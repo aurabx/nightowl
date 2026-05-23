@@ -43,7 +43,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [ ] M6: SCP C-MOVE and C-GET return matching SOP Instances. Verified by `movescu` and `getscu` from DCMTK.
 - [ ] M7: Peers CRUD UI persists a peer list. Add, edit, delete a peer; the change survives an app restart.
 - [ ] M8: SCU page can run C-ECHO, C-FIND, C-MOVE, C-GET, and C-STORE against a configured peer and display the result.
-- [ ] M9: Activity page shows a live event stream of every association (inbound and outbound) with peer, command, status, and timestamp.
+- [x] (2026-05-23) M9: Activity page shows a live event stream of every association (inbound and outbound) with peer, command, status, and timestamp. **Built ahead of M4–M8** to make the next four milestones visually verifiable: every C-FIND / C-STORE / C-MOVE response from M4–M6 will now appear in the live log without instrumentation work. `ActivityLog` in `src-tauri/src/core/activity.rs` persists every `dimse::emit` into `activity_events` (50,000-row cap, trim on every 500 inserts), three Tauri commands (`list_activity`, `clear_activity`, `activity_count`), Activity page with live event subscription, direction / status / search filters, pause-resume toggle, and clear-log button. Seventeen backend tests passing.
 - [ ] M10: (Stub only) Modality Worklist SCP placeholder page exists so the worklist work can land later as a single milestone.
 
 Use timestamps when entries are completed, like `- [x] (2026-05-23 11:00Z) Scaffold created.`
@@ -175,6 +175,26 @@ Record every decision in the format below.
   Rationale: The user picked the port. Silently running without an SCP would defeat the whole point of the app. If the port is in use the error surfaces immediately in the dev console / dock launch failure, prompting the user to free the port or change Settings before relaunch.
   Date/Author: 2026-05-23 / M3 implementer.
 
+- Decision: Build M9 (activity log) ahead of M4 / M5 / M6 / M8.
+  Rationale: M3 already emits activity events into the void. Persisting and visualising them now means M4–M6 (C-FIND / C-STORE / C-MOVE) become visually verifiable for free — every new DIMSE command lights up the Activity page without any extra wiring. Otherwise the implementer of M4 would need temporary logging instrumentation only to throw it away when M9 lands. Reordering the milestones costs us nothing because M9 only depends on the `ActivityEvent` shape that M3 has already pinned.
+  Date/Author: 2026-05-23 / M9 implementer.
+
+- Decision (M9): The activity table lives in the same `store.sqlite` file as the SOP Instance index, but `ActivityLog` opens its own SQLite `Connection`.
+  Rationale: One database file is simpler to back up / clear / migrate than two. WAL mode (already enabled by the index) supports multiple readers without lock contention. Separate connections mean the activity mutex does not contend with the store-index mutex during a busy rescan.
+  Date/Author: 2026-05-23 / M9 implementer.
+
+- Decision (M9): `dimse::emit` fetches the `ActivityLog` from Tauri state via `app.try_state::<Arc<ActivityLog>>()` rather than receiving it as an explicit parameter.
+  Rationale: `emit` is called from a dozen sites in the dimse code (inbound dispatch, outbound responses, listener lifecycle). Threading an explicit `&ActivityLog` through every call site would double the parameter count of half the functions. State lookup is a `RwLock::try_read` on a small map — cheap. The signature stays `emit(&AppHandle, ActivityEvent)`, matching M3.
+  Date/Author: 2026-05-23 / M9 implementer.
+
+- Decision (M9): Direction and Status are persisted as their lowercase JSON discriminator strings (`"inbound"`, `"success"`, …) rather than as integer enums.
+  Rationale: The SQLite file is human-readable from the `sqlite3` shell during development without any decoding step. Adding a new enum variant later does not invalidate the existing rows (the unknown token maps to `Info`). The cost is a few bytes per row, which is irrelevant at the 50,000-row cap.
+  Date/Author: 2026-05-23 / M9 implementer.
+
+- Decision (M9): Tauri events emit `PersistedActivityEvent` (with `id`) always, even when persistence failed (id = -1 sentinel).
+  Rationale: The frontend listener writes events directly into a React state list keyed by `id`. Switching the wire shape on failure would force every consumer to handle two possibilities; emitting one shape always keeps the UI code simple. The `id = -1` value is documented and distinguishable from real ids.
+  Date/Author: 2026-05-23 / M9 implementer.
+
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
@@ -305,6 +325,62 @@ Follow-on observations:
 - No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
 - The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
 - Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
+
+### M9 (2026-05-23, completed ahead of M4-M8)
+
+What landed: a persistent, live, filterable activity log. Every association event and every DIMSE message that flows through `core::dimse` is now stored in a new `activity_events` table in `store.sqlite` and re-broadcast to the frontend as a Tauri `activity` event with an assigned id. The Activity page subscribes to that stream and prepends rows in real time; filters (direction, status, free-text search), a pause-resume toggle, and a clear-log button are all wired.
+
+Backend pieces (`src-tauri/src/core/activity.rs`):
+
+- `ActivityLog::open(path)` creates the table and two indexes (timestamp_ms, association_id). Opens its own SQLite connection in the shared `store.sqlite` file.
+- `record(event)` writes one row, returns `PersistedActivityEvent { id, event }`. Trims on every 500 inserts if `COUNT(*) > 50000`, deleting the oldest excess.
+- `list(filter)` builds a parametric WHERE clause from optional fields (direction, status, peer_ae_title, command, association_id, free-text search on message + peer_ae_title, since_ms, limit). Returns newest first. Default limit 500, max 5000.
+- `clear()` truncates the table; used by the "Clear log" button.
+- Five unit tests: record-then-list round trip, substring search, clear, newest-first ordering, limit capping.
+
+Backend wiring:
+
+- `core/dimse.rs::emit` now calls `app.try_state::<Arc<ActivityLog>>()` and persists each event before emitting it. On persistence failure it emits with `id = -1` so the live UI is never silenced by a transient DB error.
+- `lib.rs::setup` manages an `Arc<ActivityLog>` (separate from `AppState`) so any function with an `AppHandle` can fetch it. Three Tauri commands exposed: `list_activity`, `clear_activity`, `activity_count`.
+
+Frontend (`src/pages/Activity.tsx`):
+
+- Initial fetch via `listActivity(filter)`; live subscription via `listen("activity", …)` registered once and reading `paused` from a ref so it always sees the latest value.
+- Filter dropdowns and a free-text input refetch through the backend, so SQL does the heavy lifting; the same filter is applied client-side to live-prepended events to keep the table consistent.
+- Per-association colour via a tiny hash → palette mapping so messages from one association visually group.
+- Direction iconography (down-arrow inbound / up-arrow outbound / info dot) and status dot (info / success / warning / error) colour-coded.
+- "Clear log" guarded by a `confirm()` so an accidental click can't nuke debugging context.
+
+Verification:
+
+    $ make test-rust
+    test result: ok. 17 passed; 0 failed
+    $ make build-web
+    ✓ 1762 modules transformed, built in 1.94s
+    # Clear prior rows, boot the app, run echoscu twice, query SQLite:
+    $ sqlite3 store.sqlite "DELETE FROM activity_events"
+    $ npm run tauri dev          (background)
+    $ echoscu -aec PHANTOM -aet TESTSCU localhost 11112
+    $ echoscu -aec PHANTOM -aet TESTSCU localhost 11112
+    $ sqlite3 store.sqlite "SELECT id, direction, peer_ae_title, command, status, message FROM activity_events ORDER BY id"
+    3 |info     |        |             |info    |SCP listening on 0.0.0.0:11112 as AE PHANTOM
+    4 |info     |TESTSCU |             |info    |association accepted from TESTSCU
+    5 |inbound  |TESTSCU |C-ECHO-RQ    |info    |message id 1
+    6 |outbound |TESTSCU |C-ECHO-RSP   |success |message id 1 status 0x0000 (Success)
+    7 |inbound  |TESTSCU |A-RELEASE-RQ |info    |release requested
+    8 |outbound |TESTSCU |A-RELEASE-RP |success |release acknowledged
+    9 |info     |TESTSCU |             |info    |association closed
+    10..15  (second echoscu — same six-event sequence)
+
+13 rows persisted from two `echoscu` runs (1 startup + 2 × 6 association events). The Tauri event for each landed in the frontend's `listen` callback within a frame of the row being committed.
+
+Gaps to address: none. The producer side (M3 emits, M9 persists + lists) is complete.
+
+Follow-on observations:
+
+- The frontend table is unvirtualized. At MAX_DISPLAYED=2000 rows with current event sizes that should still scroll fluidly, but a busy multi-hour session could hit it. `react-virtuoso` or `@tanstack/react-virtual` is the obvious follow-up.
+- The `since_ms` filter is in the backend but unused by the frontend. Polling endpoints that want incremental updates can use it.
+- Pause currently drops live events from the display (they are still persisted). A "queue while paused, prepend on resume" mode is possible but adds complexity to the listener; the existing "Refresh" button covers the catch-up case.
 
 ### M3 (2026-05-23)
 

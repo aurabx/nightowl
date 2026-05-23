@@ -43,9 +43,10 @@ use dicom_ul::association::server::ServerAssociationOptions;
 use dicom_ul::association::Association;
 use dicom_ul::pdu::{PDataValue, PDataValueType, Pdu};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
+use super::activity::{ActivityLog, PersistedActivityEvent};
 use super::error::AppError;
 
 // DIMSE Command Field values (PS3.7 Table 7.1-1). Listed even when
@@ -130,7 +131,22 @@ fn emit(app: &AppHandle, event: ActivityEvent) {
         message = %event.message,
         "activity",
     );
-    if let Err(err) = app.emit("activity", &event) {
+
+    // Persist when the activity log is in Tauri state. A negative id is
+    // emitted only when persistence failed; the UI can render that as
+    // "live but unpersisted" if it cares.
+    let payload: PersistedActivityEvent = match app.try_state::<Arc<ActivityLog>>() {
+        Some(log) => match log.record(event.clone()) {
+            Ok(p) => p,
+            Err(err) => {
+                tracing::warn!(error = %err, "activity persist failed");
+                PersistedActivityEvent { id: -1, event }
+            }
+        },
+        None => PersistedActivityEvent { id: -1, event },
+    };
+
+    if let Err(err) = app.emit("activity", &payload) {
         tracing::warn!(error = %err, "activity emit failed");
     }
 }

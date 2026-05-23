@@ -2,15 +2,18 @@
 //! wrappers that call into this module.
 //!
 //! Submodules:
-//! - `config`  — persistent application configuration and validators.
-//! - `error`   — the single error type returned across the IPC boundary.
-//! - `store`   — SQLite-backed SOP Instance index over the local store
-//!              directory.
-//! - `dimse`   — DIMSE SCP listener (C-ECHO at M3; C-FIND / C-STORE /
-//!              C-MOVE / C-GET in later milestones).
+//! - `config`   — persistent application configuration and validators.
+//! - `error`    — the single error type returned across the IPC boundary.
+//! - `store`    — SQLite-backed SOP Instance index over the local store
+//!               directory.
+//! - `dimse`    — DIMSE SCP listener (C-ECHO at M3; C-FIND / C-STORE /
+//!               C-MOVE / C-GET in later milestones).
+//! - `activity` — persistent activity log (M9) plus the typed
+//!               `PersistedActivityEvent` shape the UI lists.
 //!
-//! Later milestones will add `peers` and `activity`.
+//! Later milestones will add `peers`.
 
+pub mod activity;
 pub mod config;
 pub mod dimse;
 pub mod error;

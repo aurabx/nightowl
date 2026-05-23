@@ -114,3 +114,44 @@ export function listInstancesForSeries(seriesUid: string): Promise<InstanceRow[]
 export function totalInstanceCount(): Promise<number> {
   return invoke<number>("total_instance_count");
 }
+
+// --- Activity log (M9) ------------------------------------------------
+
+export type ActivityDirection = "inbound" | "outbound" | "info";
+export type ActivityStatus = "info" | "success" | "warning" | "error";
+
+/** Matches PersistedActivityEvent + ActivityEvent flattened on the wire. */
+export interface ActivityEvent {
+  id: number;
+  timestamp_ms: number;
+  direction: ActivityDirection;
+  peer_ae_title: string | null;
+  peer_host: string | null;
+  command: string | null;
+  status: ActivityStatus;
+  message: string;
+  association_id: string;
+}
+
+export interface ActivityFilter {
+  direction?: ActivityDirection;
+  status?: ActivityStatus;
+  peer_ae_title?: string;
+  command?: string;
+  association_id?: string;
+  search?: string;
+  since_ms?: number;
+  limit?: number;
+}
+
+export function listActivity(filter?: ActivityFilter): Promise<ActivityEvent[]> {
+  return invoke<ActivityEvent[]>("list_activity", { filter });
+}
+
+export function clearActivity(): Promise<void> {
+  return invoke<void>("clear_activity");
+}
+
+export function activityCount(): Promise<number> {
+  return invoke<number>("activity_count");
+}

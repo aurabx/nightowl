@@ -12,6 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use core::activity::{ActivityFilter, ActivityLog, PersistedActivityEvent};
 use core::config::{AppConfig, load_or_default, save};
 use core::dimse::{start_listener, ListenerHandle};
 use core::error::AppError;
@@ -29,6 +30,10 @@ struct AppState {
     #[allow(dead_code)]
     listener: ListenerHandle,
 }
+
+// The activity log is managed as its own `Arc<ActivityLog>` (separate
+// from `AppState`) so `dimse::emit` can fetch it from anywhere it has
+// an `AppHandle`, without holding `AppState` for the persist call.
 
 // ---------------------------------------------------------------------
 // Tauri-aware path helpers
@@ -144,6 +149,26 @@ fn total_instance_count(state: State<'_, AppState>) -> Result<i64, AppError> {
     state.index.total_instance_count()
 }
 
+// --- Activity log (M9) -----------------------------------------------
+
+#[tauri::command]
+fn list_activity(
+    log: State<'_, Arc<ActivityLog>>,
+    filter: Option<ActivityFilter>,
+) -> Result<Vec<PersistedActivityEvent>, AppError> {
+    log.list(filter.unwrap_or_default())
+}
+
+#[tauri::command]
+fn clear_activity(log: State<'_, Arc<ActivityLog>>) -> Result<(), AppError> {
+    log.clear()
+}
+
+#[tauri::command]
+fn activity_count(log: State<'_, Arc<ActivityLog>>) -> Result<i64, AppError> {
+    log.count()
+}
+
 // ---------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------
@@ -177,9 +202,14 @@ pub fn run() {
             // Open the SOP Instance index alongside the config.
             let idx = Arc::new(Index::open(&index_path(handle)?)?);
 
-            // Start the SCP listener. Failure to bind is fatal — the
-            // user explicitly configured this port and would not want
-            // the app to silently run without an SCP.
+            // Open the persistent activity log. We use the same
+            // store.sqlite file but our own Connection so the activity
+            // mutex does not contend with the SOP-index mutex.
+            let activity = Arc::new(ActivityLog::open(&index_path(handle)?)?);
+            app.manage(activity);
+
+            // Start the SCP listener AFTER managing the activity log
+            // so its startup `SCP listening …` event is persisted.
             let listener =
                 start_listener(cfg.listen_port, cfg.local_ae_title.clone(), handle.clone())?;
 
@@ -223,6 +253,9 @@ pub fn run() {
             list_series_for_study,
             list_instances_for_series,
             total_instance_count,
+            list_activity,
+            clear_activity,
+            activity_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
