@@ -37,7 +37,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [x] (2026-05-23) M0: Tauri 2 + React 19 + TS 6 + Tailwind v4 + lucide-react scaffold compiles via `cargo check`, builds via `npm run build`, and launches via `npm run tauri dev`. Sidebar shows Peers / SCU / Activity / Store / Settings. Frontend calls `invoke("ping")` on mount and renders the `pong` reply in the footer.
 - [x] (2026-05-23) M1: Settings page persists a config (local AE Title, listen port, store directory) to disk and reloads on launch. `AppConfig` + validators in `src-tauri/src/core/config.rs`, `AppError` discriminated union in `core/error.rs`, `get_config` / `save_config` Tauri commands in `lib.rs`, Settings UI in `src/pages/Settings.tsx`, shared API client + types in `src/lib/api.ts`. Eight backend unit tests passing.
 - [x] (2026-05-23) M2: Local Store scanner indexes a directory of DICOM files into a SQLite database and the Store page browses the Patient / Study / Series / SOP Instance hierarchy. `Index` + `parse_dicom` + `rescan_dir` in `src-tauri/src/core/store.rs`, five Tauri commands (`rescan_store`, `list_studies`, `list_series_for_study`, `list_instances_for_series`, `total_instance_count`), Store page tree UI with live-event refresh, initial background scan on boot. Eleven backend tests passing.
-- [ ] M3: SCP listener accepts an association and answers C-ECHO. Verified by `echoscu` from DCMTK.
+- [x] (2026-05-23) M3: SCP listener accepts an association and answers C-ECHO. `core/dimse.rs` binds `0.0.0.0:<port>` on app start, accepts the Verification SOP Class on Implicit/Explicit VR LE, dispatches DIMSE commands, and emits stable `activity` events. `echoscu -aec PHANTOM -aet TESTSCU localhost 11112` returns "Received Echo Response (Success)" with exit 0. Twelve backend tests passing.
 - [ ] M4: SCP C-FIND returns matching identifiers from the local index. Verified by `findscu` from DCMTK.
 - [ ] M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Verified by `storescu` from DCMTK.
 - [ ] M6: SCP C-MOVE and C-GET return matching SOP Instances. Verified by `movescu` and `getscu` from DCMTK.
@@ -78,6 +78,14 @@ Document unexpected behaviors, bugs, optimizations, or insights discovered durin
 - Observation (M2): The dicom-rs API for accessing tags goes `obj.element(Tag) -> Result<&InMemElement, AccessError>` then `element.to_str() -> Result<Cow<str>, ConvertValueError>`. Two different error types in two lines. The `?` operator can't propagate them to a single user-facing error variant without explicit `.map_err`.
   Evidence: First-pass code with `?` failed to compile until the `req_str` / `opt_str` helpers wrapped both errors into `String` so the caller (`parse_dicom`) can decide whether to skip the file or surface a real error.
   Resolution: The helpers in `core/store.rs` (`req_str`, `opt_str`) are the canonical pattern for any future code that needs to pull tags out of `DefaultDicomObject`. M4 (C-FIND) and M5 (C-STORE) should reuse them rather than reinventing the conversion.
+
+- Observation (M3): `TransferSyntax::erased()` is for the typed, non-erased static (e.g. `dicom_transfer_syntax_registry::entries::IMPLICIT_VR_LITTLE_ENDIAN`). The value returned by `TransferSyntaxRegistry.get(uid)` is *already* erased; calling `.erased()` on it produces an unsatisfied trait bound on the adapter type parameters.
+  Evidence: First compile of `encode_command_set` produced `the trait bound 'Box<dyn DataRWAdapter + Send + Sync>: DataRWAdapter' is not satisfied` with `required by a bound in 'TransferSyntax::<D, R, W>::erased'`.
+  Resolution: Drop the `.erased()` call after `TransferSyntaxRegistry.get(...)` and pass the borrowed `&TransferSyntax` directly to `write_dataset_with_ts` / `read_dataset_with_ts`.
+
+- Observation (M3): `dicom_ul::ServerAssociation::client_ae_title()` is deprecated in 0.9.1; use `Association::peer_ae_title` from the `dicom_ul::association::Association` trait. The deprecation is a `#[warn]` not an `#[error]`, so it would have compiled and shipped if not noticed.
+  Evidence: `warning: use of deprecated method 'dicom_ul::ServerAssociation::<S>::client_ae_title': Call 'peer_ae_title' from trait 'Association'`.
+  Resolution: Imported the trait and switched to the trait method. Any future code working with `ServerAssociation` should follow the same pattern.
 
 ## Decision Log
 
@@ -150,6 +158,22 @@ Record every decision in the format below.
 - Decision (M2): Phantom only ingests Part-10 DICOM files (the "DICM" preamble + meta header format that `dicom_object::open_file` accepts). Raw datasets without a file meta header are recorded as `Skipped`.
   Rationale: A development tool needs to interoperate with real PACS exports, which are always Part-10. Supporting raw datasets adds a fallback parsing path without a known consumer. Will revisit if a real workflow demands it.
   Date/Author: 2026-05-23 / M2 implementer.
+
+- Decision (M3): The SCP listener uses a thread-per-association model with `std::net::TcpListener` and `dicom-ul`'s synchronous server API, rather than tokio's async network types.
+  Rationale: `dicom-ul` 0.9 exposes `establish(std::net::TcpStream)` as the stable path; the async variant is unstable and the conversion between tokio and std streams is awkward in 2026. A dev tool that expects single-digit concurrent peers does not need the async story. Thread-per-association is simple, debuggable, and matches `dicom-ul`'s own test patterns. Reconsider if connection counts become a real concern.
+  Date/Author: 2026-05-23 / M3 implementer.
+
+- Decision (M3): The listener binds on `0.0.0.0` (every interface) rather than `127.0.0.1` (loopback only).
+  Rationale: The plan specified `0.0.0.0` so the same Phantom instance can talk to a real modality on the LAN, not just DCMTK on the same machine. The Settings page already carries an amber "no TLS / no auth" warning that doubles as the warning against exposing this on hostile networks. If a follow-up makes the bind interface configurable, default to loopback.
+  Date/Author: 2026-05-23 / M3 implementer.
+
+- Decision (M3): Activity events fire over a single Tauri event name (`activity`) with a stable JSON payload (`ActivityEvent` in `core/dimse.rs`).
+  Rationale: M9 will build the Activity page and persistent log on top of this stream. Pinning the event name and shape now means M9 is just persistence + UI; the producer side does not need to change. Direction (`inbound` / `outbound` / `info`) and Status (`info` / `success` / `warning` / `error`) are kept narrow so the UI can colour-code with a small switch.
+  Date/Author: 2026-05-23 / M3 implementer.
+
+- Decision (M3): Bind failure is fatal (`setup()` returns Err and the app does not start).
+  Rationale: The user picked the port. Silently running without an SCP would defeat the whole point of the app. If the port is in use the error surfaces immediately in the dev console / dock launch failure, prompting the user to free the port or change Settings before relaunch.
+  Date/Author: 2026-05-23 / M3 implementer.
 
 ## Outcomes & Retrospective
 
@@ -281,6 +305,57 @@ Follow-on observations:
 - No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
 - The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
 - Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
+
+### M3 (2026-05-23)
+
+What landed: a working DIMSE SCP. Phantom now binds `0.0.0.0:<listen_port>` on boot, accepts associations from any caller via `dicom-ul` 0.9, negotiates the Verification SOP Class on Implicit and Explicit VR Little Endian, and answers C-ECHO with status `0x0000`. Every association open, every DIMSE message in or out, every release, and every close emits a structured `activity` event ready for the M9 page to subscribe to.
+
+Backend (`src-tauri/src/core/dimse.rs`, ~570 lines):
+
+- `start_listener(port, ae_title, app)` binds `std::net::TcpListener` synchronously so the user learns immediately if the port is in use, spawns a named accept thread, and emits the `SCP listening …` info event.
+- `run_accept_loop` accepts connections sequentially and hands each to a per-association `std::thread::spawn`. Each association gets a UUID-derived id so all its events group together in the activity log.
+- `handle_association` calls `ServerAssociationOptions::new().accept_any().with_abstract_syntax(VERIFICATION).with_transfer_syntax(IMPLICIT_VR_LE).with_transfer_syntax(EXPLICIT_VR_LE).ae_title(...).establish(stream)`, then loops on `association.receive()`.
+- `dispatch_command` decodes the Command Set from the inbound PDV (Implicit VR LE), looks up the CommandField, and dispatches. C-ECHO is implemented; other DIMSE commands log a warning and continue (M4–M6 will implement them).
+- `build_c_echo_rsp` and `encode_command_set` use `InMemDicomObject::command_from_element_iter` + `write_dataset_with_ts`. A unit test round-trips the encoder against the decoder.
+- `ActivityEvent` payload pinned for M9; `Direction` and `Status` enums are narrow so the UI can colour-code with a small switch.
+
+Wiring (`src-tauri/src/lib.rs`):
+
+- `AppState` now also holds a `ListenerHandle` so the listener cannot be garbage-collected mid-life.
+- `setup()` calls `start_listener` *after* opening the index, so a port-in-use failure does not leave the SQLite database opened-then-orphaned. Bind failure is fatal.
+
+Verification (commands run, output captured):
+
+    $ make test-rust
+    test result: ok. 12 passed; 0 failed
+    $ npm run tauri dev   (running in background)
+    INFO phantom_lib::dimse: SCP listening on 0.0.0.0:11112 as AE PHANTOM
+    $ echoscu -v -aec PHANTOM -aet TESTSCU localhost 11112
+    I: Requesting Association
+    I: Association Accepted (Max Send PDV: 16366)
+    I: Sending Echo Request (MsgID 1)
+    I: Received Echo Response (Success)
+    I: Releasing Association
+    $ echo $?
+    0
+
+Phantom's activity stream during the echoscu run, in order:
+
+    SCP listening on 0.0.0.0:11112 as AE PHANTOM
+    association accepted from TESTSCU
+    inbound  C-ECHO-RQ      message id 1
+    outbound C-ECHO-RSP     message id 1 status 0x0000 (Success)
+    inbound  A-RELEASE-RQ   release requested
+    outbound A-RELEASE-RP   release acknowledged
+    association closed
+
+Gaps to address before M4: none. M4 (C-FIND SCP) layers query handling onto the same dispatch path.
+
+Follow-on observations:
+
+- Settings changes to AE title or port currently take a restart to apply. The listener handle has a `shutdown()` method ready to use; wiring `save_config` to rebind is a follow-up.
+- The `cmd` module catalogues the full DIMSE command field table even though M3 only uses two values, so M4/M5/M6 can match on names rather than re-deriving the hex.
+- Activity events are fire-and-forget over the `activity` Tauri event channel. They are NOT persisted yet; M9 adds the SQLite-backed log and the UI page.
 
 ## Context and Orientation
 

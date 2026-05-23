@@ -30,6 +30,12 @@ tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync"] }
 dicom-object = "0.9"
 dicom-core = "0.9"
 dicom-dictionary-std = "0.9"
+dicom-encoding = "0.9"
+
+# DICOM upper layer / DIMSE (M3 onwards). `dicom-ul` carries the
+# PDU codec and the association negotiation primitives.
+dicom-ul = "0.9"
+dicom-transfer-syntax-registry = "0.9"
 
 # SOP Instance index (M2).
 rusqlite = { version = "0.39", features = ["bundled"] }
@@ -40,6 +46,12 @@ walkdir = "2.5"
 # Structured logging (used across milestones).
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# UUIDs for per-association identifiers in the activity stream.
+uuid = { version = "1.23", features = ["v4", "serde"] }
+
+# Wall-clock timestamps for the activity stream.
+chrono = { version = "0.4", features = ["serde"] }
 
 [profile.release]
 panic = "abort"

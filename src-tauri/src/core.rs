@@ -6,10 +6,13 @@
 //! - `error`   — the single error type returned across the IPC boundary.
 //! - `store`   — SQLite-backed SOP Instance index over the local store
 //!              directory.
+//! - `dimse`   — DIMSE SCP listener (C-ECHO at M3; C-FIND / C-STORE /
+//!              C-MOVE / C-GET in later milestones).
 //!
-//! Later milestones will add `peers`, `activity`, and `dicom`.
+//! Later milestones will add `peers` and `activity`.
 
 pub mod config;
+pub mod dimse;
 pub mod error;
 pub mod store;
 

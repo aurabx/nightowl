@@ -13,6 +13,7 @@ use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, Manager, State};
 
 use core::config::{AppConfig, load_or_default, save};
+use core::dimse::{start_listener, ListenerHandle};
 use core::error::AppError;
 use core::store::{Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
 
@@ -23,6 +24,10 @@ struct AppState {
     /// the SQLite-backed store with the background rescan task and
     /// every command thread.
     index: Arc<Index>,
+    /// DIMSE SCP listener handle. Kept alive for the process lifetime;
+    /// dropping shuts the listener down.
+    #[allow(dead_code)]
+    listener: ListenerHandle,
 }
 
 // ---------------------------------------------------------------------
@@ -172,9 +177,16 @@ pub fn run() {
             // Open the SOP Instance index alongside the config.
             let idx = Arc::new(Index::open(&index_path(handle)?)?);
 
+            // Start the SCP listener. Failure to bind is fatal — the
+            // user explicitly configured this port and would not want
+            // the app to silently run without an SCP.
+            let listener =
+                start_listener(cfg.listen_port, cfg.local_ae_title.clone(), handle.clone())?;
+
             app.manage(AppState {
                 config: Mutex::new(cfg.clone()),
                 index: idx.clone(),
+                listener,
             });
 
             // Initial background scan so the Store page is populated
