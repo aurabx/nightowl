@@ -9,6 +9,7 @@ import {
   Play,
   RotateCw,
   Search,
+  TriangleAlert,
 } from "lucide-react";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -82,6 +83,13 @@ export function ActivityPage() {
   // page 1. We display a "N new events" banner; clicking it jumps to
   // page 1 (which triggers a refetch).
   const [newSincePage1, setNewSincePage1] = useState<number>(0);
+
+  // Two-click confirmation for Clear log. `window.confirm()` is
+  // unreliable inside Tauri's WKWebView (returns undefined without
+  // showing a dialog on macOS), so we morph the button into its own
+  // confirmation prompt for a few seconds.
+  const [confirmingClear, setConfirmingClear] = useState<boolean>(false);
+  const confirmTimer = useRef<number | null>(null);
 
   const [direction, setDirection] = useState<ActivityDirection | "">("");
   const [status, setStatus] = useState<ActivityStatus | "">("");
@@ -167,7 +175,25 @@ export function ActivityPage() {
   }, []);
 
   const handleClear = async () => {
-    if (!confirm("Delete every activity log row? This cannot be undone.")) return;
+    // First click: arm the confirmation. Second click within 4 seconds:
+    // actually clear. Any other click or mouse-out resets via the
+    // timer.
+    if (!confirmingClear) {
+      setConfirmingClear(true);
+      if (confirmTimer.current !== null) {
+        window.clearTimeout(confirmTimer.current);
+      }
+      confirmTimer.current = window.setTimeout(() => {
+        setConfirmingClear(false);
+        confirmTimer.current = null;
+      }, 4000);
+      return;
+    }
+    if (confirmTimer.current !== null) {
+      window.clearTimeout(confirmTimer.current);
+      confirmTimer.current = null;
+    }
+    setConfirmingClear(false);
     try {
       await clearActivity();
       setEvents([]);
@@ -178,6 +204,17 @@ export function ActivityPage() {
       setError(formatError(err));
     }
   };
+
+  // Cancel any pending confirmation timer on unmount so we don't fire
+  // a state update against a dead component.
+  useEffect(() => {
+    return () => {
+      if (confirmTimer.current !== null) {
+        window.clearTimeout(confirmTimer.current);
+        confirmTimer.current = null;
+      }
+    };
+  }, []);
 
   const handleJumpToLatest = () => {
     if (page === 0) {
@@ -227,10 +264,19 @@ export function ActivityPage() {
           <button
             type="button"
             onClick={handleClear}
-            className="flex items-center gap-1.5 rounded border border-red-800/50 bg-red-900/20 px-3 py-1.5 text-sm text-red-200 hover:bg-red-900/30"
+            className={
+              "flex items-center gap-1.5 rounded border px-3 py-1.5 text-sm " +
+              (confirmingClear
+                ? "border-red-500 bg-red-600 text-white hover:bg-red-500"
+                : "border-red-800/50 bg-red-900/20 text-red-200 hover:bg-red-900/30")
+            }
           >
-            <Eraser className="size-3.5" />
-            Clear log
+            {confirmingClear ? (
+              <TriangleAlert className="size-3.5" />
+            ) : (
+              <Eraser className="size-3.5" />
+            )}
+            {confirmingClear ? "Click again to confirm" : "Clear log"}
           </button>
         </div>
       </div>
@@ -290,7 +336,16 @@ export function ActivityPage() {
         </p>
       )}
 
-      <div className="mt-4 overflow-x-auto rounded border border-slate-800 bg-slate-900/30">
+      <div className="mt-4 mb-2">
+        <Pagination
+          total={total}
+          pageSize={PAGE_SIZE}
+          page={page}
+          onPageChange={setPage}
+        />
+      </div>
+
+      <div className="overflow-x-auto rounded border border-slate-800 bg-slate-900/30">
         <table className="w-full text-sm">
           <thead className="border-b border-slate-800 bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500">
             <tr>
@@ -353,14 +408,6 @@ export function ActivityPage() {
         </table>
       </div>
 
-      <div className="mt-3">
-        <Pagination
-          total={total}
-          pageSize={PAGE_SIZE}
-          page={page}
-          onPageChange={setPage}
-        />
-      </div>
     </section>
   );
 }
