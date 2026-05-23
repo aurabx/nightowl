@@ -1,0 +1,52 @@
+# Node / Vite
+node_modules/
+dist/
+dist-ssr/
+*.local
+*.tsbuildinfo
+
+# Environment
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor / OS
+.vscode/*
+!.vscode/extensions.json
+!.vscode/settings.json
+.idea/
+.DS_Store
+Thumbs.db
+
+# Agent tooling — per-developer state (permission grants, etc.)
+.claude/settings.local.json
+.codex/settings.local.json
+.opencode/settings.local.json
+.automatic/snapshots/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Rust / Tauri
+# Cargo.lock IS committed for binaries (phantom is a binary), so do not ignore it.
+src-tauri/target/
+src-tauri/gen/
+
+# Local DICOM store and other runtime data
+# (the default store directory configured at M1 lives outside the repo, but
+# users sometimes point it inside; ignore the common ones)
+.dicom-store/
+dicom-store/
+
+# Test fixtures
+/tmp-fixtures/

@@ -1,0 +1,29 @@
+[package]
+name = "phantom"
+version = "0.1.0"
+description = "Phantom — Tauri desktop app for testing DICOM services"
+authors = ["Aurabox"]
+edition = "2021"
+rust-version = "1.77"
+
+# The library crate exposes `run()` for both the desktop binary (main.rs)
+# and any future mobile entrypoints. Keep main.rs thin per CLAUDE.md.
+[lib]
+name = "phantom_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6", features = [] }
+
+[dependencies]
+tauri = { version = "2.11", features = [] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

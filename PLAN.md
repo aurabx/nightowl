@@ -1,0 +1,674 @@
+# Phantom: a Tauri desktop app for testing DICOM services
+
+This ExecPlan is a living document. The sections `Progress`, `Surprises & Discoveries`, `Decision Log`, and `Outcomes & Retrospective` must be kept up to date as work proceeds. There is no `PLANS.md` file checked into this repository; the canonical rules for this format live in `.claude/skills/codex-plans/SKILL.md` — keep this document consistent with that guidance.
+
+## Purpose / Big Picture
+
+Phantom is a single-window macOS desktop application that helps a developer exercise the DICOM network protocol in both directions. After this work the developer can:
+
+1. Launch the app from the dock, see a sidebar with five pages (Peers, SCU, Activity, Store, Settings), and the app immediately begins listening for inbound DICOM associations on a configurable TCP port using a configurable local Application Entity Title.
+2. Point the app at a local directory on disk (for example `~/dicom-store`) which the app treats like a tiny PACS: any DICOM files already there are indexed, any files arriving over C-STORE are written there and added to the index, and any C-FIND / C-MOVE / C-GET requests are answered from that index.
+3. Use the Peers page to add, edit, and remove remote DICOM nodes by name, AE Title, host, and port.
+4. Use the SCU page to send a C-ECHO, C-FIND, C-MOVE, C-GET, or C-STORE request to a configured peer and see the response.
+5. Use the Activity page to watch a live, scrolling log of every association that touches the app — inbound and outbound — with timestamps, peer identification, command field, status, and any errors.
+
+"DICOM" here means Digital Imaging and Communications in Medicine — the protocol used by clinical imaging equipment (CT scanners, ultrasound machines, PACS servers) to exchange images and metadata. The network half of that protocol is called DIMSE — DICOM Message Service Element — and it runs over TCP using an association handshake followed by a series of command/data PDUs. The five DIMSE operations this app supports are:
+
+- C-ECHO: the DICOM equivalent of a network ping. One peer asks another "are you alive?" and expects a status reply.
+- C-FIND: a query for objects matching an identifier (for example, all studies for patient `MRN12345`). The responder returns zero or more matching identifiers.
+- C-MOVE: a request that the responder send specified DICOM objects to a *third* AE Title — typically the requester itself, but identified by AE Title and resolved against the responder's configured peer list.
+- C-GET: like C-MOVE but the responder sends the objects back on the *same* association rather than opening a new one to a third party.
+- C-STORE: the actual transfer of a DICOM object. Sent by a sender on its own, or sent as the second half of a C-MOVE / C-GET.
+
+The "phantom" name reflects intent: this app stands in for a real PACS or modality during development. It is a developer tool. It is not a clinical product, makes no compliance claims, and has no authentication or transport security in this iteration.
+
+The terminology "instance" is overloaded in DICOM. Throughout this plan we use:
+
+- **Peer**: a remote DICOM node we can talk to. A Peer has a Name (free text), an AE Title (the DICOM identifier, up to sixteen ASCII characters), a Host (DNS name or IP), and a Port.
+- **SOP Instance**: a single DICOM object (typically one image). SOP stands for Service-Object Pair; in practice you can read it as "a DICOM file".
+- **Local Store** or **Store**: the configured directory on disk that holds the SOP Instances this app serves.
+
+When the user said "managing associated instances" we interpret that as managing the list of Peers. When they said "keep track of instances that are added to it as if it were a PACS" we interpret that as the Local Store of SOP Instances. This interpretation should be confirmed at the end of milestone M1; if wrong, only the terminology in the UI needs to change, not the data model.
+
+## Progress
+
+Use a list with checkboxes to summarize granular steps. Every stopping point must be documented here, even if it requires splitting a partially completed task into two. This section must always reflect the actual current state of the work.
+
+- [x] (2026-05-23) M0: Tauri 2 + React 19 + TS 6 + Tailwind v4 + lucide-react scaffold compiles via `cargo check`, builds via `npm run build`, and launches via `npm run tauri dev`. Sidebar shows Peers / SCU / Activity / Store / Settings. Frontend calls `invoke("ping")` on mount and renders the `pong` reply in the footer.
+- [ ] M1: Settings page persists a config (local AE Title, listen port, store directory) to disk and reloads on launch.
+- [ ] M2: Local Store scanner indexes a directory of DICOM files into a SQLite database and the Store page can browse the Patient / Study / Series / SOP Instance hierarchy.
+- [ ] M3: SCP listener accepts an association and answers C-ECHO. Verified by `echoscu` from DCMTK.
+- [ ] M4: SCP C-FIND returns matching identifiers from the local index. Verified by `findscu` from DCMTK.
+- [ ] M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Verified by `storescu` from DCMTK.
+- [ ] M6: SCP C-MOVE and C-GET return matching SOP Instances. Verified by `movescu` and `getscu` from DCMTK.
+- [ ] M7: Peers CRUD UI persists a peer list. Add, edit, delete a peer; the change survives an app restart.
+- [ ] M8: SCU page can run C-ECHO, C-FIND, C-MOVE, C-GET, and C-STORE against a configured peer and display the result.
+- [ ] M9: Activity page shows a live event stream of every association (inbound and outbound) with peer, command, status, and timestamp.
+- [ ] M10: (Stub only) Modality Worklist SCP placeholder page exists so the worklist work can land later as a single milestone.
+
+Use timestamps when entries are completed, like `- [x] (2026-05-23 11:00Z) Scaffold created.`
+
+## Surprises & Discoveries
+
+Document unexpected behaviors, bugs, optimizations, or insights discovered during implementation. Provide concise evidence.
+
+- Observation (M0): Vite 8 (the current "latest" tag at 8.0.14) ships with Rolldown as its bundler. Rolldown's native binding for `darwin-arm64` is delivered as an optionalDependency that npm refuses to install on Node 20.16 because Vite 8 declares `engines: node ^20.19.0 || >=22.12.0`. The install completes with a warning but the binding is silently absent, so any subsequent `vite build` or `vite dev` crashes with `Cannot find module './rolldown-binding.darwin-universal.node'`.
+  Evidence: After `npm install`, `ls node_modules/@rolldown/binding-darwin-arm64/` returned "No such file or directory" even though the optional dep was listed in the rolldown package manifest. `npm run build` then failed with the binding load error.
+  Resolution: Pinned Vite to `^7.3.3` and `@vitejs/plugin-react` to `^5.2.0`. Vite 7 uses Rollup (no native binding) and emits only a soft warning on Node 20.16. Future revisit: bumping the user's Node to 22 LTS would unblock Vite 8.
+
+- Observation (M0): Tauri's `generate_context!()` proc macro reads `tauri.conf.json` at compile time and refuses to compile if any path listed under `bundle.icon` is missing. There is no "skip icons in dev" mode.
+  Evidence: First `cargo check` failed with `failed to open icon /.../src-tauri/icons/32x32.png: No such file or directory`.
+  Resolution: Generated a 1024×1024 solid-colour source PNG and ran `npx tauri icon /tmp/phantom-source.png` to produce the full icon set under `src-tauri/icons/`.
+
+- Observation (M0): The Tauri 2 CLI does not ship default placeholder icons inside `node_modules/@tauri-apps/cli/templates/...` the way the v1 CLI did. The user must supply a source image.
+  Evidence: `find node_modules/@tauri-apps/cli -name "*.png"` returned no results after install.
+  Resolution: Used Python's stdlib (`struct`, `zlib`) to write a valid 1024×1024 PNG to `/tmp/phantom-source.png` for `tauri icon` to resample. The script is in this plan's Concrete Steps; no third-party imaging tool required.
+
+## Decision Log
+
+Record every decision in the format below.
+
+- Decision: Use the `dicom-rs` ecosystem (the `dicom`, `dicom-object`, `dicom-encoding`, `dicom-transfer-syntax-registry`, `dicom-dictionary-std`, and `dicom-ul` crates from <https://github.com/Enet4/dicom-rs>) for all DICOM parsing and network operations.
+  Rationale: It is the only mature pure-Rust DICOM library. Avoids needing a C dependency (DCMTK) or a Python sidecar. The crate already ships example binaries for `storescp`, `storescu`, `echoscu`, `findscu`, `movescu`, `getscu` which give us a known-good reference implementation to follow. Pure-Rust also keeps the macOS build simple.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: Persist the local SOP Instance index in SQLite via `rusqlite` (bundled feature so we do not require a system SQLite).
+  Rationale: C-FIND is a structured query at Patient / Study / Series / Image level. SQL is the natural way to answer those queries. SQLite is one file, no server, and works inside a Tauri app trivially. The alternative (in-memory `HashMap` rebuilt from a directory scan on every launch) does not scale and complicates C-FIND.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: One single AE Title for the SCP for now; no support for multiple virtual AEs.
+  Rationale: A development tool does not need multi-tenant AE behavior. Keeps the configuration model simple. Easy to extend later.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: No TLS, no authentication, no DICOM user identity negotiation in this iteration.
+  Rationale: Local developer tool on the developer's own machine. Adding TLS would expand the scope significantly and is not requested. Document the omission in the Settings page.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: Verification is done with the DCMTK command-line tools (`echoscu`, `findscu`, `movescu`, `getscu`, `storescu`, `storescp`) installed via Homebrew (`brew install dcmtk`). DCMTK is the reference DICOM implementation; if Phantom interoperates with DCMTK it is by definition correct.
+  Rationale: We need an external, independently-implemented peer to test against, otherwise we are only checking that our code is internally consistent. DCMTK is free, widely used, and ships on Homebrew.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: Persist application config (local AE Title, listen port, store directory, peers) as JSON files in the Tauri app config dir, accessed via the `tauri-plugin-store` plugin.
+  Rationale: Native to Tauri 2, no extra dependency to evaluate, isolates the config from the SOP Instance store. Avoids reinventing path handling. Secrets are not stored (we have none in this iteration), so we do not need the OS keychain that `CLAUDE.md` mentions.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: Frontend talks to backend over Tauri `invoke` for request/response and over Tauri `emit` events for the activity stream.
+  Rationale: Standard Tauri pattern. `invoke` gives us request-scoped error handling; `emit` gives us a fire-and-forget broadcast for the activity log.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: Use React 19 (latest stable) rather than React 18 as `CLAUDE.md` states.
+  Rationale: User asked for latest stable versions of all dependencies, which overrides the CLAUDE.md text. React 19 is fully released. `CLAUDE.md` will be updated when M0 lands to keep the two consistent.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: Pin dependencies to the latest stable major.minor lines at scaffold time using `^` ranges so security patches flow in. Concrete versions captured below in `Interfaces and Dependencies`.
+  Rationale: Avoid pinning to obsolete versions; allow patch upgrades without manual intervention; but lock the major because Tauri, React, and the dicom-rs crates make breaking changes between majors.
+  Date/Author: 2026-05-23 / plan author.
+
+- Decision: Pin Vite to `^7.3.3` (not the absolute latest `^8.0.x`) and `@vitejs/plugin-react` to `^5.2.0`.
+  Rationale: Vite 8 has hard-coded Rolldown bindings that require Node `^20.19.0 || >=22.12.0`. The user's machine runs Node 20.16. npm silently drops the rolldown native binding on engine mismatch, so `vite build` fails with a module-not-found at runtime. Vite 7 uses Rollup, has no native binding requirement, and works on Node 20.16. When Node is upgraded to 22 LTS (recommended), the constraint can be relaxed back to `^8`.
+  Date/Author: 2026-05-23 / plan author.
+
+## Outcomes & Retrospective
+
+Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
+
+### M0 (2026-05-23)
+
+What landed: a Tauri 2.11 desktop app on macOS with a five-page React 19 + Tailwind v4 sidebar shell. The frontend round-trips a `ping` IPC call to the Rust backend on mount and displays the response in a footer, proving the invoke channel works end-to-end. The Rust scaffold has the `main.rs` / `lib.rs` / `core.rs` split that `CLAUDE.md` prescribes, with a unit test on `core::ping`.
+
+Verification (commands run, output observed):
+
+    $ cd src-tauri && cargo check
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 1.16s
+    $ npm run build
+    vite v7.3.3 building client environment for production...
+    transforming...
+    ✓ 1759 modules transformed.
+    ...
+    ✓ built in 1.20s
+    $ npm run tauri dev   # killed after 90s
+    Compiling tauri-runtime-wry v2.11.2
+    Compiling tauri v2.11.2
+    Compiling phantom v0.1.0 (/.../src-tauri)
+    Finished `dev` profile target(s) in 36.47s
+    Running `target/debug/phantom`
+
+The binary launched without crashing inside the 90-second window we sampled. A human running `npm run tauri dev` from this state should see a 1100×750 window titled "Phantom" with the sidebar and an "IPC self-check: pong" footer.
+
+Gaps to address before M1: none. The scaffold is clean.
+
+Follow-on observations (worth fixing soon, not blocking M1):
+
+- The user's Node is 20.16 which is below Vite 8's required 20.19+. Upgrading to Node 22 LTS would let us bump Vite back to the absolute latest. Not done in M0 because changing the developer's runtime is out of scope.
+- `CLAUDE.md` still says "React 18". The Decision Log captures the deviation but `CLAUDE.md` itself should be updated by the project owner to keep the documentation honest.
+
+## Context and Orientation
+
+At the time this plan was authored, the working directory `/Users/xtfer/working/aurabx/_experiments/phantom/` contained only configuration directories (`.claude/`, `.codex/`, `.automatic/`, `.agents/`), instruction files (`CLAUDE.md`, `AGENTS.md`, `opencode.json`, `.mcp.json`), and no source code whatsoever. There is no Tauri scaffold yet. There is no `Cargo.toml`, no `package.json`, no `src/`, no `src-tauri/`. This plan therefore starts from empty.
+
+`CLAUDE.md` at the repo root prescribes the target architecture:
+
+- A Tauri 2 shell with a Rust backend and a webview frontend.
+- React 18 + TypeScript on the frontend.
+- Tailwind CSS v4 for styling.
+- `lucide-react` for icons.
+- A specific file layout: `src/` for the frontend, `src/App.tsx` as the root layout with sidebar navigation, `src/components/` for reusable UI; `src-tauri/src/main.rs` as the binary entry, `src-tauri/src/lib.rs` for the thin Tauri command wrappers, `src-tauri/src/core.rs` for shared business logic.
+- A coding pattern: business logic lives in `core.rs`; Tauri commands in `lib.rs` are thin wrappers. Frontend calls backend with `invoke()` from `@tauri-apps/api/core`. All `#[tauri::command]` functions must be registered in `generate_handler![]`. User-provided names must be validated with `is_valid_name()` before any filesystem use. Secrets (we have none) would use the `keyring` crate.
+
+We will respect this layout and add subdirectories where it helps: `src-tauri/src/dicom/` for the DICOM module, `src-tauri/src/store/` for the local SOP Instance index, `src-tauri/src/config/` for configuration loading, `src/pages/` for one file per sidebar page, `src/lib/` for shared frontend helpers.
+
+The DICOM library ecosystem we will rely on is `dicom-rs` (<https://github.com/Enet4/dicom-rs>). The relevant crates are:
+
+- `dicom` — umbrella crate that re-exports the others.
+- `dicom-object` — read and write DICOM files (the `.dcm` format).
+- `dicom-encoding` — transfer syntax encoding and decoding (the wire format).
+- `dicom-transfer-syntax-registry` — the registry of supported transfer syntaxes (implicit VR little endian, explicit VR little endian, JPEG, and so on). A *transfer syntax* is how the in-memory DICOM data set is serialized on the wire.
+- `dicom-dictionary-std` — the standard data dictionary (mapping of DICOM tags such as `(0010,0010)` "Patient Name" to their meaning).
+- `dicom-ul` — the DICOM Upper Layer protocol, which provides PDU encoding, association negotiation, and the primitives needed to build SCP and SCU.
+
+DICOM-specific definitions we will use freely below:
+
+- **SCP** (Service Class Provider): the server side of a DIMSE operation. Phantom *is an SCP* for C-ECHO, C-FIND, C-STORE, C-MOVE, and C-GET.
+- **SCU** (Service Class User): the client side. Phantom *is also an SCU* — the user can initiate any of those operations against a configured Peer.
+- **PDU** (Protocol Data Unit): the wire-level message format. An association is a sequence of PDUs.
+- **Association**: a negotiated TCP connection between two AEs. Both sides agree on which Abstract Syntaxes (services such as "C-ECHO") and which Transfer Syntaxes they support before any DIMSE message is exchanged.
+- **Presentation Context**: one (Abstract Syntax, list of Transfer Syntaxes) pair offered during association negotiation. The acceptor picks one Transfer Syntax per offered context, or rejects the context.
+
+Two related projects in the user's workspace handle DICOM but are not Tauri apps and should not be copied wholesale: `/Users/xtfer/working/aurabx/_active/dicom-connector` (terraform and certificate material for a deployed connector) and `/Users/xtfer/working/aurabx/_active/dicom-gateway` (a cloud gateway built around Orthanc and Lua scripts). They establish that the user is comfortable with DICOM concepts, but their code is not directly reusable here.
+
+## Plan of Work
+
+The work is divided into eleven milestones. Each milestone is a complete, demonstrable step. Do not start a later milestone before the earlier ones are observably passing.
+
+### M0 — Tauri scaffold and shell UI
+
+Bootstrap the project so that `npm run tauri dev` opens an empty window with a left sidebar of five empty pages. After this milestone exists: `package.json`, `tsconfig.json`, `vite.config.ts`, `tailwind.config.ts` (or v4 equivalent), `index.html`, `src/main.tsx`, `src/App.tsx`, `src/components/Sidebar.tsx`, `src/pages/{Peers,Scu,Activity,Store,Settings}.tsx`, `src-tauri/Cargo.toml`, `src-tauri/tauri.conf.json`, `src-tauri/src/{main.rs,lib.rs,core.rs}`, `.gitignore`.
+
+The Rust backend should expose one trivial Tauri command (`#[tauri::command] fn ping() -> &'static str { "pong" }`) wired through `lib.rs` and called from `App.tsx` on mount to verify the IPC channel works.
+
+### M1 — Configuration and Settings page
+
+Add a persistent application configuration. The configuration data shape is:
+
+    pub struct AppConfig {
+        pub local_ae_title: String,   // up to 16 ASCII characters, default "PHANTOM"
+        pub listen_port: u16,         // default 11112 (the DICOM-registered port)
+        pub store_dir: PathBuf,       // default $HOME/dicom-store, created if missing
+    }
+
+Persist as JSON via `tauri-plugin-store` to a file named `config.json` in the Tauri app config directory. On launch, `core::config::load_or_default()` returns the config; if `store_dir` does not exist it is created.
+
+The Settings page has three labeled inputs (AE Title text, listen port number, store directory path) and a Save button. After save, the values round-trip on app restart. The page also displays a non-editable note that this iteration has no TLS or authentication.
+
+Validate the AE Title with `is_valid_ae_title(&str) -> bool`: one to sixteen characters, ASCII printable, no leading or trailing whitespace, no control characters. Reject invalid input at the boundary and return a structured error from the `save_config` Tauri command. The frontend renders that error inline next to the field.
+
+### M2 — Local Store: directory scanner and SQLite index
+
+Create the SOP Instance index. The schema (in `src-tauri/src/store/schema.sql`):
+
+    CREATE TABLE IF NOT EXISTS sop_instances (
+        sop_instance_uid TEXT PRIMARY KEY,
+        series_instance_uid TEXT NOT NULL,
+        study_instance_uid TEXT NOT NULL,
+        patient_id TEXT NOT NULL,
+        patient_name TEXT,
+        study_description TEXT,
+        series_description TEXT,
+        modality TEXT,
+        study_date TEXT,
+        sop_class_uid TEXT NOT NULL,
+        transfer_syntax_uid TEXT NOT NULL,
+        file_path TEXT NOT NULL UNIQUE,
+        size_bytes INTEGER NOT NULL,
+        ingested_at INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_study ON sop_instances(study_instance_uid);
+    CREATE INDEX IF NOT EXISTS idx_series ON sop_instances(series_instance_uid);
+    CREATE INDEX IF NOT EXISTS idx_patient ON sop_instances(patient_id);
+
+The database lives at `<app config dir>/store.sqlite`.
+
+On startup, after config is loaded, run a background scan of `store_dir` recursively. For each file, attempt to parse as DICOM using `dicom_object::open_file(path)`. Extract the tags above. Insert (or replace by `sop_instance_uid`) into the table. Files that fail to parse are skipped with a warning event.
+
+Expose three Tauri commands:
+
+    #[tauri::command] async fn rescan_store(...) -> Result<ScanReport, AppError>
+    #[tauri::command] async fn list_studies(...) -> Result<Vec<StudyRow>, AppError>
+    #[tauri::command] async fn list_series_for_study(study_uid: String, ...) -> Result<Vec<SeriesRow>, AppError>
+
+`ScanReport` returns counts: files seen, parsed, skipped, errored.
+
+The Store page shows a tree: each Study expandable into its Series, each Series expandable into its SOP Instances. A "Rescan now" button triggers `rescan_store`. The header shows the total count.
+
+### M3 — DIMSE spike: C-ECHO SCP
+
+This milestone is the riskiest because it is our first contact with `dicom-ul` association negotiation. Treat it as a prototyping milestone: the goal is to *demonstrate* that we can accept an association and answer one C-ECHO before we go any further.
+
+Add a module `src-tauri/src/dicom/scp.rs`. On app start, spawn a tokio task that binds a TCP listener to `0.0.0.0:<listen_port>` from config. For each accepted connection:
+
+1. Use `dicom_ul::association::server::ServerAssociationOptions` to negotiate the association. Accept the Verification SOP Class (UID `1.2.840.10008.1.1`) on Implicit VR Little Endian (`1.2.840.10008.1.2`) and Explicit VR Little Endian (`1.2.840.10008.1.2.1`).
+2. Read DIMSE PDUs in a loop. When a C-ECHO-RQ arrives, respond with a C-ECHO-RSP with status `0x0000` (Success).
+3. On association release or abort, close the connection.
+
+Emit `activity` events on association open, on each DIMSE message in or out, and on close.
+
+Validation: with Phantom running on `localhost:11112` (the default), and DCMTK installed:
+
+    echoscu -aec PHANTOM -aet TESTSCU localhost 11112
+
+Expected exit code 0 and stdout containing `Received Echo Response (Success)`.
+
+If `dicom-ul` does not expose a clean server API by the time this milestone is implemented, fall back to manually reading PDUs from a `tokio::net::TcpStream` using `dicom_ul::pdu::reader::read_pdu` and writing responses with `dicom_ul::pdu::writer::write_pdu`. The reference for these primitives is the `dicom-rs` repository's `storescp` example. If neither path works after a day of investigation, raise it in the Decision Log and consider an alternative (a thin Rust binding to a small DCMTK helper).
+
+### M4 — SCP C-FIND
+
+Implement Patient Root and Study Root Query/Retrieve Information Models — Find (SOP Class UIDs `1.2.840.10008.5.1.4.1.2.1.1` and `1.2.840.10008.5.1.4.1.2.2.1`). For each C-FIND-RQ:
+
+1. Parse the identifier data set (the query keys).
+2. Translate the keys to SQL. Support these matching key types in this iteration: single value, list of UID, wildcard (`*` and `?`) on `PatientName`, range matching on `StudyDate` (`YYYYMMDD-YYYYMMDD`), and Universal Matching (empty key returns all values).
+3. Query at the requested level (`PATIENT`, `STUDY`, `SERIES`, `IMAGE`).
+4. For each match, emit a C-FIND-RSP with status `0xFF00` (Pending) carrying the identifier with the requested return keys populated.
+5. After the last match, send one final C-FIND-RSP with status `0x0000` (Success).
+
+Validation:
+
+    findscu -P -k QueryRetrieveLevel=STUDY -k PatientID -k StudyInstanceUID \
+            -aec PHANTOM -aet TESTSCU localhost 11112
+
+Expected: zero or more `--`-delimited identifier blocks printed by `findscu` followed by `Releasing Association`. Place a few sample `.dcm` files in `store_dir` before running.
+
+### M5 — SCP C-STORE and live indexing
+
+Accept the Storage SOP Classes for the common modalities at minimum: CT Image Storage (`1.2.840.10008.5.1.4.1.1.2`), MR Image Storage (`1.2.840.10008.5.1.4.1.1.4`), Secondary Capture (`1.2.840.10008.5.1.4.1.1.7`), Ultrasound (`1.2.840.10008.5.1.4.1.1.6.1`), CR (`1.2.840.10008.5.1.4.1.1.1`), DX (`1.2.840.10008.5.1.4.1.1.1.1`), and the Encapsulated PDF SOP Class (`1.2.840.10008.5.1.4.1.1.104.1`). Negotiate Implicit VR Little Endian and Explicit VR Little Endian; also negotiate Explicit VR Big Endian and the JPEG baseline (`1.2.840.10008.1.2.4.50`) for compatibility (we do not decode the pixel data, we just store the bytes).
+
+For each C-STORE-RQ:
+
+1. Read the data set into a `dicom_object::InMemDicomObject`.
+2. Write to `<store_dir>/<study_instance_uid>/<series_instance_uid>/<sop_instance_uid>.dcm`. Create intermediate directories. Use `dicom_object::FileDicomObject::write_to_file` so the file is a valid Part-10 DICOM file with a preamble and meta header.
+3. Insert or replace into the SQLite index.
+4. Respond with C-STORE-RSP status `0x0000` (Success). On parse or write failure respond with status `0xA700` (Out of Resources) or `0xC000` (Processing failure) as appropriate.
+
+Validation:
+
+    storescu -aec PHANTOM -aet TESTSCU localhost 11112 /path/to/sample.dcm
+
+Expected: `storescu` exits 0; the file appears under `store_dir/<study>/<series>/<sop>.dcm`; the row appears in `store.sqlite`; the Store page in the UI reflects the new study after the next rescan (or immediately, if M2's filesystem watcher is wired up).
+
+### M6 — SCP C-MOVE and C-GET
+
+For C-MOVE, accept the Patient Root and Study Root Query/Retrieve Information Models — Move (`1.2.840.10008.5.1.4.1.2.1.2` and `1.2.840.10008.5.1.4.1.2.2.2`). For each C-MOVE-RQ:
+
+1. The request includes a Move Destination AE Title. Resolve that against the configured Peers list (M7). If unknown, respond C-MOVE-RSP status `0xA801` (Move Destination unknown).
+2. Run the query against the index (same logic as C-FIND).
+3. Open a *new* association *as an SCU* to the destination Peer, negotiating the relevant Storage SOP Classes.
+4. For each matched SOP Instance, send a C-STORE-RQ over that association.
+5. Periodically send C-MOVE-RSP `0xFF00` (Pending) updates showing completed / remaining / failed counts.
+6. Send final C-MOVE-RSP `0x0000` (Success) when done, or `0xB000` (sub-operations complete, one or more failures) on partial failure.
+
+For C-GET, accept `1.2.840.10008.5.1.4.1.2.1.3` and `1.2.840.10008.5.1.4.1.2.2.3`. Similar to C-MOVE except the C-STORE-RQ sub-operations go back over the *same* association (presentation contexts for the Storage SOP Classes must be negotiated on that association — this is why C-GET requesters offer Storage SOP Classes as SCP-role contexts at association time).
+
+Validation:
+
+    movescu -P -k QueryRetrieveLevel=STUDY -k StudyInstanceUID=<uid> \
+            -aem TESTSCU -aec PHANTOM -aet TESTSCU \
+            localhost 11112 --port 11113
+
+Here `--port 11113` makes `movescu` start its own SCP on port 11113 so Phantom can send the studies back. Configure a Peer named `TESTSCU` pointing to `localhost:11113` in the Peers page first. Expected: the files arrive in `movescu`'s working directory.
+
+    getscu -P -k QueryRetrieveLevel=STUDY -k StudyInstanceUID=<uid> \
+           -aec PHANTOM -aet TESTSCU localhost 11112
+
+Expected: `getscu` writes the files locally.
+
+### M7 — Peers CRUD
+
+Add a `peers.json` file in the Tauri app config dir holding an array of:
+
+    pub struct Peer {
+        pub id: String,            // UUID v4
+        pub name: String,          // human-readable
+        pub ae_title: String,      // up to 16 ASCII chars, validated
+        pub host: String,          // DNS or IP
+        pub port: u16,
+    }
+
+Tauri commands: `list_peers`, `create_peer`, `update_peer`, `delete_peer`. Validation rules: `name` non-empty, `ae_title` passes `is_valid_ae_title`, `host` non-empty, `port` in `1..=65535`. Reject duplicate `ae_title` at the command boundary.
+
+The Peers page shows a table of peers with row actions (edit, delete) and a "+ Add Peer" button that opens a modal form. Edits and deletes persist immediately.
+
+The Peers list is the resolution source for C-MOVE destinations (M6) and for the SCU page (M8).
+
+### M8 — SCU page: outbound DIMSE
+
+The SCU page has a top section to pick a Peer (dropdown of the configured peer list) and an operation (radio buttons for ECHO, FIND, MOVE, GET, STORE). Below that, an operation-specific form:
+
+- ECHO: no inputs. Button "Send Echo".
+- FIND: dropdown for level (PATIENT, STUDY, SERIES, IMAGE), text inputs for the matching keys (PatientID, PatientName, StudyInstanceUID, StudyDate, Modality), and a "Run Query" button. Results displayed as a table.
+- MOVE: same query inputs as FIND, plus a "Move Destination AE Title" text input. Button "Send Move". Live progress updates from C-MOVE-RSP pending statuses appear under the form.
+- GET: same query inputs as FIND. Button "Send Get". Received SOP Instances are written into `store_dir` and indexed.
+- STORE: a file picker (or drag-and-drop area) listing `.dcm` files to send. Button "Send Store". Per-file progress and status.
+
+Implement these as `#[tauri::command] async fn scu_echo(peer_id: String) -> Result<EchoResult, AppError>`, `scu_find(...)`, `scu_move(...)`, `scu_get(...)`, `scu_store(...)`. The functions construct a `dicom_ul::association::client::ClientAssociation`, negotiate the relevant SOP Classes, exchange the DIMSE messages, and return a structured result.
+
+Validation: against a known external SCP (most easily a second Phantom instance running on a different port, or DCMTK's `storescp -d --port 11113`), every operation succeeds and the Activity log shows the matching outbound association.
+
+### M9 — Activity log: persistent, live, scrollable
+
+Define one event type:
+
+    pub struct ActivityEvent {
+        pub id: i64,                       // autoincrement
+        pub timestamp_ms: i64,             // unix ms
+        pub direction: Direction,          // Inbound | Outbound
+        pub peer_ae_title: Option<String>, // None until association is identified
+        pub peer_host: Option<String>,
+        pub command: Option<String>,       // "C-ECHO-RQ", "C-STORE-RSP", etc.
+        pub status: ActivityStatus,        // Info | Success | Warning | Error
+        pub message: String,               // human-readable
+        pub association_id: String,        // groups events from one association
+    }
+
+Persist to a new SQLite table `activity_events` in `store.sqlite` (capped to the most recent 50,000 rows; trim older rows in a background task). Every event is also `app_handle.emit("activity", &event)` for live streaming.
+
+The Activity page subscribes to the `activity` event with `listen` from `@tauri-apps/api/event`, prepends new events into a virtualized list, and offers filters (direction, status, peer, free-text search) and a "Clear log" button (which truncates the table). A "Pause stream" toggle stops the live prepend without dropping events.
+
+Validation: open the Activity page, then in a terminal run `echoscu -aec PHANTOM -aet TESTSCU localhost 11112`. Expect three rows to appear within one second: association open, C-ECHO-RQ inbound, C-ECHO-RSP outbound, then association close.
+
+### M10 — Worklist stub (placeholder only)
+
+Add a Worklist sidebar entry and an empty page with a single line "Modality Worklist support is planned." Do not implement DMWL SCP in this iteration; the user has explicitly deferred this. The placeholder exists so the future milestone can drop in without re-arranging the sidebar.
+
+## Concrete Steps
+
+Run all commands from the repo root `/Users/xtfer/working/aurabx/_experiments/phantom/` unless stated otherwise.
+
+### Prerequisites
+
+Install the toolchain:
+
+    # Node (use a recent LTS via nvm or homebrew)
+    node --version    # expect v20.x or v22.x
+    npm --version
+
+    # Rust toolchain
+    rustup --version
+    rustc --version   # expect 1.78+ (Tauri 2 minimum) — newer is fine
+
+    # macOS build dependency
+    xcode-select --install   # if not already present
+
+    # DCMTK (used for verification across all milestones)
+    brew install dcmtk
+    echoscu --version
+
+### M0 — scaffold
+
+Create the Tauri 2 project. We do this by hand (not via `create-tauri-app`) because the surrounding rules in this repo prescribe specific file layouts.
+
+    # 1. Frontend setup
+    npm init -y
+    # Set "name" in package.json to "phantom" and "type" to "module".
+    npm install --save-dev typescript vite @vitejs/plugin-react
+    npm install react react-dom
+    npm install --save-dev @types/react @types/react-dom
+    npm install lucide-react
+    npm install --save-dev tailwindcss@^4 @tailwindcss/vite
+
+    # 2. Tauri CLI (use the v2 CLI as a dev dependency so it's pinned per-project)
+    npm install --save-dev @tauri-apps/cli@^2 @tauri-apps/api@^2
+    npx tauri init   # answer: app name "phantom", window title "Phantom",
+                     # frontend dist "../dist", dev URL "http://localhost:5173",
+                     # before dev cmd "npm run dev", before build cmd "npm run build".
+
+This produces `src-tauri/`. Then create the frontend tree (full contents are listed in "Plan of Work" above):
+
+    mkdir -p src/components src/pages src/lib
+    # Author index.html, src/main.tsx, src/App.tsx, src/index.css with @import "tailwindcss";
+    # src/components/Sidebar.tsx, and the five empty src/pages/*.tsx files.
+
+Edit `src-tauri/src/lib.rs` so its `run` function registers a `ping` command:
+
+    #[tauri::command]
+    fn ping() -> &'static str { "pong" }
+
+    #[cfg_attr(mobile, tauri::mobile_entry_point)]
+    pub fn run() {
+        tauri::Builder::default()
+            .invoke_handler(tauri::generate_handler![ping])
+            .run(tauri::generate_context!())
+            .expect("error while running tauri application");
+    }
+
+Expected: `npm run tauri dev` opens a window. The console shows `pong` from `App.tsx` (which calls `invoke("ping")` on mount and `console.log`s the result). The sidebar shows five entries, each routes to an empty page.
+
+### M1 — config and Settings page
+
+    # Backend
+    # In src-tauri/Cargo.toml under [dependencies]:
+    #   tauri-plugin-store = "2"
+    #   serde = { version = "1", features = ["derive"] }
+    #   serde_json = "1"
+    #   tokio = { version = "1", features = ["full"] }
+    #   thiserror = "1"
+    #   anyhow = "1"
+    # In src-tauri/src/lib.rs, add .plugin(tauri_plugin_store::Builder::new().build())
+    # Implement core::config::{AppConfig, load_or_default, save}.
+    # Implement is_valid_ae_title.
+    # Expose Tauri commands get_config and save_config.
+
+    # Frontend
+    npm install @tauri-apps/plugin-store
+
+Run `npm run tauri dev`. On the Settings page, set AE Title to `PHANTOM`, port to `11112`, store dir to `~/dicom-store`, click Save. Close the app. Reopen. The same values appear. Test invalid input: AE Title `"a really long title with spaces"` is rejected with an inline error and the previous value is preserved.
+
+### M2 — Local Store index
+
+    # In src-tauri/Cargo.toml:
+    #   rusqlite = { version = "0.32", features = ["bundled"] }
+    #   dicom = "0.7"               # double-check the latest published version at impl time
+    #   dicom-object = "0.7"
+    #   walkdir = "2"
+    #   notify = "6"                # filesystem watcher (used at M5 too)
+    #   chrono = { version = "0.4", features = ["serde"] }
+
+Implement `core::store::{Index, open_index, ScanReport, scan, query_studies, query_series, query_instances}`. The scanner walks `store_dir` with `walkdir`, parses each file with `dicom_object::open_file`, extracts the tags listed in M2's schema, and writes rows. On first launch with an empty config dir, the SQLite file is created from `schema.sql`.
+
+Validation: drop a known sample DICOM file (any anonymised CT or MR slice you have on disk) into `~/dicom-store`. Click "Rescan now" on the Store page. The study appears in the tree.
+
+### M3 — C-ECHO SCP
+
+    # In src-tauri/Cargo.toml:
+    #   dicom-ul = "0.7"
+    #   dicom-encoding = "0.7"
+    #   dicom-transfer-syntax-registry = "0.7"
+    #   dicom-dictionary-std = "0.7"
+
+Implement `core::dicom::scp::{Server, run_server}`. On `App::run`, spawn `tokio::spawn(run_server(config, app_handle))`. For each accepted TCP connection, run the association negotiation accepting Verification SOP Class only, then loop reading PDUs. On C-ECHO-RQ, send C-ECHO-RSP success.
+
+Validation:
+
+    # In terminal A, leave Phantom running.
+    # In terminal B:
+    echoscu -v -aec PHANTOM -aet TESTSCU localhost 11112
+
+Expected DCMTK output:
+
+    I: Requesting Association
+    I: Association Accepted (Max Send PDV: ...)
+    I: Sending Echo Request (MsgID 1)
+    I: Received Echo Response (Success)
+    I: Releasing Association
+
+The Activity page (still empty at this point — we have not yet wired the UI) should at least see the events through `app_handle.emit` printed in the dev console.
+
+### M4 through M9
+
+Follow the implementation outline in "Plan of Work" above. For each milestone:
+
+1. Add the relevant code under `src-tauri/src/dicom/` and `src-tauri/src/store/`.
+2. Add or update the corresponding page under `src/pages/`.
+3. Add the Tauri commands to the `generate_handler!` macro.
+4. Run the DCMTK verification command listed in the milestone.
+5. Tick off the matching checkbox in the `Progress` section with a timestamp, and commit.
+
+Frequent commits are expected — one per milestone at minimum, more often is encouraged. Commit messages should reference the milestone, for example `M3: C-ECHO SCP responds successfully to echoscu`.
+
+### M10 — worklist stub
+
+Add `src/pages/Worklist.tsx` containing one paragraph, register it in the sidebar, and tick off the box. No backend code.
+
+## Validation and Acceptance
+
+The final acceptance gate is a scripted end-to-end exercise:
+
+1. Build a release: `npm run tauri build`. The result is `src-tauri/target/release/bundle/macos/Phantom.app`. Open it.
+2. On Settings, configure AE Title `PHANTOM`, port `11112`, store dir `~/dicom-store-test` (created automatically).
+3. On Peers, add a peer named "DCMTK" with AE Title `TESTSCU`, host `localhost`, port `11113`.
+4. In a terminal:
+
+       # Have a few real DICOM files on hand. If you do not, generate dummy ones with:
+       img2dcm --input-format JPEG sample.jpg /tmp/sample.dcm   # from dcmtk
+
+       # Send three files to Phantom via C-STORE.
+       storescu -aec PHANTOM -aet TESTSCU localhost 11112 /tmp/sample.dcm
+       storescu -aec PHANTOM -aet TESTSCU localhost 11112 /tmp/sample2.dcm
+       storescu -aec PHANTOM -aet TESTSCU localhost 11112 /tmp/sample3.dcm
+
+5. On the Store page, three new SOP Instances are visible.
+6. On the SCU page, select peer "DCMTK", operation `C-FIND`, level `STUDY`, click Run Query. While that runs in another terminal start `storescp --port 11113 -od /tmp/sink -aet TESTSCU` so the move destination exists. Results appear in the SCU page.
+7. On the SCU page, select operation `C-MOVE` with the same query and destination `TESTSCU`. Phantom opens an outbound association to localhost:11113 and forwards the studies. `/tmp/sink` fills with the files.
+8. On the Activity page, every step above appears in chronological order: inbound C-STORE-RQ, C-STORE-RSP, outbound C-MOVE-RQ, C-FIND-RQ, the move sub-operations as outbound C-STORE-RQ to TESTSCU, and the final C-MOVE-RSP success.
+
+The plan is accepted when steps 1 through 8 complete without errors and the observable behavior matches.
+
+## Idempotence and Recovery
+
+The milestones are additive. Re-running any of the build commands or the DCMTK verifications is safe: the SQLite index uses `INSERT OR REPLACE` on `sop_instance_uid`, the store directory uses content-addressed paths (`<study>/<series>/<sop>.dcm`), and the activity log appends only.
+
+If the SQLite database becomes inconsistent with disk (manual edits, partial scans), delete `<app config dir>/store.sqlite` and restart the app. The scanner rebuilds the index from the directory.
+
+If the Tauri build fails on a clean machine, the most common causes are: missing Xcode command-line tools (`xcode-select --install`); missing Rust toolchain (`rustup install stable`); a corrupted `node_modules` (`rm -rf node_modules && npm install`); or an out-of-date `@tauri-apps/cli` (`npm install --save-dev @tauri-apps/cli@latest`).
+
+Listening port `11112` may be in use; either change the port in Settings or run `lsof -i :11112` to find the offender. The DICOM-registered port is `104`, but binding below 1024 requires root on macOS, so we default to `11112` (the de facto convention for development).
+
+## Artifacts and Notes
+
+A typical successful echoscu verification at M3 should produce something like:
+
+    $ echoscu -v -aec PHANTOM -aet TESTSCU localhost 11112
+    I: Requesting Association
+    I: Association Accepted (Max Send PDV: 16372)
+    I: Sending Echo Request (MsgID 1)
+    I: Received Echo Response (Success)
+    I: Releasing Association
+    $ echo $?
+    0
+
+A typical SQLite row after a successful storescu at M5:
+
+    $ sqlite3 ~/Library/Application\ Support/cloud.aurabox.phantom/store.sqlite \
+        'SELECT sop_instance_uid, study_instance_uid, modality, file_path FROM sop_instances LIMIT 3;'
+    1.2.840...1234|1.2.840...5678|CT|/Users/xtfer/dicom-store-test/1.2.840...5678/1.2.840...9012/1.2.840...1234.dcm
+
+Keep these examples up to date in this section as evidence accumulates.
+
+## Interfaces and Dependencies
+
+Versions captured from npm and crates.io on 2026-05-23. Use the `^` ranges below; allow patch and minor upgrades, lock the major. If a newer major release renames any of the symbols this plan references, update this section.
+
+Crate versions (Rust, `src-tauri/Cargo.toml`):
+
+    [build-dependencies]
+    tauri-build = { version = "2.6", features = [] }
+
+    [dependencies]
+    tauri = { version = "2.11", features = [] }
+    tauri-plugin-store = "2.4"
+    serde = { version = "1.0", features = ["derive"] }
+    serde_json = "1.0"
+    tokio = { version = "1.52", features = ["full"] }
+    thiserror = "2.0"
+    anyhow = "1.0"
+    chrono = { version = "0.4", features = ["serde"] }
+    uuid = { version = "1.23", features = ["v4", "serde"] }
+    walkdir = "2.5"
+    notify = "8.2"
+    rusqlite = { version = "0.39", features = ["bundled"] }
+    dicom = "0.9"
+    dicom-object = "0.9"
+    dicom-encoding = "0.9"
+    dicom-transfer-syntax-registry = "0.9"
+    dicom-dictionary-std = "0.9"
+    dicom-ul = "0.9"
+    tracing = "0.1"
+    tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+Package versions (npm, `package.json`):
+
+    {
+      "dependencies": {
+        "@tauri-apps/api": "^2.11",
+        "@tauri-apps/plugin-store": "^2.4",
+        "react": "^19.2",
+        "react-dom": "^19.2",
+        "lucide-react": "^1.16"
+      },
+      "devDependencies": {
+        "@tauri-apps/cli": "^2.11",
+        "@types/react": "^19.2",
+        "@types/react-dom": "^19.2",
+        "@vitejs/plugin-react": "^5.2",
+        "typescript": "^6.0",
+        "vite": "^7.3",
+        "tailwindcss": "^4.3",
+        "@tailwindcss/vite": "^4.3"
+      }
+    }
+
+In `src-tauri/src/core.rs`, declare the module tree:
+
+    pub mod config;
+    pub mod store;
+    pub mod dicom;
+    pub mod activity;
+    pub mod peers;
+
+In `src-tauri/src/core/config.rs`, define:
+
+    pub struct AppConfig { pub local_ae_title: String, pub listen_port: u16, pub store_dir: PathBuf }
+    pub fn load_or_default(app: &tauri::AppHandle) -> Result<AppConfig, AppError>;
+    pub fn save(app: &tauri::AppHandle, cfg: &AppConfig) -> Result<(), AppError>;
+    pub fn is_valid_ae_title(s: &str) -> bool;
+    pub fn is_valid_name(s: &str) -> bool;
+
+In `src-tauri/src/core/store/mod.rs`:
+
+    pub struct Index { /* opaque, wraps rusqlite::Connection in a Mutex */ }
+    pub fn open_index(path: &Path) -> Result<Index, AppError>;
+    impl Index {
+        pub fn ingest_file(&self, path: &Path) -> Result<IngestOutcome, AppError>;
+        pub fn rescan_dir(&self, dir: &Path) -> Result<ScanReport, AppError>;
+        pub fn query_studies(&self, q: &FindQuery) -> Result<Vec<StudyRow>, AppError>;
+        pub fn query_series(&self, study_uid: &str) -> Result<Vec<SeriesRow>, AppError>;
+        pub fn query_instances(&self, series_uid: &str) -> Result<Vec<InstanceRow>, AppError>;
+    }
+
+In `src-tauri/src/core/dicom/scp.rs`:
+
+    pub async fn run_server(cfg: AppConfig, app: tauri::AppHandle, idx: Arc<Index>, peers: Arc<PeersStore>) -> Result<(), AppError>;
+
+In `src-tauri/src/core/dicom/scu.rs`:
+
+    pub async fn c_echo(peer: &Peer, calling_ae: &str) -> Result<EchoResult, AppError>;
+    pub async fn c_find(peer: &Peer, calling_ae: &str, q: &FindQuery) -> Result<Vec<Identifier>, AppError>;
+    pub async fn c_move(peer: &Peer, calling_ae: &str, q: &FindQuery, dest_ae: &str) -> Result<MoveOutcome, AppError>;
+    pub async fn c_get(peer: &Peer, calling_ae: &str, q: &FindQuery, idx: &Index, store_dir: &Path) -> Result<GetOutcome, AppError>;
+    pub async fn c_store(peer: &Peer, calling_ae: &str, files: &[PathBuf]) -> Result<Vec<StoreOutcome>, AppError>;
+
+The Tauri commands in `src-tauri/src/lib.rs` are thin shims around these — they take `tauri::State<Arc<...>>` for shared state, call the function, and translate `AppError` into a `Result<T, String>` for the frontend.
+
+`AppError` is defined in `src-tauri/src/core/error.rs` using `thiserror::Error`. All boundary failures (config IO, SQLite, DICOM parse, network, validation) are variants of this single enum. The frontend never sees panics; commands never `unwrap` on inputs.
+
+## Revision history
+
+This is the inaugural revision of `PLAN.md`. It establishes the eleven milestones, the technology choices, and the verification approach. No code yet exists.
