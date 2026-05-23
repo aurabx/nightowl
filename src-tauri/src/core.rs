@@ -1,10 +1,17 @@
 //! Shared business logic. Tauri commands in `lib.rs` should remain thin
 //! wrappers that call into this module.
 //!
-//! At M0 this only exposes a smoke-test `ping`. Modules for config, store,
-//! peers, activity, and dicom will be added by later milestones.
+//! Submodules:
+//! - `config`  — persistent application configuration and validators.
+//! - `error`   — the single error type returned across the IPC boundary.
+//!
+//! Later milestones will add `store`, `peers`, `activity`, and `dicom`.
 
-/// Returns a fixed greeting used by the frontend IPC self-check.
+pub mod config;
+pub mod error;
+
+/// IPC self-check used by the frontend on mount. Returns the fixed string
+/// `"pong"`; if the frontend sees anything else, the IPC channel is broken.
 pub fn ping() -> &'static str {
     "pong"
 }

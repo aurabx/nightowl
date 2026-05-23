@@ -35,7 +35,7 @@ When the user said "managing associated instances" we interpret that as managing
 Use a list with checkboxes to summarize granular steps. Every stopping point must be documented here, even if it requires splitting a partially completed task into two. This section must always reflect the actual current state of the work.
 
 - [x] (2026-05-23) M0: Tauri 2 + React 19 + TS 6 + Tailwind v4 + lucide-react scaffold compiles via `cargo check`, builds via `npm run build`, and launches via `npm run tauri dev`. Sidebar shows Peers / SCU / Activity / Store / Settings. Frontend calls `invoke("ping")` on mount and renders the `pong` reply in the footer.
-- [ ] M1: Settings page persists a config (local AE Title, listen port, store directory) to disk and reloads on launch.
+- [x] (2026-05-23) M1: Settings page persists a config (local AE Title, listen port, store directory) to disk and reloads on launch. `AppConfig` + validators in `src-tauri/src/core/config.rs`, `AppError` discriminated union in `core/error.rs`, `get_config` / `save_config` Tauri commands in `lib.rs`, Settings UI in `src/pages/Settings.tsx`, shared API client + types in `src/lib/api.ts`. Eight backend unit tests passing.
 - [ ] M2: Local Store scanner indexes a directory of DICOM files into a SQLite database and the Store page can browse the Patient / Study / Series / SOP Instance hierarchy.
 - [ ] M3: SCP listener accepts an association and answers C-ECHO. Verified by `echoscu` from DCMTK.
 - [ ] M4: SCP C-FIND returns matching identifiers from the local index. Verified by `findscu` from DCMTK.
@@ -63,6 +63,13 @@ Document unexpected behaviors, bugs, optimizations, or insights discovered durin
 - Observation (M0): The Tauri 2 CLI does not ship default placeholder icons inside `node_modules/@tauri-apps/cli/templates/...` the way the v1 CLI did. The user must supply a source image.
   Evidence: `find node_modules/@tauri-apps/cli -name "*.png"` returned no results after install.
   Resolution: Used Python's stdlib (`struct`, `zlib`) to write a valid 1024×1024 PNG to `/tmp/phantom-source.png` for `tauri icon` to resample. The script is in this plan's Concrete Steps; no third-party imaging tool required.
+
+- Observation (M1): Rustdoc tries to compile indented blocks AND fenced blocks with no language tag inside `///` comments as Rust doctests. A JSON example formatted as an indented block under "the frontend sees, for example:" caused `cargo test` to fail with a syntax error.
+  Evidence: `running 1 test ... test src/core/error.rs - core::error::AppError (line 25) ... FAILED ... error: expected one of '.', ';', '?', '}', or an operator, found ':'`.
+  Resolution: Reformat the JSON example as an inline backtick span rather than an indented block. For any future multi-line non-Rust example in a doc comment, use a fenced block tagged ` ```text ` or ` ```json ` so rustdoc skips it.
+
+- Observation (M1): On a fresh launch with no prior `config.json`, the Tauri setup callback does create the app config directory and the default `store_dir` (`~/dicom-store`) but does NOT write a config file. The config file is only written when the user clicks Save. This is intentional but a future reader could be surprised that "first launch" leaves the directory empty.
+  Evidence: After 75 seconds of `npm run tauri dev` against a clean `~/Library/Application Support/cloud.aurabox.phantom/` and `~/dicom-store/`, both directories existed but `config.json` did not. Documented here so M3 (SCP listener) knows that `cfg.store_dir` is guaranteed to exist by the time the listener starts but `config.json` may not.
 
 ## Decision Log
 
@@ -108,6 +115,18 @@ Record every decision in the format below.
   Rationale: Vite 8 has hard-coded Rolldown bindings that require Node `^20.19.0 || >=22.12.0`. The user's machine runs Node 20.16. npm silently drops the rolldown native binding on engine mismatch, so `vite build` fails with a module-not-found at runtime. Vite 7 uses Rollup, has no native binding requirement, and works on Node 20.16. When Node is upgraded to 22 LTS (recommended), the constraint can be relaxed back to `^8`.
   Date/Author: 2026-05-23 / plan author.
 
+- Decision (M1): Persist `config.json` with plain `serde_json` + `std::fs` (atomic write-temp-then-rename) instead of `tauri-plugin-store`.
+  Rationale: The plugin is a key-value store optimised for frontend access with change watchers. For one typed config struct touched only on Save, it adds a runtime dependency without value, and forces `core::config` to depend on Tauri (which makes it impossible to unit-test without an `AppHandle`). The plain implementation takes `&Path`, so the six unit tests around `validate`, `load_or_default`, and `save` round-trip without booting Tauri. The `@tauri-apps/plugin-store` frontend dependency was removed.
+  Date/Author: 2026-05-23 / M1 implementer.
+
+- Decision (M1): Reject listen ports below 1024 in `validate(&AppConfig)`.
+  Rationale: Binding below 1024 requires root on macOS. If we accepted, e.g., the DICOM-registered port 104, the SCP listener (M3) would silently fail at bind time. Failing fast at validation surfaces the constraint where the user sees it.
+  Date/Author: 2026-05-23 / M1 implementer.
+
+- Decision (M1): Tauri commands use snake_case field names on the JSON wire (`local_ae_title`, not `localAeTitle`).
+  Rationale: The wire shape mirrors the on-disk `config.json` and the Rust struct exactly — one vocabulary throughout. The TypeScript `AppConfig` interface in `src/lib/api.ts` declares snake_case fields, which is unusual for JS but trades a small style oddity for full schema alignment.
+  Date/Author: 2026-05-23 / M1 implementer.
+
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
@@ -141,6 +160,46 @@ Follow-on observations (worth fixing soon, not blocking M1):
 
 - The user's Node is 20.16 which is below Vite 8's required 20.19+. Upgrading to Node 22 LTS would let us bump Vite back to the absolute latest. Not done in M0 because changing the developer's runtime is out of scope.
 - `CLAUDE.md` still says "React 18". The Decision Log captures the deviation but `CLAUDE.md` itself should be updated by the project owner to keep the documentation honest.
+
+### M1 (2026-05-23)
+
+What landed: a persistent, validated application configuration with a Settings UI. The user can change the local AE Title, the listen port, and the store directory; invalid input is rejected at the Rust boundary with a structured error the frontend renders inline; valid input is written atomically to `~/Library/Application Support/cloud.aurabox.phantom/config.json` and round-trips across restarts.
+
+Backend pieces (in `src-tauri/src/core/`):
+
+- `error.rs` — single `AppError` enum, externally tagged `Serialize` (`{kind, message}`). Variants: `Io`, `Json`, `Validation` (with `field` + `reason`), `Tauri`, `Internal`. `From` impls for `std::io::Error`, `serde_json::Error`, `tauri::Error`.
+- `config.rs` — `AppConfig` struct, `default_with_home`, `is_valid_ae_title`, `validate`, `load_or_default`, `save` (atomic via write-temp + rename). Zero Tauri imports; functions take `&Path`. Six unit tests cover both happy and validation-failure paths.
+- `lib.rs` — `AppState { config: Mutex<AppConfig> }` registered via `app.manage`; `setup` resolves `app_config_dir`, creates both dirs, loads the config, seeds the state. `#[tauri::command] get_config / save_config` shim into core::config.
+
+Frontend pieces:
+
+- `src/lib/api.ts` — typed `AppConfig`, `AppError` discriminated union, `isAppError` guard, `formatError` helper, and `getConfig` / `saveConfig` thin wrappers around `invoke`.
+- `src/components/Field.tsx` — label + hint + inline-error wrapper used by every form input.
+- `src/pages/Settings.tsx` — three inputs (text, number, text), Save and Revert buttons (disabled when not dirty), saved-indicator, an amber warning panel calling out the no-TLS / no-auth posture.
+
+Verification:
+
+    $ cargo test
+    test result: ok. 8 passed; 0 failed; ...
+    $ npm run build
+    ✓ 1761 modules transformed.
+    ✓ built in 1.14s
+    $ rm -f ~/Library/Application\ Support/cloud.aurabox.phantom/config.json
+    $ npm run tauri dev   # killed after 75s
+    Finished `dev` profile target(s) in 1.72s
+    Running `target/debug/phantom`
+    # After kill:
+    $ ls ~/Library/Application\ Support/cloud.aurabox.phantom/
+    (directory created, no config.json yet — expected; setup only creates dirs)
+    $ ls ~/dicom-store/
+    (directory created from default)
+
+Gaps to address before M2: none. The config plumbing is what M2's SQLite indexer needs.
+
+Follow-on observations:
+
+- The Settings page accepts a free-text store directory path. A native folder picker (via `tauri-plugin-dialog`) would be a much better UX. Adding it in M2 alongside the Store page makes more sense than retrofitting M1.
+- The current SCP-listener-required restart on port change is not yet enforced (because M1 has no SCP listener). When M3 lands, `save_config` will need to either gracefully rebind or surface "restart required" to the user.
 
 ## Context and Orientation
 
