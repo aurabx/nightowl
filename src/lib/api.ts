@@ -142,10 +142,16 @@ export interface ActivityFilter {
   search?: string;
   since_ms?: number;
   limit?: number;
+  offset?: number;
 }
 
-export function listActivity(filter?: ActivityFilter): Promise<ActivityEvent[]> {
-  return invoke<ActivityEvent[]>("list_activity", { filter });
+export interface ActivityPage {
+  events: ActivityEvent[];
+  total: number;
+}
+
+export function listActivity(filter?: ActivityFilter): Promise<ActivityPage> {
+  return invoke<ActivityPage>("list_activity", { filter });
 }
 
 export function clearActivity(): Promise<void> {

@@ -72,9 +72,20 @@ pub struct ActivityFilter {
     /// Lower bound on `timestamp_ms`; results return events newer than
     /// this. Useful for incremental polling.
     pub since_ms: Option<i64>,
-    /// Maximum number of rows returned. Capped at `MAX_LIMIT` even when
-    /// callers ask for more.
+    /// Page size. Capped at `MAX_LIMIT` even when callers ask for more.
     pub limit: Option<i64>,
+    /// Zero-based row offset from the start of the (filtered, newest-
+    /// first) result set. Combined with `limit` to drive page-based
+    /// pagination on the UI.
+    pub offset: Option<i64>,
+}
+
+/// A page of activity events plus the total matching count, so the UI
+/// can render `Page X of Y` without a separate round trip.
+#[derive(Debug, Clone, Serialize)]
+pub struct ActivityPage {
+    pub events: Vec<PersistedActivityEvent>,
+    pub total: i64,
 }
 
 const DEFAULT_LIMIT: i64 = 500;
@@ -139,17 +150,22 @@ impl ActivityLog {
         Ok(PersistedActivityEvent { id, event })
     }
 
-    /// Returns matching rows ordered newest first.
-    pub fn list(&self, filter: ActivityFilter) -> Result<Vec<PersistedActivityEvent>, AppError> {
+    /// Returns a page of matching rows (newest first) plus the total
+    /// matching count, so the UI can render `Page X of Y` without a
+    /// second round trip.
+    pub fn list(&self, filter: ActivityFilter) -> Result<ActivityPage, AppError> {
         let conn = self.lock()?;
 
         let limit = filter
             .limit
             .unwrap_or(DEFAULT_LIMIT)
             .clamp(1, MAX_LIMIT);
+        let offset = filter.offset.unwrap_or(0).max(0);
 
         // Build the WHERE clause dynamically. Each clause appends to
-        // `where_parts` and pushes a value into `bound`.
+        // `where_parts` and pushes a value into `bound`. We reuse the
+        // bindings for both the SELECT and the COUNT — that is why
+        // they are collected first.
         let mut where_parts: Vec<&'static str> = Vec::new();
         let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -190,21 +206,30 @@ impl ActivityLog {
             format!("WHERE {}", where_parts.join(" AND "))
         };
 
+        let count_params: Vec<&dyn rusqlite::ToSql> =
+            bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let total: i64 = conn.query_row(
+            &format!("SELECT COUNT(*) FROM activity_events {where_sql}"),
+            count_params.as_slice(),
+            |r| r.get(0),
+        )?;
+
         let sql = format!(
             "SELECT id, timestamp_ms, direction, peer_ae_title, peer_host,
                     command, status, message, association_id
              FROM activity_events
              {where_sql}
              ORDER BY id DESC
-             LIMIT {limit}"
+             LIMIT {limit} OFFSET {offset}"
         );
 
         let mut stmt = conn.prepare(&sql)?;
-        let params: Vec<&dyn rusqlite::ToSql> = bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
-        let rows = stmt
-            .query_map(params.as_slice(), map_persisted_row)?
+        let select_params: Vec<&dyn rusqlite::ToSql> =
+            bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let events = stmt
+            .query_map(select_params.as_slice(), map_persisted_row)?
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(rows)
+        Ok(ActivityPage { events, total })
     }
 
     /// Deletes every row. The UI exposes this behind a "Clear log"
@@ -340,9 +365,10 @@ mod tests {
         let persisted = log.record(sample_event("hello")).expect("record");
         assert!(persisted.id > 0);
 
-        let rows = log.list(ActivityFilter::default()).expect("list");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].event.message, "hello");
+        let page = log.list(ActivityFilter::default()).expect("list");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.events.len(), 1);
+        assert_eq!(page.events[0].event.message, "hello");
     }
 
     #[test]
@@ -356,9 +382,10 @@ mod tests {
             search: Some("echo".to_string()),
             ..Default::default()
         };
-        let rows = log.list(filter).expect("list");
-        assert_eq!(rows.len(), 1);
-        assert!(rows[0].event.message.contains("ECHO"));
+        let page = log.list(filter).expect("list");
+        assert_eq!(page.total, 1);
+        assert_eq!(page.events.len(), 1);
+        assert!(page.events[0].event.message.contains("ECHO"));
     }
 
     #[test]
@@ -378,9 +405,9 @@ mod tests {
         log.record(sample_event("second")).unwrap();
         log.record(sample_event("third")).unwrap();
 
-        let rows = log.list(ActivityFilter::default()).expect("list");
-        assert_eq!(rows[0].event.message, "third");
-        assert_eq!(rows[2].event.message, "first");
+        let page = log.list(ActivityFilter::default()).expect("list");
+        assert_eq!(page.events[0].event.message, "third");
+        assert_eq!(page.events[2].event.message, "first");
     }
 
     #[test]
@@ -389,12 +416,34 @@ mod tests {
         for i in 0..10 {
             log.record(sample_event(&format!("msg-{i}"))).unwrap();
         }
-        let rows = log
+        let page = log
             .list(ActivityFilter {
                 limit: Some(3),
                 ..Default::default()
             })
             .expect("list");
-        assert_eq!(rows.len(), 3);
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.total, 10);
+    }
+
+    #[test]
+    fn offset_skips_rows() {
+        let (_path, log) = temp_log();
+        for i in 0..10 {
+            log.record(sample_event(&format!("msg-{i}"))).unwrap();
+        }
+        // Newest first means msg-9 .. msg-0. Offset 5 with limit 3
+        // should return msg-4, msg-3, msg-2.
+        let page = log
+            .list(ActivityFilter {
+                limit: Some(3),
+                offset: Some(5),
+                ..Default::default()
+            })
+            .expect("list");
+        assert_eq!(page.events.len(), 3);
+        assert_eq!(page.events[0].event.message, "msg-4");
+        assert_eq!(page.events[2].event.message, "msg-2");
+        assert_eq!(page.total, 10);
     }
 }

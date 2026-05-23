@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
-use core::activity::{ActivityFilter, ActivityLog, PersistedActivityEvent};
+use core::activity::{ActivityFilter, ActivityLog, ActivityPage};
 use core::config::{AppConfig, load_or_default, save};
 use core::dimse::{start_listener, ListenerHandle};
 use core::error::AppError;
@@ -155,7 +155,7 @@ fn total_instance_count(state: State<'_, AppState>) -> Result<i64, AppError> {
 fn list_activity(
     log: State<'_, Arc<ActivityLog>>,
     filter: Option<ActivityFilter>,
-) -> Result<Vec<PersistedActivityEvent>, AppError> {
+) -> Result<ActivityPage, AppError> {
     log.list(filter.unwrap_or_default())
 }
 
