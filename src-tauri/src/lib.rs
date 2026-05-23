@@ -8,44 +8,51 @@
 mod core;
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, Manager, State};
+use tauri::{AppHandle, Emitter, Manager, State};
 
 use core::config::{AppConfig, load_or_default, save};
 use core::error::AppError;
+use core::store::{Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
 
 /// Process-wide state shared across Tauri commands.
-///
-/// At M1 this holds only the configuration. Later milestones will add the
-/// SQLite index handle, the SCP listener handle, the peers store, etc.
 struct AppState {
     config: Mutex<AppConfig>,
+    /// SOP Instance index. Cloning the `Arc` is the cheap way to share
+    /// the SQLite-backed store with the background rescan task and
+    /// every command thread.
+    index: Arc<Index>,
 }
+
+// ---------------------------------------------------------------------
+// Tauri-aware path helpers
+// ---------------------------------------------------------------------
 
 /// Returns the path to `config.json` inside the platform-specific app
-/// config directory. Tauri resolves `app_config_dir` based on the
-/// `identifier` in `tauri.conf.json` (here: `cloud.aurabox.phantom`),
-/// which on macOS is `~/Library/Application Support/cloud.aurabox.phantom`.
+/// config directory.
 fn config_path(app: &AppHandle) -> Result<PathBuf, AppError> {
-    let dir = app
-        .path()
-        .app_config_dir()
-        .map_err(|e| AppError::Tauri(e.to_string()))?;
-    Ok(dir.join("config.json"))
+    Ok(app_config_dir(app)?.join("config.json"))
 }
 
-/// Resolves the user's home directory through Tauri so the same logic
-/// works on every platform.
+/// Returns the path to `store.sqlite` inside the platform-specific app
+/// config directory. The SOP Instance index lives next to `config.json`.
+fn index_path(app: &AppHandle) -> Result<PathBuf, AppError> {
+    Ok(app_config_dir(app)?.join("store.sqlite"))
+}
+
+fn app_config_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
+    app.path()
+        .app_config_dir()
+        .map_err(|e| AppError::Tauri(e.to_string()))
+}
+
 fn home_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
     app.path()
         .home_dir()
         .map_err(|e| AppError::Tauri(e.to_string()))
 }
 
-/// Locks the config mutex and clones the current value. We hold the
-/// lock only long enough to copy out, never across an `await`. Mutex
-/// poisoning is reported as an `Internal` error rather than panicking.
 fn read_config(state: &AppState) -> Result<AppConfig, AppError> {
     state
         .config
@@ -54,21 +61,20 @@ fn read_config(state: &AppState) -> Result<AppConfig, AppError> {
         .map_err(|_| AppError::Internal("config mutex poisoned".to_string()))
 }
 
+// ---------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------
+
 #[tauri::command]
 fn ping() -> &'static str {
     core::ping()
 }
 
-/// Returns the currently loaded configuration.
 #[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<AppConfig, AppError> {
     read_config(&state)
 }
 
-/// Validates `cfg`, writes it to disk, and updates the in-memory copy on
-/// success. The frontend should re-render with the new values after this
-/// command resolves; we also return the saved config for symmetry with
-/// `get_config`.
 #[tauri::command]
 fn save_config(
     app: AppHandle,
@@ -85,15 +91,75 @@ fn save_config(
     Ok(cfg)
 }
 
+/// Walks the configured store directory and re-ingests every file.
+///
+/// Runs the synchronous scan in `spawn_blocking` so the Tauri async
+/// runtime stays responsive for the rest of the UI. On completion the
+/// `ScanReport` is also broadcast as a `store/scan-completed` event so
+/// the Store page can re-fetch without a polling loop.
+#[tauri::command]
+async fn rescan_store(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<ScanReport, AppError> {
+    let idx = state.index.clone();
+    let dir = read_config(&state)?.store_dir;
+
+    let report = tauri::async_runtime::spawn_blocking(move || idx.rescan_dir(&dir))
+        .await
+        .map_err(|e| AppError::Internal(format!("rescan join error: {e}")))??;
+
+    let _ = app.emit("store/scan-completed", &report);
+    Ok(report)
+}
+
+#[tauri::command]
+fn list_studies(state: State<'_, AppState>) -> Result<Vec<StudyRow>, AppError> {
+    state.index.list_studies()
+}
+
+#[tauri::command]
+fn list_series_for_study(
+    state: State<'_, AppState>,
+    study_uid: String,
+) -> Result<Vec<SeriesRow>, AppError> {
+    state.index.list_series_for_study(&study_uid)
+}
+
+#[tauri::command]
+fn list_instances_for_series(
+    state: State<'_, AppState>,
+    series_uid: String,
+) -> Result<Vec<InstanceRow>, AppError> {
+    state.index.list_instances_for_series(&series_uid)
+}
+
+#[tauri::command]
+fn total_instance_count(state: State<'_, AppState>) -> Result<i64, AppError> {
+    state.index.total_instance_count()
+}
+
+// ---------------------------------------------------------------------
+// Entrypoint
+// ---------------------------------------------------------------------
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Best-effort tracing setup; honour RUST_LOG when present, default
+    // to phantom_lib=info,warn so we see scan summaries without drowning
+    // in noise from upstream crates.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "phantom_lib=info,warn".parse().unwrap()),
+        )
+        .try_init();
+
     tauri::Builder::default()
         .setup(|app| {
             let handle = app.handle();
             let cfg_path = config_path(handle)?;
 
-            // Ensure the config directory exists so a first-time launch
-            // does not blow up writing the default config later.
             if let Some(parent) = cfg_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -101,18 +167,51 @@ pub fn run() {
             let home = home_dir(handle)?;
             let default = AppConfig::default_with_home(&home);
             let cfg = load_or_default(&cfg_path, default)?;
-
-            // Ensure the store directory exists before any DICOM module
-            // tries to read or write into it.
             std::fs::create_dir_all(&cfg.store_dir)?;
 
+            // Open the SOP Instance index alongside the config.
+            let idx = Arc::new(Index::open(&index_path(handle)?)?);
+
             app.manage(AppState {
-                config: Mutex::new(cfg),
+                config: Mutex::new(cfg.clone()),
+                index: idx.clone(),
+            });
+
+            // Initial background scan so the Store page is populated
+            // without the user having to click anything. Reports back
+            // via the `store/scan-completed` event when finished.
+            let store_dir = cfg.store_dir.clone();
+            let app_handle = handle.clone();
+            tauri::async_runtime::spawn_blocking(move || match idx.rescan_dir(&store_dir) {
+                Ok(report) => {
+                    tracing::info!(
+                        seen = report.files_seen,
+                        inserted = report.files_inserted,
+                        updated = report.files_updated,
+                        skipped = report.files_skipped,
+                        errored = report.files_errored,
+                        elapsed_ms = report.elapsed_ms,
+                        "initial scan completed"
+                    );
+                    let _ = app_handle.emit("store/scan-completed", &report);
+                }
+                Err(err) => {
+                    tracing::error!(error = %err, "initial scan failed");
+                }
             });
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![ping, get_config, save_config])
+        .invoke_handler(tauri::generate_handler![
+            ping,
+            get_config,
+            save_config,
+            rescan_store,
+            list_studies,
+            list_series_for_study,
+            list_instances_for_series,
+            total_instance_count,
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

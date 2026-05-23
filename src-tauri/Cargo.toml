@@ -21,6 +21,26 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2.0"
 
+# Tokio runtime (Tauri pulls in tokio already; we use spawn directly for
+# the background rescan task).
+tokio = { version = "1.52", features = ["rt-multi-thread", "macros", "sync"] }
+
+# DICOM parsing (M2). The umbrella `dicom` crate re-exports the
+# submodules we use directly.
+dicom-object = "0.9"
+dicom-core = "0.9"
+dicom-dictionary-std = "0.9"
+
+# SOP Instance index (M2).
+rusqlite = { version = "0.39", features = ["bundled"] }
+
+# Directory walker for the rescan (M2).
+walkdir = "2.5"
+
+# Structured logging (used across milestones).
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

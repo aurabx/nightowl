@@ -36,7 +36,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 
 - [x] (2026-05-23) M0: Tauri 2 + React 19 + TS 6 + Tailwind v4 + lucide-react scaffold compiles via `cargo check`, builds via `npm run build`, and launches via `npm run tauri dev`. Sidebar shows Peers / SCU / Activity / Store / Settings. Frontend calls `invoke("ping")` on mount and renders the `pong` reply in the footer.
 - [x] (2026-05-23) M1: Settings page persists a config (local AE Title, listen port, store directory) to disk and reloads on launch. `AppConfig` + validators in `src-tauri/src/core/config.rs`, `AppError` discriminated union in `core/error.rs`, `get_config` / `save_config` Tauri commands in `lib.rs`, Settings UI in `src/pages/Settings.tsx`, shared API client + types in `src/lib/api.ts`. Eight backend unit tests passing.
-- [ ] M2: Local Store scanner indexes a directory of DICOM files into a SQLite database and the Store page can browse the Patient / Study / Series / SOP Instance hierarchy.
+- [x] (2026-05-23) M2: Local Store scanner indexes a directory of DICOM files into a SQLite database and the Store page browses the Patient / Study / Series / SOP Instance hierarchy. `Index` + `parse_dicom` + `rescan_dir` in `src-tauri/src/core/store.rs`, five Tauri commands (`rescan_store`, `list_studies`, `list_series_for_study`, `list_instances_for_series`, `total_instance_count`), Store page tree UI with live-event refresh, initial background scan on boot. Eleven backend tests passing.
 - [ ] M3: SCP listener accepts an association and answers C-ECHO. Verified by `echoscu` from DCMTK.
 - [ ] M4: SCP C-FIND returns matching identifiers from the local index. Verified by `findscu` from DCMTK.
 - [ ] M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Verified by `storescu` from DCMTK.
@@ -70,6 +70,14 @@ Document unexpected behaviors, bugs, optimizations, or insights discovered durin
 
 - Observation (M1): On a fresh launch with no prior `config.json`, the Tauri setup callback does create the app config directory and the default `store_dir` (`~/dicom-store`) but does NOT write a config file. The config file is only written when the user clicks Save. This is intentional but a future reader could be surprised that "first launch" leaves the directory empty.
   Evidence: After 75 seconds of `npm run tauri dev` against a clean `~/Library/Application Support/cloud.aurabox.phantom/` and `~/dicom-store/`, both directories existed but `config.json` did not. Documented here so M3 (SCP listener) knows that `cfg.store_dir` is guaranteed to exist by the time the listener starts but `config.json` may not.
+
+- Observation (M2): Killing `npm run tauri dev` with `pkill -TERM` does not always tear down the Vite child process. On the next run, Vite fails fast with `Error: Port 5173 is already in use` and Tauri reports `The "beforeDevCommand" terminated with a non-zero status code` — so the whole dev session fails to start. The Rust scan code never runs, leaving the SQLite database absent and giving the appearance that M2 broke.
+  Evidence: First boot attempt produced an empty log apart from the port-in-use error; `lsof -ti :5173 | xargs kill -9` cleared the stale process and the second attempt completed normally.
+  Resolution: After any forced kill of tauri dev, run `lsof -ti :5173 | xargs -r kill -9` (or rely on the `pkill -KILL -f vite` step in the test harness) before relaunching. Worth wiring into the Makefile as `make kill-dev` if this becomes a recurring nuisance.
+
+- Observation (M2): The dicom-rs API for accessing tags goes `obj.element(Tag) -> Result<&InMemElement, AccessError>` then `element.to_str() -> Result<Cow<str>, ConvertValueError>`. Two different error types in two lines. The `?` operator can't propagate them to a single user-facing error variant without explicit `.map_err`.
+  Evidence: First-pass code with `?` failed to compile until the `req_str` / `opt_str` helpers wrapped both errors into `String` so the caller (`parse_dicom`) can decide whether to skip the file or surface a real error.
+  Resolution: The helpers in `core/store.rs` (`req_str`, `opt_str`) are the canonical pattern for any future code that needs to pull tags out of `DefaultDicomObject`. M4 (C-FIND) and M5 (C-STORE) should reuse them rather than reinventing the conversion.
 
 ## Decision Log
 
@@ -126,6 +134,22 @@ Record every decision in the format below.
 - Decision (M1): Tauri commands use snake_case field names on the JSON wire (`local_ae_title`, not `localAeTitle`).
   Rationale: The wire shape mirrors the on-disk `config.json` and the Rust struct exactly — one vocabulary throughout. The TypeScript `AppConfig` interface in `src/lib/api.ts` declares snake_case fields, which is unusual for JS but trades a small style oddity for full schema alignment.
   Date/Author: 2026-05-23 / M1 implementer.
+
+- Decision (M2): The Store module lives in one file `src-tauri/src/core/store.rs` rather than the `store/` subdirectory tree the plan's Interfaces section suggested.
+  Rationale: ~500 lines holds the schema, the `Index` struct, the DICOM parser, the directory scanner, and tests together. Splitting into `index.rs` / `parser.rs` / `scanner.rs` would add three files for clarity that the file table of contents already provides through section comments. Will reconsider in M4 when C-FIND adds non-trivial query translation that may want its own file.
+  Date/Author: 2026-05-23 / M2 implementer.
+
+- Decision (M2): The initial scan runs in `tauri::async_runtime::spawn_blocking` from `setup()`, not synchronously.
+  Rationale: `rusqlite` is sync and `WalkDir` walks the filesystem; doing the scan synchronously in setup would block window paint until the directory is fully indexed. For an empty store it's microseconds; for a large store it could be seconds. Spawning to a blocking task and emitting `store/scan-completed` when done keeps the UI responsive from frame one.
+  Date/Author: 2026-05-23 / M2 implementer.
+
+- Decision (M2): The Store schema treats `patient_id` as `TEXT NOT NULL` but allows empty string.
+  Rationale: DICOM declares PatientID as Type 2 — required to be present but may be empty. Real-world files often have empty values. Rejecting them would discard legitimate data; coercing missing/empty PatientID to `""` keeps the column non-nullable (simpler GROUP BY) while still ingesting the file.
+  Date/Author: 2026-05-23 / M2 implementer.
+
+- Decision (M2): Phantom only ingests Part-10 DICOM files (the "DICM" preamble + meta header format that `dicom_object::open_file` accepts). Raw datasets without a file meta header are recorded as `Skipped`.
+  Rationale: A development tool needs to interoperate with real PACS exports, which are always Part-10. Supporting raw datasets adds a fallback parsing path without a known consumer. Will revisit if a real workflow demands it.
+  Date/Author: 2026-05-23 / M2 implementer.
 
 ## Outcomes & Retrospective
 
@@ -200,6 +224,63 @@ Follow-on observations:
 
 - The Settings page accepts a free-text store directory path. A native folder picker (via `tauri-plugin-dialog`) would be a much better UX. Adding it in M2 alongside the Store page makes more sense than retrofitting M1.
 - The current SCP-listener-required restart on port change is not yet enforced (because M1 has no SCP listener). When M3 lands, `save_config` will need to either gracefully rebind or surface "restart required" to the user.
+
+### M2 (2026-05-23)
+
+What landed: a SQLite-backed SOP Instance index over the configured store directory, a recursive scanner that ingests Part-10 DICOM files, and a Store page that browses the Patient / Study / Series / SOP Instance hierarchy. The index lives at `<app config dir>/store.sqlite`; an initial scan runs automatically when the app boots and emits `store/scan-completed` so the UI refreshes without polling; the user can also trigger a rescan from the Store page.
+
+Backend pieces (`src-tauri/src/core/store.rs`):
+
+- `Index::open(path)` creates the schema (one `sop_instances` table plus three secondary indexes), turns on WAL journaling, and returns a clonable handle.
+- `parse_dicom(path)` extracts SOPInstanceUID, SeriesInstanceUID, StudyInstanceUID, SOPClassUID, transfer syntax UID (from `obj.meta()`), and optional human-facing tags (PatientName, StudyDescription, etc.). Non-DICOM files return `Err(reason)` which becomes `IngestOutcome::Skipped` rather than a hard failure.
+- `Index::ingest_file` `INSERT OR REPLACE`s a row keyed on `sop_instance_uid`, distinguishing first ingest from replacement.
+- `Index::rescan_dir` walks the directory, calling `ingest_file` per regular file, summarising into a `ScanReport`.
+- `list_studies` / `list_series_for_study` / `list_instances_for_series` / `total_instance_count` queries return shapes ready for direct JSON-IPC serialisation.
+- Three unit tests cover schema creation, empty-dir rescan, and non-DICOM-file skip behavior.
+
+Backend wiring (`src-tauri/src/lib.rs`):
+
+- `AppState` now holds `Arc<Index>` alongside the existing config mutex.
+- `setup` opens the index and spawns the initial scan via `tauri::async_runtime::spawn_blocking`, so the window paints before the scan completes.
+- `rescan_store` / `list_studies` / `list_series_for_study` / `list_instances_for_series` / `total_instance_count` exposed as Tauri commands.
+- `tracing_subscriber` initialised with `RUST_LOG` honoured; scan summaries appear at `info` level.
+
+Frontend (`src/pages/Store.tsx`):
+
+- Tree view with three depth levels (Study → Series → SOP Instance).
+- Lazy expansion: series and instance lists are fetched only when the user clicks the chevron, so opening a study with thousands of instances doesn't fetch everything upfront.
+- Listens to `store/scan-completed` via `@tauri-apps/api/event#listen` and refreshes the study list when it fires. The "Rescan now" button kicks off `rescan_store` and the same event-driven refresh.
+- Last-scan summary in the header (`X seen · Y new · Z updated · …`) is the same data emitted by the backend.
+- Empty-state message instructs the user how to populate the store.
+
+Verification (commands run, output captured):
+
+    $ make test-rust
+    test result: ok. 11 passed; 0 failed
+    $ make build-web
+    ✓ 1762 modules transformed, built in 1.56s
+
+    # End-to-end: copy 3 real MR images + 1 non-DICOM into the store,
+    # boot the app, kill it, read the SQLite index back.
+    $ cp /path/to/IM00000{1,2,3}.dcm ~/dicom-store/
+    $ echo "this is not dicom" > ~/dicom-store/readme.txt
+    $ npm run tauri dev   # killed after 75s
+    INFO phantom_lib: initial scan completed seen=4 inserted=3 updated=0 skipped=1 errored=0 elapsed_ms=4
+    $ sqlite3 ~/Library/Application\ Support/cloud.aurabox.phantom/store.sqlite \
+        "SELECT patient_name, modality, sop_class_uid, transfer_syntax_uid FROM sop_instances;"
+    Doe^Giovanni|MR|1.2.840.10008.5.1.4.1.1.4|1.2.840.10008.1.2.1
+    Doe^Giovanni|MR|1.2.840.10008.5.1.4.1.1.4|1.2.840.10008.1.2.1
+    Doe^Giovanni|MR|1.2.840.10008.5.1.4.1.1.4|1.2.840.10008.1.2.1
+    $ sqlite3 ... "SELECT study_instance_uid, study_description FROM sop_instances GROUP BY study_instance_uid;"
+    1.3.6.1.4.1.5962.99.1.2786334768...|RM SPALLA SN
+
+Gaps to address before M3: none. The index is the data source M4 (C-FIND) will query.
+
+Follow-on observations:
+
+- No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
+- The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
+- Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
 
 ## Context and Orientation
 

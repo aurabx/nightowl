@@ -19,7 +19,48 @@ export type AppError =
   | { kind: "Json"; message: string }
   | { kind: "Validation"; message: { field: string; reason: string } }
   | { kind: "Tauri"; message: string }
+  | { kind: "Database"; message: string }
+  | { kind: "DicomParse"; message: string }
   | { kind: "Internal"; message: string };
+
+// --- Local store (M2) -------------------------------------------------
+
+export interface ScanReport {
+  files_seen: number;
+  files_inserted: number;
+  files_updated: number;
+  files_skipped: number;
+  files_errored: number;
+  elapsed_ms: number;
+}
+
+export interface StudyRow {
+  study_instance_uid: string;
+  patient_id: string;
+  patient_name: string | null;
+  study_description: string | null;
+  study_date: string | null;
+  modalities: string | null;
+  series_count: number;
+  instance_count: number;
+}
+
+export interface SeriesRow {
+  series_instance_uid: string;
+  study_instance_uid: string;
+  series_description: string | null;
+  modality: string | null;
+  instance_count: number;
+}
+
+export interface InstanceRow {
+  sop_instance_uid: string;
+  series_instance_uid: string;
+  sop_class_uid: string;
+  transfer_syntax_uid: string;
+  file_path: string;
+  size_bytes: number;
+}
 
 export function isAppError(err: unknown): err is AppError {
   return (
@@ -50,4 +91,26 @@ export function saveConfig(cfg: AppConfig): Promise<AppConfig> {
 
 export function ping(): Promise<string> {
   return invoke<string>("ping");
+}
+
+// --- Local store (M2) -------------------------------------------------
+
+export function rescanStore(): Promise<ScanReport> {
+  return invoke<ScanReport>("rescan_store");
+}
+
+export function listStudies(): Promise<StudyRow[]> {
+  return invoke<StudyRow[]>("list_studies");
+}
+
+export function listSeriesForStudy(studyUid: string): Promise<SeriesRow[]> {
+  return invoke<SeriesRow[]>("list_series_for_study", { studyUid });
+}
+
+export function listInstancesForSeries(seriesUid: string): Promise<InstanceRow[]> {
+  return invoke<InstanceRow[]>("list_instances_for_series", { seriesUid });
+}
+
+export function totalInstanceCount(): Promise<number> {
+  return invoke<number>("total_instance_count");
 }

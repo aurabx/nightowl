@@ -41,6 +41,18 @@ pub enum AppError {
     #[error("tauri error: {0}")]
     Tauri(String),
 
+    /// Failure interacting with the SQLite store index.
+    #[error("database error: {0}")]
+    Database(String),
+
+    /// Failure parsing a DICOM file (Part-10 read, tag missing, value
+    /// cannot be decoded). Reserved for command-level reports — the
+    /// background scanner (M2) records skips as `IngestOutcome::Skipped`
+    /// instead. C-STORE in M5 will be the first user.
+    #[allow(dead_code)]
+    #[error("dicom parse error: {0}")]
+    DicomParse(String),
+
     /// Catch-all for unexpected errors that do not fit the above. Use
     /// sparingly — prefer adding a specific variant when a new failure
     /// class appears more than once.
@@ -73,5 +85,11 @@ impl From<serde_json::Error> for AppError {
 impl From<tauri::Error> for AppError {
     fn from(e: tauri::Error) -> Self {
         Self::Tauri(e.to_string())
+    }
+}
+
+impl From<rusqlite::Error> for AppError {
+    fn from(e: rusqlite::Error) -> Self {
+        Self::Database(e.to_string())
     }
 }
