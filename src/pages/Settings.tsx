@@ -98,7 +98,7 @@ export function SettingsPage() {
       <div className="mt-6 space-y-5">
         <Field
           label="Local AE Title"
-          hint="1–16 ASCII characters. The identifier other DICOM peers see when this app responds. Default: PHANTOM."
+          hint="1–16 ASCII characters. The identifier other DICOM peers see when this app responds. Default: NIGHTOWL."
           error={fieldErrors.local_ae_title}
         >
           <input

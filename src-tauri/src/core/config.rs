@@ -38,7 +38,7 @@ impl AppConfig {
     /// directory. `store_dir` defaults to `<home>/dicom-store`.
     pub fn default_with_home(home: &Path) -> Self {
         Self {
-            local_ae_title: "PHANTOM".to_string(),
+            local_ae_title: "NIGHTOWL".to_string(),
             listen_port: 11112,
             store_dir: home.join("dicom-store"),
         }
@@ -148,7 +148,7 @@ mod tests {
 
     #[test]
     fn valid_ae_titles() {
-        assert!(is_valid_ae_title("PHANTOM"));
+        assert!(is_valid_ae_title("NIGHTOWL"));
         assert!(is_valid_ae_title("A"));
         assert!(is_valid_ae_title("CT_SCANNER_01"));
         assert!(is_valid_ae_title("1234567890123456")); // exactly 16

@@ -146,7 +146,7 @@ export function PeersPage() {
         <div>
           <h1 className="text-2xl font-semibold">Peers</h1>
           <p className="mt-1 text-sm text-slate-400">
-            Remote DICOM nodes Phantom can talk to. Stored as
+            Remote DICOM nodes NightOwl can talk to. Stored as
             <code className="mx-1 rounded bg-slate-800 px-1.5 py-0.5 text-xs">
               peers.json
             </code>

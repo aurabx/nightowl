@@ -40,7 +40,7 @@ export function Sidebar({ currentPage, onSelect }: SidebarProps) {
   return (
     <aside className="w-56 shrink-0 border-r border-slate-800 bg-slate-900">
       <div className="px-5 py-5 border-b border-slate-800">
-        <div className="text-lg font-semibold">Phantom</div>
+        <div className="text-lg font-semibold">NightOwl</div>
         <div className="text-xs text-slate-500">DICOM service tester</div>
       </div>
       <nav className="py-3">

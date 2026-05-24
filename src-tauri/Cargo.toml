@@ -1,7 +1,7 @@
 [package]
-name = "phantom"
+name = "nightowl"
 version = "0.1.0"
-description = "Phantom — Tauri desktop app for testing DICOM services"
+description = "NightOwl — Tauri desktop app for testing DICOM services"
 authors = ["Aurabox"]
 edition = "2021"
 rust-version = "1.77"
@@ -9,7 +9,7 @@ rust-version = "1.77"
 # The library crate exposes `run()` for both the desktop binary (main.rs)
 # and any future mobile entrypoints. Keep main.rs thin per CLAUDE.md.
 [lib]
-name = "phantom_lib"
+name = "nightowl_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
