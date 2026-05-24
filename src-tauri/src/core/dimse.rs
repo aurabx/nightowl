@@ -2364,6 +2364,78 @@ fn encode_command_set(obj: &InMemDicomObject) -> Result<Vec<u8>, AppError> {
 // The Tauri commands in lib.rs are thin wrappers around these.
 // =====================================================================
 
+/// Context shared across one SCU operation. Carries the `AppHandle` so
+/// every emit goes through the same persisted + broadcast path the SCP
+/// side uses, and a stable `association_id` so the Activity page groups
+/// every event from the operation together.
+struct ScuCtx<'a> {
+    app: &'a AppHandle,
+    association_id: String,
+    peer_ae_title: String,
+    /// `host:port` actually dialled. Carried alongside the AE title so
+    /// the Activity page can show where the traffic went.
+    peer_host: String,
+}
+
+impl<'a> ScuCtx<'a> {
+    fn new(app: &'a AppHandle, peer: &Peer) -> Self {
+        Self {
+            app,
+            association_id: format!("s-{}", Uuid::new_v4().simple()),
+            peer_ae_title: peer.ae_title.clone(),
+            peer_host: format!("{}:{}", peer.host, peer.port),
+        }
+    }
+
+    fn emit_lifecycle(&self, status: Status, message: impl Into<String>) {
+        emit(
+            self.app,
+            ActivityEvent {
+                timestamp_ms: Utc::now().timestamp_millis(),
+                direction: Direction::Info,
+                peer_ae_title: Some(self.peer_ae_title.clone()),
+                peer_host: Some(self.peer_host.clone()),
+                command: None,
+                status,
+                message: message.into(),
+                association_id: self.association_id.clone(),
+            },
+        );
+    }
+
+    fn emit_outbound(&self, command: &str, message: impl Into<String>) {
+        emit(
+            self.app,
+            ActivityEvent {
+                timestamp_ms: Utc::now().timestamp_millis(),
+                direction: Direction::Outbound,
+                peer_ae_title: Some(self.peer_ae_title.clone()),
+                peer_host: Some(self.peer_host.clone()),
+                command: Some(command.to_string()),
+                status: Status::Info,
+                message: message.into(),
+                association_id: self.association_id.clone(),
+            },
+        );
+    }
+
+    fn emit_inbound(&self, status: Status, command: &str, message: impl Into<String>) {
+        emit(
+            self.app,
+            ActivityEvent {
+                timestamp_ms: Utc::now().timestamp_millis(),
+                direction: Direction::Inbound,
+                peer_ae_title: Some(self.peer_ae_title.clone()),
+                peer_host: Some(self.peer_host.clone()),
+                command: Some(command.to_string()),
+                status,
+                message: message.into(),
+                association_id: self.association_id.clone(),
+            },
+        );
+    }
+}
+
 /// Which Q/R Information Model the SCU should use. Patient Root for
 /// queries that start from a patient identifier; Study Root for queries
 /// that start from a study/series/image identifier. PS3.4 Annex C.
@@ -2449,27 +2521,56 @@ pub struct ScuStoreOutcome {
 
 /// Sends a C-ECHO-RQ to `peer` and reports whether the round-trip
 /// completed successfully.
-pub fn scu_echo(local_ae: &str, peer: &Peer) -> Result<ScuEchoResult, AppError> {
+pub fn scu_echo(
+    app: &AppHandle,
+    local_ae: &str,
+    peer: &Peer,
+) -> Result<ScuEchoResult, AppError> {
     let start = Instant::now();
+    let ctx = ScuCtx::new(app, peer);
 
-    let mut association = ClientAssociationOptions::new()
+    ctx.emit_lifecycle(
+        Status::Info,
+        format!(
+            "opening SCU association to {} ({}) as {local_ae}",
+            ctx.peer_ae_title, ctx.peer_host
+        ),
+    );
+
+    let mut association = match ClientAssociationOptions::new()
         .calling_ae_title(local_ae.to_string())
         .called_ae_title(peer.ae_title.clone())
         .max_pdu_length(MAX_PDU_LENGTH)
         .with_abstract_syntax(VERIFICATION)
         .establish(format!("{}:{}", peer.host, peer.port))
-        .map_err(|e| AppError::Internal(format!("SCU echo establish: {e}")))?;
+    {
+        Ok(a) => a,
+        Err(err) => {
+            ctx.emit_lifecycle(Status::Error, format!("establish failed: {err}"));
+            return Err(AppError::Internal(format!("SCU echo establish: {err}")));
+        }
+    };
 
-    let pc = association
+    ctx.emit_lifecycle(Status::Info, "association established".to_string());
+
+    let pc = match association
         .presentation_contexts()
         .iter()
         .find(|p| {
             p.reason == PresentationContextResultReason::Acceptance
                 && p.abstract_syntax == VERIFICATION
-        })
-        .ok_or_else(|| {
-            AppError::Internal("peer did not accept Verification presentation context".to_string())
-        })?;
+        }) {
+        Some(p) => p,
+        None => {
+            ctx.emit_lifecycle(
+                Status::Error,
+                "peer did not accept Verification presentation context".to_string(),
+            );
+            return Err(AppError::Internal(
+                "peer did not accept Verification presentation context".to_string(),
+            ));
+        }
+    };
     let pc_id = pc.id;
 
     let message_id = next_scu_message_id();
@@ -2489,20 +2590,42 @@ pub fn scu_echo(local_ae: &str, peer: &Peer) -> Result<ScuEchoResult, AppError> 
     ]);
     let cmd_bytes = encode_command_set(&cmd)?;
 
-    association
-        .send(&Pdu::PData {
-            data: vec![PDataValue {
-                presentation_context_id: pc_id,
-                value_type: PDataValueType::Command,
-                is_last: true,
-                data: cmd_bytes,
-            }],
-        })
-        .map_err(|e| AppError::Internal(format!("SCU echo send: {e}")))?;
+    ctx.emit_outbound("C-ECHO-RQ", format!("message id {message_id}"));
 
-    let response_command = receive_response_command(&mut association)?;
+    if let Err(err) = association.send(&Pdu::PData {
+        data: vec![PDataValue {
+            presentation_context_id: pc_id,
+            value_type: PDataValueType::Command,
+            is_last: true,
+            data: cmd_bytes,
+        }],
+    }) {
+        ctx.emit_lifecycle(Status::Error, format!("send C-ECHO-RQ failed: {err}"));
+        return Err(AppError::Internal(format!("SCU echo send: {err}")));
+    }
+
+    let response_command = match receive_response_command(&mut association) {
+        Ok(c) => c,
+        Err(err) => {
+            ctx.emit_lifecycle(Status::Error, format!("receive C-ECHO-RSP failed: {err}"));
+            return Err(err);
+        }
+    };
     let status = read_u16(&response_command, tags::STATUS)?;
+
+    let rsp_status = if status == STATUS_SUCCESS {
+        Status::Success
+    } else {
+        Status::Error
+    };
+    ctx.emit_inbound(
+        rsp_status,
+        "C-ECHO-RSP",
+        format!("message id {message_id} status 0x{:04X}", status),
+    );
+
     let _ = association.release();
+    ctx.emit_lifecycle(Status::Info, "association released".to_string());
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
     Ok(ScuEchoResult {
@@ -2516,6 +2639,7 @@ pub fn scu_echo(local_ae: &str, peer: &Peer) -> Result<ScuEchoResult, AppError> 
 /// Sends a C-FIND-RQ to `peer` and collects the Pending response
 /// identifiers as `ScuFindMatch` rows.
 pub fn scu_find(
+    app: &AppHandle,
     local_ae: &str,
     peer: &Peer,
     root: QrRoot,
@@ -2524,14 +2648,29 @@ pub fn scu_find(
 ) -> Result<ScuFindResult, AppError> {
     let start = Instant::now();
     let sop_class = root.find_uid();
+    let ctx = ScuCtx::new(app, peer);
 
-    let mut association = ClientAssociationOptions::new()
+    ctx.emit_lifecycle(
+        Status::Info,
+        format!(
+            "opening SCU association to {} ({}) for C-FIND",
+            ctx.peer_ae_title, ctx.peer_host
+        ),
+    );
+
+    let mut association = match ClientAssociationOptions::new()
         .calling_ae_title(local_ae.to_string())
         .called_ae_title(peer.ae_title.clone())
         .max_pdu_length(MAX_PDU_LENGTH)
         .with_abstract_syntax(sop_class)
         .establish(format!("{}:{}", peer.host, peer.port))
-        .map_err(|e| AppError::Internal(format!("SCU find establish: {e}")))?;
+    {
+        Ok(a) => a,
+        Err(err) => {
+            ctx.emit_lifecycle(Status::Error, format!("establish failed: {err}"));
+            return Err(AppError::Internal(format!("SCU find establish: {err}")));
+        }
+    };
 
     let (pc_id, ts_uid) = accepted_pc(&association, sop_class)?;
     let ts = lookup_ts(&ts_uid)?;
@@ -2556,6 +2695,11 @@ pub fn scu_find(
         ),
     ]);
     let cmd_bytes = encode_command_set(&cmd)?;
+
+    ctx.emit_outbound(
+        "C-FIND-RQ",
+        format!("message id {message_id} sop class {sop_class}"),
+    );
 
     association
         .send(&Pdu::PData {
@@ -2583,9 +2727,13 @@ pub fn scu_find(
     let mut accumulated_data: Vec<u8> = Vec::new();
 
     loop {
-        let pdu = association
-            .receive()
-            .map_err(|e| AppError::Internal(format!("SCU find receive: {e}")))?;
+        let pdu = match association.receive() {
+            Ok(p) => p,
+            Err(err) => {
+                ctx.emit_lifecycle(Status::Error, format!("receive failed: {err}"));
+                return Err(AppError::Internal(format!("SCU find receive: {err}")));
+            }
+        };
         match pdu {
             Pdu::PData { data } => {
                 for pdv in data {
@@ -2597,10 +2745,28 @@ pub fn scu_find(
                                 current_command = Some(cmd_obj);
                                 accumulated_data.clear();
                             } else if status == STATUS_SUCCESS {
+                                let match_count = matches.len();
+                                ctx.emit_inbound(
+                                    Status::Success,
+                                    "C-FIND-RSP",
+                                    format!(
+                                        "{match_count} match{} + final Success",
+                                        if match_count == 1 { "" } else { "es" }
+                                    ),
+                                );
                                 let _ = association.release();
+                                ctx.emit_lifecycle(
+                                    Status::Info,
+                                    "association released".to_string(),
+                                );
                                 let elapsed_ms = start.elapsed().as_millis() as u64;
                                 return Ok(ScuFindResult { matches, elapsed_ms });
                             } else {
+                                ctx.emit_inbound(
+                                    Status::Error,
+                                    "C-FIND-RSP",
+                                    format!("final status 0x{:04X}", status),
+                                );
                                 let _ = association.release();
                                 return Err(AppError::Internal(format!(
                                     "C-FIND-RSP final status 0x{:04X}",
@@ -2631,12 +2797,20 @@ pub fn scu_find(
                 }
             }
             Pdu::AbortRQ { source } => {
+                ctx.emit_lifecycle(
+                    Status::Error,
+                    format!("peer aborted association: {:?}", source),
+                );
                 return Err(AppError::Internal(format!(
                     "C-FIND peer aborted: {:?}",
                     source
                 )));
             }
             other => {
+                ctx.emit_lifecycle(
+                    Status::Warning,
+                    format!("unexpected pdu: {}", other.short_description()),
+                );
                 return Err(AppError::Internal(format!(
                     "unexpected pdu during C-FIND: {}",
                     other.short_description()
@@ -2649,6 +2823,7 @@ pub fn scu_find(
 /// Sends a C-MOVE-RQ to `peer` asking it to send matched instances to
 /// `destination_ae`. Returns the final completed/failed counts.
 pub fn scu_move(
+    app: &AppHandle,
     local_ae: &str,
     peer: &Peer,
     root: QrRoot,
@@ -2658,14 +2833,29 @@ pub fn scu_move(
 ) -> Result<ScuMoveResult, AppError> {
     let start = Instant::now();
     let sop_class = root.move_uid();
+    let ctx = ScuCtx::new(app, peer);
 
-    let mut association = ClientAssociationOptions::new()
+    ctx.emit_lifecycle(
+        Status::Info,
+        format!(
+            "opening SCU association to {} ({}) for C-MOVE → {destination_ae}",
+            ctx.peer_ae_title, ctx.peer_host
+        ),
+    );
+
+    let mut association = match ClientAssociationOptions::new()
         .calling_ae_title(local_ae.to_string())
         .called_ae_title(peer.ae_title.clone())
         .max_pdu_length(MAX_PDU_LENGTH)
         .with_abstract_syntax(sop_class)
         .establish(format!("{}:{}", peer.host, peer.port))
-        .map_err(|e| AppError::Internal(format!("SCU move establish: {e}")))?;
+    {
+        Ok(a) => a,
+        Err(err) => {
+            ctx.emit_lifecycle(Status::Error, format!("establish failed: {err}"));
+            return Err(AppError::Internal(format!("SCU move establish: {err}")));
+        }
+    };
 
     let (pc_id, ts_uid) = accepted_pc(&association, sop_class)?;
     let ts = lookup_ts(&ts_uid)?;
@@ -2696,6 +2886,11 @@ pub fn scu_move(
     ]);
     let cmd_bytes = encode_command_set(&cmd)?;
 
+    ctx.emit_outbound(
+        "C-MOVE-RQ",
+        format!("message id {message_id} destination {destination_ae}"),
+    );
+
     association
         .send(&Pdu::PData {
             data: vec![PDataValue {
@@ -2722,9 +2917,13 @@ pub fn scu_move(
     let final_status;
 
     loop {
-        let pdu = association
-            .receive()
-            .map_err(|e| AppError::Internal(format!("SCU move receive: {e}")))?;
+        let pdu = match association.receive() {
+            Ok(p) => p,
+            Err(err) => {
+                ctx.emit_lifecycle(Status::Error, format!("receive failed: {err}"));
+                return Err(AppError::Internal(format!("SCU move receive: {err}")));
+            }
+        };
         match pdu {
             Pdu::PData { data } => {
                 let mut got_final = false;
@@ -2750,12 +2949,20 @@ pub fn scu_move(
                 }
             }
             Pdu::AbortRQ { source } => {
+                ctx.emit_lifecycle(
+                    Status::Error,
+                    format!("peer aborted association: {:?}", source),
+                );
                 return Err(AppError::Internal(format!(
                     "C-MOVE peer aborted: {:?}",
                     source
                 )));
             }
             other => {
+                ctx.emit_lifecycle(
+                    Status::Warning,
+                    format!("unexpected pdu: {}", other.short_description()),
+                );
                 return Err(AppError::Internal(format!(
                     "unexpected pdu during C-MOVE: {}",
                     other.short_description()
@@ -2773,6 +2980,21 @@ pub fn scu_move(
         other => format!("status 0x{:04X}", other),
     };
 
+    let rsp_status = match final_status {
+        STATUS_SUCCESS => Status::Success,
+        STATUS_WARNING_SUBOPS_COMPLETE_WITH_FAILURES => Status::Warning,
+        _ => Status::Error,
+    };
+    ctx.emit_inbound(
+        rsp_status,
+        "C-MOVE-RSP",
+        format!(
+            "final status 0x{:04X} ({label}) — completed {completed} failed {failed}",
+            final_status
+        ),
+    );
+    ctx.emit_lifecycle(Status::Info, "association released".to_string());
+
     Ok(ScuMoveResult {
         completed,
         failed,
@@ -2787,10 +3009,24 @@ pub fn scu_move(
 /// UID; failures (file unreadable, peer refuses the SOP class, etc.)
 /// are recorded per-file rather than aborting the whole batch.
 pub fn scu_store(
+    app: &AppHandle,
     local_ae: &str,
     peer: &Peer,
     files: &[PathBuf],
 ) -> Result<Vec<ScuStoreOutcome>, AppError> {
+    let ctx = ScuCtx::new(app, peer);
+
+    ctx.emit_lifecycle(
+        Status::Info,
+        format!(
+            "opening SCU association to {} ({}) for C-STORE of {} file{}",
+            ctx.peer_ae_title,
+            ctx.peer_host,
+            files.len(),
+            if files.len() == 1 { "" } else { "s" }
+        ),
+    );
+
     // Pre-parse each file to learn its SOP class so we can negotiate
     // only the contexts we need. Any per-file failures here become
     // outcomes the UI can render.
@@ -2813,11 +3049,19 @@ pub fn scu_store(
             }
             Err(err) => {
                 outcomes[idx].message = format!("pre-parse failed: {err}");
+                ctx.emit_lifecycle(
+                    Status::Warning,
+                    format!("pre-parse failed for {}: {err}", path.display()),
+                );
             }
         }
     }
 
     if instances.is_empty() {
+        ctx.emit_lifecycle(
+            Status::Warning,
+            "no parsable files; nothing to send".to_string(),
+        );
         return Ok(outcomes);
     }
 
@@ -2828,6 +3072,7 @@ pub fn scu_store(
         match open_storage_scu(local_ae, &peer.ae_title, &peer.host, peer.port, &just_instances) {
             Ok(a) => a,
             Err(err) => {
+                ctx.emit_lifecycle(Status::Error, format!("establish failed: {err}"));
                 // Whole batch fails if we can't even open.
                 for (idx, _) in &instances {
                     outcomes[*idx].message = format!("could not open SCU association: {err}");
@@ -2837,17 +3082,32 @@ pub fn scu_store(
         };
 
     for (idx, inst) in &instances {
+        ctx.emit_outbound(
+            "C-STORE-RQ",
+            format!("sop {}", inst.sop_instance_uid),
+        );
         match forward_via_c_store(&mut association, inst, None) {
             Ok(_) => {
                 outcomes[*idx].success = true;
                 outcomes[*idx].message = "C-STORE-RSP 0x0000 (Success)".to_string();
+                ctx.emit_inbound(
+                    Status::Success,
+                    "C-STORE-RSP",
+                    format!("sop {} status 0x0000 (Success)", inst.sop_instance_uid),
+                );
             }
             Err(err) => {
                 outcomes[*idx].message = format!("{err}");
+                ctx.emit_inbound(
+                    Status::Error,
+                    "C-STORE-RSP",
+                    format!("sop {} failed: {err}", inst.sop_instance_uid),
+                );
             }
         }
     }
     let _ = association.release();
+    ctx.emit_lifecycle(Status::Info, "association released".to_string());
     Ok(outcomes)
 }
 

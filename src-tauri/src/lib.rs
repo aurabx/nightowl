@@ -1,4 +1,4 @@
-//! Phantom Tauri library entrypoint.
+//! NightOwl Tauri library entrypoint.
 //!
 //! Per the project's `CLAUDE.md`: business logic lives in `core`; the
 //! `#[tauri::command]` functions in this file are thin wrappers that
@@ -227,19 +227,21 @@ fn resolve_peer(peers: &PeerStore, id: &str) -> Result<Peer, AppError> {
 
 #[tauri::command]
 async fn scu_echo_cmd(
+    app: AppHandle,
     state: State<'_, AppState>,
     peers: State<'_, Arc<PeerStore>>,
     peer_id: String,
 ) -> Result<ScuEchoResult, AppError> {
     let local_ae = read_config(&state)?.local_ae_title;
     let peer = resolve_peer(&peers, &peer_id)?;
-    tauri::async_runtime::spawn_blocking(move || scu_echo(&local_ae, &peer))
+    tauri::async_runtime::spawn_blocking(move || scu_echo(&app, &local_ae, &peer))
         .await
         .map_err(|e| AppError::Internal(format!("scu_echo join: {e}")))?
 }
 
 #[tauri::command]
 async fn scu_find_cmd(
+    app: AppHandle,
     state: State<'_, AppState>,
     peers: State<'_, Arc<PeerStore>>,
     peer_id: String,
@@ -249,13 +251,16 @@ async fn scu_find_cmd(
 ) -> Result<ScuFindResult, AppError> {
     let local_ae = read_config(&state)?.local_ae_title;
     let peer = resolve_peer(&peers, &peer_id)?;
-    tauri::async_runtime::spawn_blocking(move || scu_find(&local_ae, &peer, root, level, keys))
-        .await
-        .map_err(|e| AppError::Internal(format!("scu_find join: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        scu_find(&app, &local_ae, &peer, root, level, keys)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("scu_find join: {e}")))?
 }
 
 #[tauri::command]
 async fn scu_move_cmd(
+    app: AppHandle,
     state: State<'_, AppState>,
     peers: State<'_, Arc<PeerStore>>,
     peer_id: String,
@@ -267,7 +272,7 @@ async fn scu_move_cmd(
     let local_ae = read_config(&state)?.local_ae_title;
     let peer = resolve_peer(&peers, &peer_id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        scu_move(&local_ae, &peer, root, level, keys, &destination_ae)
+        scu_move(&app, &local_ae, &peer, root, level, keys, &destination_ae)
     })
     .await
     .map_err(|e| AppError::Internal(format!("scu_move join: {e}")))?
@@ -275,6 +280,7 @@ async fn scu_move_cmd(
 
 #[tauri::command]
 async fn scu_store_cmd(
+    app: AppHandle,
     state: State<'_, AppState>,
     peers: State<'_, Arc<PeerStore>>,
     peer_id: String,
@@ -283,7 +289,7 @@ async fn scu_store_cmd(
     let local_ae = read_config(&state)?.local_ae_title;
     let peer = resolve_peer(&peers, &peer_id)?;
     let paths: Vec<StdPathBuf> = files.into_iter().map(StdPathBuf::from).collect();
-    tauri::async_runtime::spawn_blocking(move || scu_store(&local_ae, &peer, &paths))
+    tauri::async_runtime::spawn_blocking(move || scu_store(&app, &local_ae, &peer, &paths))
         .await
         .map_err(|e| AppError::Internal(format!("scu_store join: {e}")))?
 }
@@ -328,12 +334,12 @@ fn delete_worklist_entry(
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Best-effort tracing setup; honour RUST_LOG when present, default
-    // to phantom_lib=info,warn so we see scan summaries without drowning
+    // to nightowl_lib=info,warn so we see scan summaries without drowning
     // in noise from upstream crates.
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "phantom_lib=info,warn".parse().unwrap()),
+                .unwrap_or_else(|_| "nightowl_lib=info,warn".parse().unwrap()),
         )
         .try_init();
 
