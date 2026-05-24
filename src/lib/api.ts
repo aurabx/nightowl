@@ -202,3 +202,87 @@ export function updatePeer(peer: UpdatePeer): Promise<Peer> {
 export function deletePeer(id: string): Promise<void> {
   return invoke<void>("delete_peer", { id });
 }
+
+// --- SCU operations (M8) ---------------------------------------------
+
+export type QrRoot = "patient" | "study";
+export type QrLevel = "PATIENT" | "STUDY" | "SERIES" | "IMAGE";
+
+export interface ScuQueryKeys {
+  patient_id?: string;
+  patient_name?: string;
+  study_instance_uid?: string;
+  study_date?: string;
+  modality?: string;
+  series_instance_uid?: string;
+  sop_instance_uid?: string;
+  /** Empty-valued tag names to also include as return keys. */
+  return_keys?: string[];
+}
+
+export interface ScuEchoResult {
+  success: boolean;
+  status: number;
+  elapsed_ms: number;
+  message: string;
+}
+
+export interface ScuFindMatch {
+  fields: Record<string, string>;
+}
+
+export interface ScuFindResult {
+  matches: ScuFindMatch[];
+  elapsed_ms: number;
+}
+
+export interface ScuMoveResult {
+  completed: number;
+  failed: number;
+  status: number;
+  status_label: string;
+  elapsed_ms: number;
+}
+
+export interface ScuStoreOutcome {
+  file: string;
+  success: boolean;
+  sop_instance_uid: string | null;
+  message: string;
+}
+
+export function scuEcho(peerId: string): Promise<ScuEchoResult> {
+  return invoke<ScuEchoResult>("scu_echo_cmd", { peerId });
+}
+
+export function scuFind(
+  peerId: string,
+  root: QrRoot,
+  level: QrLevel,
+  keys: ScuQueryKeys,
+): Promise<ScuFindResult> {
+  return invoke<ScuFindResult>("scu_find_cmd", { peerId, root, level, keys });
+}
+
+export function scuMove(
+  peerId: string,
+  root: QrRoot,
+  level: QrLevel,
+  keys: ScuQueryKeys,
+  destinationAe: string,
+): Promise<ScuMoveResult> {
+  return invoke<ScuMoveResult>("scu_move_cmd", {
+    peerId,
+    root,
+    level,
+    keys,
+    destinationAe,
+  });
+}
+
+export function scuStore(
+  peerId: string,
+  files: string[],
+): Promise<ScuStoreOutcome[]> {
+  return invoke<ScuStoreOutcome[]>("scu_store_cmd", { peerId, files });
+}

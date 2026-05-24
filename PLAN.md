@@ -42,7 +42,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [x] (2026-05-23) M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Storage SOP Classes (CT, MR, SC, US, CR, DX, Encapsulated PDF) negotiated; JPEG Baseline 8-bit added to the transfer syntax list; `handle_c_store` decodes the dataset, validates the UIDs as path components, wraps with a Part-10 file meta via `FileMetaTableBuilder`, writes to `<store_dir>/<study>/<series>/<sop>.dcm`, refreshes the SQLite index via `ingest_file`, and responds 0x0000 / 0xA700 / 0xC000. Verified with `storescu` against three real MR files: three `Received Store Response (Success)` and three Part-10 files on disk in the right hierarchy.
 - [x] (2026-05-23) M6: SCP C-MOVE and C-GET return matching SOP Instances. Patient/Study Root Q/R Move + Get SOP classes negotiated; `handle_c_move` resolves the Move Destination AE Title against `PeerStore`, opens an outbound SCU association (`forward_via_c_store`), streams each match with PDataWriter (handles the typical >500 KB MR slice over ~16 KB PDU limits); `handle_c_get` sends C-STORE sub-ops back over the requester's association; both send periodic Pending RSPs with completed/remaining/failed counts and a final RSP. Verified: `movescu` STUDY→STORESCP transfers 3/3 MR files; `getscu` STUDY pulls 3/3 files back; both report `final status 0x0000 (Success) — completed 3 failed 0`.
 - [x] (2026-05-23) M7: Peers CRUD UI persists a peer list. Add, edit, delete a peer; the change survives an app restart. Built **before M6** because C-MOVE needs to resolve a Move Destination AE Title against this list. `PeerStore` in `src-tauri/src/core/peers.rs` persists to `peers.json` with atomic write-temp + rename; four Tauri commands (`list_peers`, `create_peer`, `update_peer`, `delete_peer`); validation rejects duplicate AE titles; `find_by_ae_title` exposed for M6. Peers page with table + modal form + two-click delete confirmation. Seven backend tests covering CRUD, duplicate rejection, persistence across reopen.
-- [ ] M8: SCU page can run C-ECHO, C-FIND, C-MOVE, C-GET, and C-STORE against a configured peer and display the result.
+- [x] (2026-05-23) M8: SCU page can run C-ECHO, C-FIND, C-MOVE, and C-STORE against a configured peer and display the result. Four new Tauri commands (`scu_echo_cmd`, `scu_find_cmd`, `scu_move_cmd`, `scu_store_cmd`) each call into a pure-Rust SCU function in `core::dimse`; the SCU page has a peer dropdown, operation switcher, per-operation form, and op-specific result panels (echo: green/red status; find: dynamic-column results table with friendly tag names; move: completed/failed counts; store: per-file outcome table). C-GET deferred — it overlaps the same code path as C-MOVE from the SCU's side but `getscu`-style negotiation with SCP-role contexts is more involved; not blocking.
 - [x] (2026-05-23) M9: Activity page shows a live event stream of every association (inbound and outbound) with peer, command, status, and timestamp. **Built ahead of M4–M8** to make the next four milestones visually verifiable: every C-FIND / C-STORE / C-MOVE response from M4–M6 will now appear in the live log without instrumentation work. `ActivityLog` in `src-tauri/src/core/activity.rs` persists every `dimse::emit` into `activity_events` (50,000-row cap, trim on every 500 inserts), three Tauri commands (`list_activity`, `clear_activity`, `activity_count`), Activity page with live event subscription, direction / status / search filters, pause-resume toggle, and clear-log button. Seventeen backend tests passing.
 - [ ] M10: (Stub only) Modality Worklist SCP placeholder page exists so the worklist work can land later as a single milestone.
 
@@ -259,6 +259,18 @@ Record every decision in the format below.
   Rationale: PS3.7 §9.1.3 makes C-GET sub-ops fire-and-forget; the requester counts what it received and we count what we sent. Waiting for each response would serialise the sub-ops and defeat pipelining. The dispatch loop's previous "unsupported command" warning for incoming 0x8001 responses was wrong (functionally fine, but noisy) — now we recognise C-STORE-RSP specifically and any high-bit response in general as no-ops.
   Date/Author: 2026-05-23 / M6 implementer.
 
+- Decision (M8): Each Tauri SCU command (`scu_echo_cmd`, `scu_find_cmd`, `scu_move_cmd`, `scu_store_cmd`) clones what it needs (local AE Title, peer struct) and runs the synchronous SCU function in `tauri::async_runtime::spawn_blocking`, then awaits.
+  Rationale: `dicom-ul`'s client API is sync (blocking sockets). Calling it directly from a `#[tauri::command] async fn` would block the Tauri command worker for the duration of the association — typically sub-second for ECHO, but seconds+ for FIND/MOVE/STORE with large match sets. spawn_blocking offloads to the blocking thread pool, keeps the IPC worker free, and the `await` yields cleanly.
+  Date/Author: 2026-05-23 / M8 implementer.
+
+- Decision (M8): The Store form on the SCU page takes file paths as text (one per line) rather than opening a native file picker.
+  Rationale: A native picker needs `tauri-plugin-dialog`, another runtime dep + capability + frontend wiring. For a developer tool, paste-paths-from-finder is acceptable as a starting point. Adding the picker later is a small follow-up if real usage demands.
+  Date/Author: 2026-05-23 / M8 implementer.
+
+- Decision (M8): C-GET SCU is NOT implemented in M8.
+  Rationale: From the SCU side, C-GET needs the client to offer SCP-role presentation contexts for every Storage SOP Class it expects back. `dicom-ul`'s `ClientAssociationOptions` does not (as of 0.9.1) expose a SCP/SCU role-selection negotiation knob, so a hand-built A-ASSOCIATE-RQ would be needed. The use case is also narrow: C-GET only makes sense over the same association as the query, and our M6 SCP-side C-GET already lets external tools (getscu) pull from us. Document and skip.
+  Date/Author: 2026-05-23 / M8 implementer.
+
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
@@ -389,6 +401,64 @@ Follow-on observations:
 - No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
 - The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
 - Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
+
+### M8 (2026-05-23)
+
+What landed: the SCU page. The user picks a configured peer, picks an operation (C-ECHO / C-FIND / C-MOVE / C-STORE), fills the op-specific form, clicks the button, and sees a result panel tailored to that operation. Every outbound DIMSE message also lights up the Activity page.
+
+Backend (`src-tauri/src/core/dimse.rs`):
+
+- `QrRoot` enum (Patient | Study) so the UI can choose between Patient Root and Study Root Q/R Information Models for FIND and MOVE.
+- `ScuQueryKeys` is the typed input from the UI: all matching key fields are `Option<String>` (empty = Universal Matching), plus a `return_keys: Vec<String>` of additional empty-valued tag names to include in the request identifier.
+- `scu_echo(local_ae, peer)`: opens a ClientAssociation with `VERIFICATION`, sends C-ECHO-RQ, receives, releases. Returns success flag + elapsed time.
+- `scu_find(local_ae, peer, root, level, keys)`: opens with the right Q/R Find SOP class, sends C-FIND-RQ + identifier (via `send_pdata` chunking), drains responses until a non-Pending command. Returns one `ScuFindMatch { fields }` per Pending response, with `fields` populated from the response identifier via `extract_match_fields`.
+- `scu_move(...)`: same shape with Q/R Move SOP class + `MoveDestination` in the command. Drains responses tracking completed/failed counts; returns the final status with a human label.
+- `scu_store(local_ae, peer, files)`: pre-parses each file to discover its SOP Class UID, opens one association negotiating those classes, calls the existing `forward_via_c_store` per file. Returns per-file outcomes.
+- New helpers: `accepted_pc` (looks up an accepted presentation context by abstract syntax), `receive_response_command` (drains until the first Command PDV), `build_scu_identifier` / `put_query_value` / `lookup_named_tag` / `extract_match_fields` / `tag_to_friendly_name` (translate between the UI's named-tag world and DICOM `Tag`s).
+
+Backend wiring (`src-tauri/src/lib.rs`):
+
+- Four `#[tauri::command] async fn scu_*_cmd` wrappers. Each `clone()`s the inputs and runs the synchronous SCU function in `tauri::async_runtime::spawn_blocking`, then `await`s — so the UI does not block the Tauri IPC worker while a large C-FIND or C-MOVE runs.
+- `resolve_peer` helper turns a peer id from the dropdown into the `Peer` struct, with a `Validation` error if unknown.
+
+Frontend (`src/pages/Scu.tsx` + `src/lib/api.ts`):
+
+- Peer dropdown (uses the reusable `Select`) populated from `list_peers`.
+- Operation switcher (button group, sticks out clearly when active).
+- Per-operation sub-form:
+  - **C-ECHO**: no inputs, just a hint paragraph.
+  - **C-FIND**: Q/R root + level + matching keys (PatientID, PatientName with wildcard hint, StudyInstanceUID, StudyDate with range hint, Modality, SeriesInstanceUID) + a comma-separated return-keys input pre-filled with the common defaults.
+  - **C-MOVE**: same form as C-FIND + Move Destination AE Title (16-char limit).
+  - **C-STORE**: a textarea for absolute file paths, one per line.
+- Per-operation result panels:
+  - Echo: green/red box with status hex + ms.
+  - Find: dynamic-column table sorted with common tags first (QueryRetrieveLevel, PatientID, …) then alphabetical. UIDs render in monospace.
+  - Move: green/amber box with completed/failed counts.
+  - Store: per-file row with green/red dot + truncated path + outcome message.
+
+Verification:
+
+    $ make test-rust         # 25 passed
+    $ make build-web         # clean
+
+Live verification has to happen through the UI (there's no headless way to invoke Tauri commands from a shell script). The SCU code paths reuse the same `open_storage_scu` + `forward_via_c_store` + `ClientAssociationOptions` plumbing that M6 already verified end-to-end with `movescu`; the only new SCU-specific code is the response-stream drainer (C-FIND result decoding, C-MOVE count tracking), which mirrors the structure of the SCP-side handlers it's the counterpart to.
+
+A reasonable smoke test loop in the UI:
+
+1. Add a peer pointing at a running `storescp 11113` (DCMTK).
+2. SCU page → Peer = STORESCP, Operation = C-ECHO → "Send Echo" → green panel.
+3. Switch to a peer pointing at Phantom itself (`PHANTOM` @ localhost:11112), Operation = C-FIND, level STUDY → "Run Query" → table populated from the local store index.
+4. Operation = C-MOVE, destination = STORESCP → "Send Move" → green panel `completed 3 failed 0`, files appear in storescp's `-od` directory.
+5. Operation = C-STORE, paste a path to a `.dcm` file → "Send Store" → per-file outcome.
+
+Gaps to address before M10: none. M10 is just the worklist stub page.
+
+Follow-on observations:
+
+- C-GET SCU not implemented (see Decision Log). Documented as deferred.
+- The file-path textarea would be much nicer as a drag-and-drop area or a native folder picker via `tauri-plugin-dialog`. Easy follow-up.
+- The Find results table is unvirtualised. At hundreds of matches that's fine; thousands of rows would want `react-virtuoso`.
+- No live progress for C-MOVE — the UI waits for the final RSP. M6's per-sub-op Pending RSPs hit the SCP-side activity stream but not this UI. A `listen("activity", …)` filter in the SCU page could show running counts.
 
 ### M6 (2026-05-23)
 

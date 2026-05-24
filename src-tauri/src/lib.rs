@@ -12,12 +12,17 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, Emitter, Manager, State};
 
+use std::path::PathBuf as StdPathBuf;
+
 use core::activity::{ActivityFilter, ActivityLog, ActivityPage};
 use core::config::{AppConfig, load_or_default, save};
-use core::dimse::{start_listener, ListenerHandle, ScpContext};
+use core::dimse::{
+    scu_echo, scu_find, scu_move, scu_store, start_listener, ListenerHandle, QrRoot,
+    ScpContext, ScuEchoResult, ScuFindResult, ScuMoveResult, ScuQueryKeys, ScuStoreOutcome,
+};
 use core::error::AppError;
 use core::peers::{NewPeer, Peer, PeerStore, UpdatePeer};
-use core::store::{Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
+use core::store::{FindLevel, Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
 
 /// Process-wide state shared across Tauri commands.
 struct AppState {
@@ -202,6 +207,82 @@ fn delete_peer(peers: State<'_, Arc<PeerStore>>, id: String) -> Result<(), AppEr
     peers.delete(&id)
 }
 
+// --- SCU operations (M8) --------------------------------------------
+
+/// Helper: look a Peer up by id, returning a Validation error if the
+/// id is unknown. The frontend already restricts the choice via a
+/// dropdown, so the lookup failure path is mostly for hand-typed IDs.
+fn resolve_peer(peers: &PeerStore, id: &str) -> Result<Peer, AppError> {
+    peers
+        .list()?
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| AppError::validation("peer_id", format!("unknown peer id {id}")))
+}
+
+#[tauri::command]
+async fn scu_echo_cmd(
+    state: State<'_, AppState>,
+    peers: State<'_, Arc<PeerStore>>,
+    peer_id: String,
+) -> Result<ScuEchoResult, AppError> {
+    let local_ae = read_config(&state)?.local_ae_title;
+    let peer = resolve_peer(&peers, &peer_id)?;
+    tauri::async_runtime::spawn_blocking(move || scu_echo(&local_ae, &peer))
+        .await
+        .map_err(|e| AppError::Internal(format!("scu_echo join: {e}")))?
+}
+
+#[tauri::command]
+async fn scu_find_cmd(
+    state: State<'_, AppState>,
+    peers: State<'_, Arc<PeerStore>>,
+    peer_id: String,
+    root: QrRoot,
+    level: FindLevel,
+    keys: ScuQueryKeys,
+) -> Result<ScuFindResult, AppError> {
+    let local_ae = read_config(&state)?.local_ae_title;
+    let peer = resolve_peer(&peers, &peer_id)?;
+    tauri::async_runtime::spawn_blocking(move || scu_find(&local_ae, &peer, root, level, keys))
+        .await
+        .map_err(|e| AppError::Internal(format!("scu_find join: {e}")))?
+}
+
+#[tauri::command]
+async fn scu_move_cmd(
+    state: State<'_, AppState>,
+    peers: State<'_, Arc<PeerStore>>,
+    peer_id: String,
+    root: QrRoot,
+    level: FindLevel,
+    keys: ScuQueryKeys,
+    destination_ae: String,
+) -> Result<ScuMoveResult, AppError> {
+    let local_ae = read_config(&state)?.local_ae_title;
+    let peer = resolve_peer(&peers, &peer_id)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        scu_move(&local_ae, &peer, root, level, keys, &destination_ae)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("scu_move join: {e}")))?
+}
+
+#[tauri::command]
+async fn scu_store_cmd(
+    state: State<'_, AppState>,
+    peers: State<'_, Arc<PeerStore>>,
+    peer_id: String,
+    files: Vec<String>,
+) -> Result<Vec<ScuStoreOutcome>, AppError> {
+    let local_ae = read_config(&state)?.local_ae_title;
+    let peer = resolve_peer(&peers, &peer_id)?;
+    let paths: Vec<StdPathBuf> = files.into_iter().map(StdPathBuf::from).collect();
+    tauri::async_runtime::spawn_blocking(move || scu_store(&local_ae, &peer, &paths))
+        .await
+        .map_err(|e| AppError::Internal(format!("scu_store join: {e}")))?
+}
+
 // ---------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------
@@ -324,6 +405,10 @@ pub fn run() {
             create_peer,
             update_peer,
             delete_peer,
+            scu_echo_cmd,
+            scu_find_cmd,
+            scu_move_cmd,
+            scu_store_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
