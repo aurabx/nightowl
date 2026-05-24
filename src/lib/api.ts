@@ -161,3 +161,44 @@ export function clearActivity(): Promise<void> {
 export function activityCount(): Promise<number> {
   return invoke<number>("activity_count");
 }
+
+// --- Peers (M7) ------------------------------------------------------
+
+export interface Peer {
+  id: string;
+  name: string;
+  ae_title: string;
+  host: string;
+  port: number;
+}
+
+export interface NewPeer {
+  name: string;
+  ae_title: string;
+  host: string;
+  port: number;
+}
+
+export interface UpdatePeer {
+  id: string;
+  name: string;
+  ae_title: string;
+  host: string;
+  port: number;
+}
+
+export function listPeers(): Promise<Peer[]> {
+  return invoke<Peer[]>("list_peers");
+}
+
+export function createPeer(peer: NewPeer): Promise<Peer> {
+  return invoke<Peer>("create_peer", { peer });
+}
+
+export function updatePeer(peer: UpdatePeer): Promise<Peer> {
+  return invoke<Peer>("update_peer", { peer });
+}
+
+export function deletePeer(id: string): Promise<void> {
+  return invoke<void>("delete_peer", { id });
+}

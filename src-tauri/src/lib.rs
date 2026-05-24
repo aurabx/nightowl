@@ -16,6 +16,7 @@ use core::activity::{ActivityFilter, ActivityLog, ActivityPage};
 use core::config::{AppConfig, load_or_default, save};
 use core::dimse::{start_listener, ListenerHandle, ScpContext};
 use core::error::AppError;
+use core::peers::{NewPeer, Peer, PeerStore, UpdatePeer};
 use core::store::{Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
 
 /// Process-wide state shared across Tauri commands.
@@ -49,6 +50,10 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, AppError> {
 /// config directory. The SOP Instance index lives next to `config.json`.
 fn index_path(app: &AppHandle) -> Result<PathBuf, AppError> {
     Ok(app_config_dir(app)?.join("store.sqlite"))
+}
+
+fn peers_path(app: &AppHandle) -> Result<PathBuf, AppError> {
+    Ok(app_config_dir(app)?.join("peers.json"))
 }
 
 fn app_config_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
@@ -169,6 +174,34 @@ fn activity_count(log: State<'_, Arc<ActivityLog>>) -> Result<i64, AppError> {
     log.count()
 }
 
+// --- Peers (M7) ------------------------------------------------------
+
+#[tauri::command]
+fn list_peers(peers: State<'_, Arc<PeerStore>>) -> Result<Vec<Peer>, AppError> {
+    peers.list()
+}
+
+#[tauri::command]
+fn create_peer(
+    peers: State<'_, Arc<PeerStore>>,
+    peer: NewPeer,
+) -> Result<Peer, AppError> {
+    peers.create(peer)
+}
+
+#[tauri::command]
+fn update_peer(
+    peers: State<'_, Arc<PeerStore>>,
+    peer: UpdatePeer,
+) -> Result<Peer, AppError> {
+    peers.update(peer)
+}
+
+#[tauri::command]
+fn delete_peer(peers: State<'_, Arc<PeerStore>>, id: String) -> Result<(), AppError> {
+    peers.delete(&id)
+}
+
 // ---------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------
@@ -214,6 +247,11 @@ pub fn run() {
             // mutex does not contend with the SOP-index mutex.
             let activity = Arc::new(ActivityLog::open(&index_path(handle)?)?);
             app.manage(activity);
+
+            // Open the persistent peer list (peers.json next to
+            // config.json). Empty on first launch.
+            let peers = Arc::new(PeerStore::open(&peers_path(handle)?)?);
+            app.manage(peers);
 
             // Start the SCP listener AFTER managing the activity log
             // so its startup `SCP listening …` event is persisted.
@@ -274,6 +312,10 @@ pub fn run() {
             list_activity,
             clear_activity,
             activity_count,
+            list_peers,
+            create_peer,
+            update_peer,
+            delete_peer,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

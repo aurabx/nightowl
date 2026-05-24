@@ -41,7 +41,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [x] (2026-05-23) M4: SCP C-FIND returns matching identifiers from the local index. Patient Root and Study Root Q/R Find SOP classes negotiated; multi-PDV command + data accumulator in `handle_pdv`; identifier-to-SQL translator supports single value, wildcard, UID list, and date range matching; response identifier is constructed by walking the request keys and populating each from the matched `FindRow`. Verified with `findscu -S -k QueryRetrieveLevel=STUDY` (returns full study row), `-S SERIES` filtered by StudyInstanceUID, and `-P PATIENT` with `PatientName=Doe*` wildcard.
 - [x] (2026-05-23) M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Storage SOP Classes (CT, MR, SC, US, CR, DX, Encapsulated PDF) negotiated; JPEG Baseline 8-bit added to the transfer syntax list; `handle_c_store` decodes the dataset, validates the UIDs as path components, wraps with a Part-10 file meta via `FileMetaTableBuilder`, writes to `<store_dir>/<study>/<series>/<sop>.dcm`, refreshes the SQLite index via `ingest_file`, and responds 0x0000 / 0xA700 / 0xC000. Verified with `storescu` against three real MR files: three `Received Store Response (Success)` and three Part-10 files on disk in the right hierarchy.
 - [ ] M6: SCP C-MOVE and C-GET return matching SOP Instances. Verified by `movescu` and `getscu` from DCMTK.
-- [ ] M7: Peers CRUD UI persists a peer list. Add, edit, delete a peer; the change survives an app restart.
+- [x] (2026-05-23) M7: Peers CRUD UI persists a peer list. Add, edit, delete a peer; the change survives an app restart. Built **before M6** because C-MOVE needs to resolve a Move Destination AE Title against this list. `PeerStore` in `src-tauri/src/core/peers.rs` persists to `peers.json` with atomic write-temp + rename; four Tauri commands (`list_peers`, `create_peer`, `update_peer`, `delete_peer`); validation rejects duplicate AE titles; `find_by_ae_title` exposed for M6. Peers page with table + modal form + two-click delete confirmation. Seven backend tests covering CRUD, duplicate rejection, persistence across reopen.
 - [ ] M8: SCU page can run C-ECHO, C-FIND, C-MOVE, C-GET, and C-STORE against a configured peer and display the result.
 - [x] (2026-05-23) M9: Activity page shows a live event stream of every association (inbound and outbound) with peer, command, status, and timestamp. **Built ahead of M4–M8** to make the next four milestones visually verifiable: every C-FIND / C-STORE / C-MOVE response from M4–M6 will now appear in the live log without instrumentation work. `ActivityLog` in `src-tauri/src/core/activity.rs` persists every `dimse::emit` into `activity_events` (50,000-row cap, trim on every 500 inserts), three Tauri commands (`list_activity`, `clear_activity`, `activity_count`), Activity page with live event subscription, direction / status / search filters, pause-resume toggle, and clear-log button. Seventeen backend tests passing.
 - [ ] M10: (Stub only) Modality Worklist SCP placeholder page exists so the worklist work can land later as a single milestone.
@@ -231,6 +231,18 @@ Record every decision in the format below.
   Rationale: The alternative is a parallel `Index::ingest_object(path, &InMemDicomObject)` that skips the re-parse. The re-parse cost for one ~500 KB MR slice is sub-millisecond and the code path is one already-tested function. Optimize if a real ingest rate makes it visible.
   Date/Author: 2026-05-23 / M5 implementer.
 
+- Decision: Build M7 (Peers) before M6 (C-MOVE / C-GET).
+  Rationale: C-MOVE's spec requires resolving a Move Destination AE Title to a host+port. Without M7 that resolution is either a stub (refactor later) or hard-coded (won't satisfy the plan). The same reordering rationale as M9-before-M4: do the dependency first, ship cleanly. M7's UI is a thin layer over a backend that's needed anyway.
+  Date/Author: 2026-05-23 / M7 implementer.
+
+- Decision (M7): `peers.json` is rewritten in full on every create/update/delete, atomically via write-temp + rename.
+  Rationale: The peer list is small (single-digit to low-double-digit entries in any realistic dev scenario). A full rewrite per change is microseconds, simpler than per-row append/patch, and the atomic rename eliminates partial-write corruption. The same pattern as `config.json` from M1.
+  Date/Author: 2026-05-23 / M7 implementer.
+
+- Decision (M7): Per-row delete uses the same two-click confirmation pattern as Clear Log (Activity page).
+  Rationale: `window.confirm()` still doesn't work reliably in Tauri's WKWebView. A reusable modal-based confirm would be overkill for one button per row; the two-click pattern is consistent across the app.
+  Date/Author: 2026-05-23 / M7 implementer.
+
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
@@ -361,6 +373,42 @@ Follow-on observations:
 - No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
 - The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
 - Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
+
+### M7 (2026-05-23, completed before M6)
+
+What landed: a Peers data model + UI. The user can add, edit, and delete remote DICOM peers (Name + AE Title + Host + Port) from the Peers page; the list is persisted as `peers.json` next to `config.json`, and `PeerStore::find_by_ae_title` is ready for M6's C-MOVE handler.
+
+Backend (`src-tauri/src/core/peers.rs`):
+
+- `Peer { id, name, ae_title, host, port }` — `id` is a UUID assigned at creation so the UI can refer to a peer stably across renames.
+- `NewPeer` and `UpdatePeer` are the Tauri-command argument types — `id` is server-assigned on create and required on update.
+- `PeerStore::open(path)` loads `peers.json` or returns an empty store. CRUD methods validate fields (name non-empty, AE Title via `is_valid_ae_title`, host non-empty, port 1–65535), reject duplicate AE titles on both create and update, write atomically (temp + rename), and return the modified peer.
+- `find_by_ae_title` returns `Option<Peer>` — M6's resolution method, kept here so peer lookup logic lives next to the data.
+- Seven unit tests: create-then-list, duplicate AE title rejection, update field changes (keeps id), unknown-id update rejection, delete, find-by-AE-title, persistence-across-reopen.
+
+Backend wiring (`src-tauri/src/lib.rs`):
+
+- `setup()` opens `PeerStore` from `<app config dir>/peers.json` and manages an `Arc<PeerStore>`.
+- Four Tauri commands: `list_peers`, `create_peer(peer)`, `update_peer(peer)`, `delete_peer(id)`.
+
+Frontend:
+
+- `src/components/Modal.tsx` — reusable modal with click-backdrop-to-close and Escape-to-close handling.
+- `src/pages/Peers.tsx` — table of peers with monospace AE Title column, "Add peer" header button, per-row Edit (opens prefilled modal) and Delete (two-click confirm, same pattern as Activity's Clear Log). Validation errors from the backend flow into the modal's per-field error state.
+
+Verification:
+
+    $ make test-rust
+    test result: ok. 25 passed; 0 failed     (7 new for peers)
+    $ make build-web                          # frontend builds clean
+
+Gaps to address before M6: none. `PeerStore::find_by_ae_title` is the exact lookup C-MOVE needs.
+
+Follow-on observations:
+
+- No TLS / certificate fingerprint per peer. If TLS lands later, each peer gets an optional CA cert / fingerprint field.
+- No "test connection" button on the row. A C-ECHO smoke from the Peers page is a small follow-up (uses the same SCU code M6 will introduce).
+- AE Title uniqueness is enforced. Two peers with the same Host:Port but different AE Titles are allowed — that's legitimate (one physical server can host multiple AEs).
 
 ### M5 (2026-05-23)
 

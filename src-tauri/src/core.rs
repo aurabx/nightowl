@@ -6,17 +6,19 @@
 //! - `error`    — the single error type returned across the IPC boundary.
 //! - `store`    — SQLite-backed SOP Instance index over the local store
 //!               directory.
-//! - `dimse`    — DIMSE SCP listener (C-ECHO at M3; C-FIND / C-STORE /
-//!               C-MOVE / C-GET in later milestones).
+//! - `dimse`    — DIMSE SCP listener (C-ECHO at M3; C-FIND at M4;
+//!               C-STORE at M5; C-MOVE / C-GET in M6).
 //! - `activity` — persistent activity log (M9) plus the typed
 //!               `PersistedActivityEvent` shape the UI lists.
-//!
-//! Later milestones will add `peers`.
+//! - `peers`    — configured remote DICOM peers, persisted as
+//!               peers.json. M7 in the plan, but C-MOVE in M6 needs
+//!               it to resolve Move Destination AE Titles.
 
 pub mod activity;
 pub mod config;
 pub mod dimse;
 pub mod error;
+pub mod peers;
 pub mod store;
 
 /// IPC self-check used by the frontend on mount. Returns the fixed string
