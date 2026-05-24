@@ -5,6 +5,7 @@ import { PeersPage } from "./pages/Peers";
 import { ScuPage } from "./pages/Scu";
 import { ActivityPage } from "./pages/Activity";
 import { StorePage } from "./pages/Store";
+import { WorklistPage } from "./pages/Worklist";
 import { SettingsPage } from "./pages/Settings";
 
 function App() {
@@ -29,6 +30,7 @@ function App() {
           {currentPage === "scu" && <ScuPage />}
           {currentPage === "activity" && <ActivityPage />}
           {currentPage === "store" && <StorePage />}
+          {currentPage === "worklist" && <WorklistPage />}
           {currentPage === "settings" && <SettingsPage />}
         </div>
         <footer className="px-8 py-3 text-xs text-slate-500 border-t border-slate-800">

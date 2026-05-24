@@ -1,7 +1,20 @@
-import { Activity, Database, Network, Send, Settings } from "lucide-react";
+import {
+  Activity,
+  ClipboardList,
+  Database,
+  Network,
+  Send,
+  Settings,
+} from "lucide-react";
 import type { ComponentType, SVGProps } from "react";
 
-export type PageId = "peers" | "scu" | "activity" | "store" | "settings";
+export type PageId =
+  | "peers"
+  | "scu"
+  | "activity"
+  | "store"
+  | "worklist"
+  | "settings";
 
 interface SidebarItem {
   id: PageId;
@@ -14,6 +27,7 @@ const ITEMS: ReadonlyArray<SidebarItem> = [
   { id: "scu", label: "SCU", icon: Send },
   { id: "activity", label: "Activity", icon: Activity },
   { id: "store", label: "Store", icon: Database },
+  { id: "worklist", label: "Worklist", icon: ClipboardList },
   { id: "settings", label: "Settings", icon: Settings },
 ];
 
