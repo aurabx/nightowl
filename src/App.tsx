@@ -7,6 +7,7 @@ import { ActivityPage } from "./pages/Activity";
 import { StorePage } from "./pages/Store";
 import { WorklistPage } from "./pages/Worklist";
 import { SettingsPage } from "./pages/Settings";
+import { AboutPage } from "./pages/About";
 
 function App() {
   const [currentPage, setCurrentPage] = useState<PageId>("peers");
@@ -32,6 +33,7 @@ function App() {
           {currentPage === "store" && <StorePage />}
           {currentPage === "worklist" && <WorklistPage />}
           {currentPage === "settings" && <SettingsPage />}
+          {currentPage === "about" && <AboutPage />}
         </div>
         <footer className="px-8 py-3 text-xs text-slate-500 border-t border-slate-800">
           IPC self-check: {pingResult}

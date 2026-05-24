@@ -96,6 +96,11 @@ fn ping() -> &'static str {
 }
 
 #[tauri::command]
+fn open_url(url: String) -> Result<(), AppError> {
+    core::open_url(&url)
+}
+
+#[tauri::command]
 fn get_config(state: State<'_, AppState>) -> Result<AppConfig, AppError> {
     read_config(&state)
 }
@@ -446,6 +451,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             ping,
+            open_url,
             get_config,
             save_config,
             rescan_store,

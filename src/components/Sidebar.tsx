@@ -2,6 +2,7 @@ import {
   Activity,
   ClipboardList,
   Database,
+  Info,
   Network,
   Send,
   Settings,
@@ -14,7 +15,8 @@ export type PageId =
   | "activity"
   | "store"
   | "worklist"
-  | "settings";
+  | "settings"
+  | "about";
 
 interface SidebarItem {
   id: PageId;
@@ -29,6 +31,7 @@ const ITEMS: ReadonlyArray<SidebarItem> = [
   { id: "store", label: "Store", icon: Database },
   { id: "worklist", label: "Worklist", icon: ClipboardList },
   { id: "settings", label: "Settings", icon: Settings },
+  { id: "about", label: "About", icon: Info },
 ];
 
 interface SidebarProps {

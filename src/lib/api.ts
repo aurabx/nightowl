@@ -93,6 +93,10 @@ export function ping(): Promise<string> {
   return invoke<string>("ping");
 }
 
+export function openUrl(url: string): Promise<void> {
+  return invoke<void>("open_url", { url });
+}
+
 // --- Local store (M2) -------------------------------------------------
 
 export function rescanStore(): Promise<ScanReport> {
