@@ -114,6 +114,100 @@ pub struct InstanceRow {
     pub size_bytes: i64,
 }
 
+// ---------------------------------------------------------------------
+// C-FIND query types (M4)
+// ---------------------------------------------------------------------
+
+/// DICOM Query/Retrieve hierarchy level used for C-FIND, C-MOVE and
+/// C-GET. PS3.4 Annex C.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FindLevel {
+    Patient,
+    Study,
+    Series,
+    Image,
+}
+
+/// A single matching key, translated from the inbound DICOM identifier.
+///
+/// The DICOM matching key types we support at M4 are: Single Value
+/// (exact equality), Wildcard (`*` matches any, `?` matches one),
+/// List of UID (backslash-separated values), and Range (two dates
+/// joined by a hyphen). Universal Matching — an empty value meaning
+/// "return this key, do not filter on it" — is represented by the
+/// absence of a `KeyMatch` rather than a variant.
+#[derive(Debug, Clone)]
+pub enum KeyMatch {
+    /// Exact equality.
+    Single(String),
+    /// DICOM wildcard pattern; `*` and `?` translate to SQL `%` and
+    /// `_` after escaping any literal SQL wildcards in the input.
+    Wildcard(String),
+    /// Backslash-separated list of UIDs; SQL `IN (?, ?, …)`.
+    List(Vec<String>),
+    /// `YYYYMMDD-YYYYMMDD` (either side optional in DICOM but here
+    /// both bounds are required after splitting).
+    Range(String, String),
+}
+
+/// Translated representation of a C-FIND-RQ identifier dataset, ready
+/// to feed to `Index::find`.
+///
+/// Every field is optional. A `None` value means the key was either
+/// absent from the request or present with an empty value (Universal
+/// Matching). Both cases mean "do not filter on this key" — the
+/// response identifier will still carry the column populated.
+#[derive(Debug, Clone)]
+pub struct FindQuery {
+    pub level: FindLevel,
+    pub patient_id: Option<KeyMatch>,
+    pub patient_name: Option<KeyMatch>,
+    pub study_instance_uid: Option<KeyMatch>,
+    pub study_date: Option<KeyMatch>,
+    pub modality: Option<KeyMatch>,
+    pub series_instance_uid: Option<KeyMatch>,
+    pub sop_instance_uid: Option<KeyMatch>,
+    pub sop_class_uid: Option<KeyMatch>,
+}
+
+impl FindQuery {
+    pub fn new(level: FindLevel) -> Self {
+        Self {
+            level,
+            patient_id: None,
+            patient_name: None,
+            study_instance_uid: None,
+            study_date: None,
+            modality: None,
+            series_instance_uid: None,
+            sop_instance_uid: None,
+            sop_class_uid: None,
+        }
+    }
+}
+
+/// One match returned from `Index::find`. Fields irrelevant to the
+/// queried level are `None`. The dimse code builds the response
+/// identifier from this row, populating the keys the client asked for.
+#[derive(Debug, Default, Clone)]
+pub struct FindRow {
+    pub patient_id: String,
+    pub patient_name: Option<String>,
+    pub study_instance_uid: Option<String>,
+    pub study_description: Option<String>,
+    pub study_date: Option<String>,
+    /// Comma-separated distinct modalities present in the study.
+    pub modalities_in_study: Option<String>,
+    pub number_of_study_related_series: Option<i64>,
+    pub number_of_study_related_instances: Option<i64>,
+    pub series_instance_uid: Option<String>,
+    pub series_description: Option<String>,
+    pub modality: Option<String>,
+    pub number_of_series_related_instances: Option<i64>,
+    pub sop_instance_uid: Option<String>,
+    pub sop_class_uid: Option<String>,
+}
+
 /// All tags extracted from a DICOM file, ready to insert.
 #[derive(Debug, Clone)]
 struct ParsedInstance {
@@ -339,6 +433,196 @@ impl Index {
         Ok(n)
     }
 
+    /// Runs a DICOM C-FIND query against the SOP Instance index.
+    ///
+    /// The returned `Vec<FindRow>` has one entry per match at the
+    /// requested level. The dimse layer is responsible for converting
+    /// each row into a C-FIND-RSP identifier dataset by populating the
+    /// keys the client asked for.
+    pub fn find(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
+        match q.level {
+            FindLevel::Patient => self.find_patients(q),
+            FindLevel::Study => self.find_studies_qr(q),
+            FindLevel::Series => self.find_series_qr(q),
+            FindLevel::Image => self.find_instances_qr(q),
+        }
+    }
+
+    fn find_patients(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
+        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
+
+        let mut sql = String::from(
+            "SELECT patient_id, MIN(patient_name) FROM sop_instances",
+        );
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        sql.push_str(" GROUP BY patient_id ORDER BY MIN(patient_name)");
+
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(FindRow {
+                    patient_id: row.get(0)?,
+                    patient_name: row.get(1)?,
+                    ..FindRow::default()
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn find_studies_qr(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
+        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
+        apply_match("study_instance_uid", q.study_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("study_date", q.study_date.as_ref(), &mut where_parts, &mut bound);
+
+        let mut sql = String::from(
+            "SELECT
+                study_instance_uid,
+                MIN(patient_id),
+                MIN(patient_name),
+                MIN(study_description),
+                MIN(study_date),
+                GROUP_CONCAT(DISTINCT modality),
+                COUNT(DISTINCT series_instance_uid),
+                COUNT(*)
+             FROM sop_instances",
+        );
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        sql.push_str(" GROUP BY study_instance_uid ORDER BY MIN(study_date) DESC");
+
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(FindRow {
+                    study_instance_uid: Some(row.get(0)?),
+                    patient_id: row.get(1)?,
+                    patient_name: row.get(2)?,
+                    study_description: row.get(3)?,
+                    study_date: row.get(4)?,
+                    modalities_in_study: row.get(5)?,
+                    number_of_study_related_series: Some(row.get(6)?),
+                    number_of_study_related_instances: Some(row.get(7)?),
+                    ..FindRow::default()
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn find_series_qr(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
+        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
+        apply_match("study_instance_uid", q.study_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("series_instance_uid", q.series_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("modality", q.modality.as_ref(), &mut where_parts, &mut bound);
+
+        let mut sql = String::from(
+            "SELECT
+                series_instance_uid,
+                MIN(study_instance_uid),
+                MIN(patient_id),
+                MIN(patient_name),
+                MIN(series_description),
+                MIN(modality),
+                COUNT(*)
+             FROM sop_instances",
+        );
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        sql.push_str(" GROUP BY series_instance_uid ORDER BY MIN(series_description), series_instance_uid");
+
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(FindRow {
+                    series_instance_uid: Some(row.get(0)?),
+                    study_instance_uid: Some(row.get(1)?),
+                    patient_id: row.get(2)?,
+                    patient_name: row.get(3)?,
+                    series_description: row.get(4)?,
+                    modality: row.get(5)?,
+                    number_of_series_related_instances: Some(row.get(6)?),
+                    ..FindRow::default()
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    fn find_instances_qr(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
+        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
+        apply_match("study_instance_uid", q.study_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("series_instance_uid", q.series_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("sop_instance_uid", q.sop_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("sop_class_uid", q.sop_class_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("modality", q.modality.as_ref(), &mut where_parts, &mut bound);
+
+        let mut sql = String::from(
+            "SELECT
+                sop_instance_uid,
+                series_instance_uid,
+                study_instance_uid,
+                patient_id,
+                patient_name,
+                sop_class_uid,
+                modality
+             FROM sop_instances",
+        );
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        sql.push_str(" ORDER BY sop_instance_uid");
+
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(FindRow {
+                    sop_instance_uid: Some(row.get(0)?),
+                    series_instance_uid: Some(row.get(1)?),
+                    study_instance_uid: Some(row.get(2)?),
+                    patient_id: row.get(3)?,
+                    patient_name: row.get(4)?,
+                    sop_class_uid: Some(row.get(5)?),
+                    modality: row.get(6)?,
+                    ..FindRow::default()
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Connection>, AppError> {
         self.conn
             .lock()
@@ -448,6 +732,57 @@ fn now_unix_ms() -> u128 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0)
+}
+
+// ---------------------------------------------------------------------
+// Matching-key → SQL translation (M4 C-FIND)
+// ---------------------------------------------------------------------
+
+/// Appends a WHERE clause and binding(s) for one matching key.
+///
+/// Returns silently when `m` is `None` (Universal Matching — the key
+/// is returned but not filtered on).
+fn apply_match(
+    column: &str,
+    m: Option<&KeyMatch>,
+    where_parts: &mut Vec<String>,
+    bound: &mut Vec<Box<dyn rusqlite::ToSql>>,
+) {
+    let Some(m) = m else { return };
+    match m {
+        KeyMatch::Single(v) => {
+            where_parts.push(format!("{column} = ?"));
+            bound.push(Box::new(v.clone()));
+        }
+        KeyMatch::Wildcard(pattern) => {
+            // Two-stage translation so the user can search for a
+            // literal underscore by typing it. First escape SQL LIKE
+            // metacharacters in the source pattern, THEN map DICOM
+            // wildcards to their SQL equivalents.
+            let escaped = pattern
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_");
+            let like = escaped.replace('*', "%").replace('?', "_");
+            where_parts.push(format!("{column} LIKE ? ESCAPE '\\'"));
+            bound.push(Box::new(like));
+        }
+        KeyMatch::List(values) => {
+            if values.is_empty() {
+                return;
+            }
+            let placeholders = vec!["?"; values.len()].join(",");
+            where_parts.push(format!("{column} IN ({placeholders})"));
+            for v in values {
+                bound.push(Box::new(v.clone()));
+            }
+        }
+        KeyMatch::Range(start, end) => {
+            where_parts.push(format!("{column} BETWEEN ? AND ?"));
+            bound.push(Box::new(start.clone()));
+            bound.push(Box::new(end.clone()));
+        }
+    }
 }
 
 #[cfg(test)]

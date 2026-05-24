@@ -38,7 +38,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [x] (2026-05-23) M1: Settings page persists a config (local AE Title, listen port, store directory) to disk and reloads on launch. `AppConfig` + validators in `src-tauri/src/core/config.rs`, `AppError` discriminated union in `core/error.rs`, `get_config` / `save_config` Tauri commands in `lib.rs`, Settings UI in `src/pages/Settings.tsx`, shared API client + types in `src/lib/api.ts`. Eight backend unit tests passing.
 - [x] (2026-05-23) M2: Local Store scanner indexes a directory of DICOM files into a SQLite database and the Store page browses the Patient / Study / Series / SOP Instance hierarchy. `Index` + `parse_dicom` + `rescan_dir` in `src-tauri/src/core/store.rs`, five Tauri commands (`rescan_store`, `list_studies`, `list_series_for_study`, `list_instances_for_series`, `total_instance_count`), Store page tree UI with live-event refresh, initial background scan on boot. Eleven backend tests passing.
 - [x] (2026-05-23) M3: SCP listener accepts an association and answers C-ECHO. `core/dimse.rs` binds `0.0.0.0:<port>` on app start, accepts the Verification SOP Class on Implicit/Explicit VR LE, dispatches DIMSE commands, and emits stable `activity` events. `echoscu -aec PHANTOM -aet TESTSCU localhost 11112` returns "Received Echo Response (Success)" with exit 0. Twelve backend tests passing.
-- [ ] M4: SCP C-FIND returns matching identifiers from the local index. Verified by `findscu` from DCMTK.
+- [x] (2026-05-23) M4: SCP C-FIND returns matching identifiers from the local index. Patient Root and Study Root Q/R Find SOP classes negotiated; multi-PDV command + data accumulator in `handle_pdv`; identifier-to-SQL translator supports single value, wildcard, UID list, and date range matching; response identifier is constructed by walking the request keys and populating each from the matched `FindRow`. Verified with `findscu -S -k QueryRetrieveLevel=STUDY` (returns full study row), `-S SERIES` filtered by StudyInstanceUID, and `-P PATIENT` with `PatientName=Doe*` wildcard.
 - [ ] M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Verified by `storescu` from DCMTK.
 - [ ] M6: SCP C-MOVE and C-GET return matching SOP Instances. Verified by `movescu` and `getscu` from DCMTK.
 - [ ] M7: Peers CRUD UI persists a peer list. Add, edit, delete a peer; the change survives an app restart.
@@ -195,6 +195,26 @@ Record every decision in the format below.
   Rationale: The frontend listener writes events directly into a React state list keyed by `id`. Switching the wire shape on failure would force every consumer to handle two possibilities; emitting one shape always keeps the UI code simple. The `id = -1` value is documented and distinguishable from real ids.
   Date/Author: 2026-05-23 / M9 implementer.
 
+- Decision (M4): The DIMSE receive loop accumulates Command + Data PDVs into an `InFlightCommand` before dispatching, rather than dispatching each PDV separately.
+  Rationale: DICOM messages span PDVs — a C-FIND-RQ has the command set in one PDV and the identifier in one or more subsequent Data PDVs (terminated by `is_last`). The dispatcher needs both halves at once. The pattern also generalises to C-STORE / C-MOVE / C-GET where the data set is the SOP Instance itself.
+  Date/Author: 2026-05-23 / M4 implementer.
+
+- Decision (M4): Wildcard matching escapes literal SQL metacharacters (`%`, `_`, `\`) in the user input before translating DICOM wildcards (`*` → `%`, `?` → `_`).
+  Rationale: Without escaping, a user searching for a literal underscore in PatientID would match every single-character pad. The two-stage translation (escape first, then translate DICOM wildcards) means `?` and `*` are the only wildcard characters at the SQL boundary.
+  Date/Author: 2026-05-23 / M4 implementer.
+
+- Decision (M4): The response identifier is built by walking the request identifier and populating each tag from the matched `FindRow`. Tags we do not track are returned with empty values.
+  Rationale: DICOM C-FIND semantics — every key the client requested (matching or return) appears in the response, populated where available and empty otherwise. This matches what real PACS do; clients written against real PACS work unchanged.
+  Date/Author: 2026-05-23 / M4 implementer.
+
+- Decision (M4): Modality filtering at STUDY level is NOT implemented in this milestone (Modality filters at SERIES and IMAGE levels work).
+  Rationale: Our schema stores one modality per instance. A STUDY-level filter on Modality should match any study where at least one instance has that modality, which requires either an EXISTS subquery or HAVING with conditional aggregation. Pragmatically, the standard tag at STUDY level is `ModalitiesInStudy` (0008,0061) — a multi-valued return key, not a filter — and most clients use it as a return key. Will revisit if a real workflow needs filter-by-modality at STUDY.
+  Date/Author: 2026-05-23 / M4 implementer.
+
+- Decision (M4): `transfer_syntax_uid_for` returns an owned `String` rather than a `&str` tied to the association's lifetime.
+  Rationale: Holding an immutable borrow on the association across mutable `send()` calls in the response loop is a borrow-checker error. The cheapest fix is to clone the UID once, drop the borrow, and re-resolve `&TransferSyntax` from the (static) registry inside the loop. `lookup_ts` returns a `&'static TransferSyntax` so the lifetime is unbounded.
+  Date/Author: 2026-05-23 / M4 implementer.
+
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
@@ -325,6 +345,68 @@ Follow-on observations:
 - No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
 - The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
 - Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
+
+### M4 (2026-05-23)
+
+What landed: Phantom answers DICOM C-FIND queries. The SCP negotiates Patient Root and Study Root Query/Retrieve Information Models for Find, parses the inbound identifier dataset, translates the matching keys (single value, wildcard, UID list, date range, or Universal) into SQL against the SOP Instance index, and emits one C-FIND-RSP Pending per match (carrying the requested return keys populated) followed by a final C-FIND-RSP Success.
+
+Backend changes (`src-tauri/src/core/dimse.rs`):
+
+- Imports: pulled in `PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND`, `STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND`, the relevant `tags::*` constants, and the new `FindQuery` / `FindLevel` / `FindRow` / `KeyMatch` types from `core::store`.
+- Status codes added: `STATUS_PENDING` (0xFF00), placeholders for Refused / Failed (used by M5 / M6).
+- `start_listener` and `run_accept_loop` now take `Arc<Index>` so the dispatcher can query the SOP index.
+- Receive loop rewritten around `InFlightCommand`: Command PDV with `CommandDataSetType != 0x0101` parks the command until subsequent Data PDVs complete (`is_last`); only then does dispatch fire. C-ECHO (no data) still dispatches inline.
+- `handle_c_find`: looks up the negotiated transfer syntax for the presentation context, decodes the identifier, parses `QueryRetrieveLevel`, builds a `FindQuery`, runs `Index::find`, and for each match builds a response identifier and sends a Pending RSP. Final RSP with Success.
+- `build_find_query` translates each key with three helpers: `key_match_text` (wildcards `*` / `?`), `key_match_uid` (backslash-separated → `List`), `key_match_date` (`YYYYMMDD-YYYYMMDD` → `Range`).
+- `build_response_identifier` walks the request identifier, copies `QueryRetrieveLevel` from the level we resolved, and populates every other tag from the matched row via `response_value_for`. Tags we don't track come back empty — the DICOM-correct behaviour for return-only keys with no source data.
+
+Backend changes (`src-tauri/src/core/store.rs`):
+
+- New types: `FindLevel`, `KeyMatch`, `FindQuery`, `FindRow`.
+- `Index::find(query)` dispatches to one of four level-specific SQL builders.
+- `apply_match` is the shared WHERE-clause + parameter binder; handles all four `KeyMatch` variants. Wildcard match escapes SQL metacharacters first (`\\` `%` `_`) then translates DICOM wildcards (`*` → `%`, `?` → `_`) using `ESCAPE '\'`.
+- STUDY-level query uses `GROUP_CONCAT(DISTINCT modality)` for `ModalitiesInStudy` and counts series and instances.
+
+Verification:
+
+    $ make test-rust
+    test result: ok. 18 passed; 0 failed
+    # 3 MR images already in ~/dicom-store from M2.
+    $ npm run tauri dev  (background)
+    $ findscu -S -k QueryRetrieveLevel=STUDY -k PatientID -k PatientName \
+              -k StudyInstanceUID -k StudyDescription -k ModalitiesInStudy \
+              -aec PHANTOM -aet TESTSCU localhost 11112
+    Find Response: 1 (Pending)
+      QueryRetrieveLevel = STUDY
+      ModalitiesInStudy   = MR
+      StudyDescription    = RM SPALLA SN
+      PatientName         = Doe^Giovanni
+      PatientID           = 48213468
+      StudyInstanceUID    = 1.3.6.1.4.1.5962.99.1.2786334768...
+    Received Final Find Response (Success)
+
+    # SERIES level filtered by StudyInstanceUID
+    Find Response: 1 (Pending)
+      Modality            = MR
+      SeriesDescription   = TSE T2 TRS1
+      SeriesInstanceUID   = 1.3.6.1.4.1...729.0
+    Received Final Find Response (Success)
+
+    # PATIENT level with wildcard
+    findscu -P -k QueryRetrieveLevel=PATIENT -k PatientID -k 'PatientName=Doe*'
+    Find Response: 1 (Pending)
+      PatientName = Doe^Giovanni
+      PatientID   = 48213468
+    Received Final Find Response (Success)
+
+Gaps to address before M5: none. The PDV accumulator generalises to C-STORE (the inbound SOP Instance is the data set); the response-construction pattern generalises to C-MOVE / C-GET (responses report sub-operation counts in the command set, no identifier needed for the final RSP).
+
+Follow-on observations:
+
+- Modality filtering at STUDY level is not supported (only at SERIES / IMAGE). Documented in Decision Log; revisit when a real workflow demands it.
+- AccessionNumber is a common C-FIND key we do not yet index. Easy schema migration when needed.
+- C-CANCEL-RQ is not handled — long-running queries cannot be aborted by the requester. Acceptable for a dev tool against a tiny database; document.
+- The 30-second association read timeout is per-receive; a slow client could keep the association alive forever by sending PDUs slowly. Not a real attack surface for a dev tool but worth noting.
 
 ### M9 (2026-05-23, completed ahead of M4-M8)
 

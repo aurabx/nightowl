@@ -31,15 +31,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use dicom_core::{dicom_value, DataElement, VR};
+use dicom_core::{dicom_value, DataElement, Tag, VR};
 use dicom_dictionary_std::tags;
 use dicom_dictionary_std::uids::{
-    EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, VERIFICATION,
+    EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN,
+    PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
+    STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND, VERIFICATION,
 };
-use dicom_encoding::transfer_syntax::TransferSyntaxIndex;
+use dicom_encoding::transfer_syntax::{TransferSyntax, TransferSyntaxIndex};
 use dicom_object::InMemDicomObject;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
-use dicom_ul::association::server::ServerAssociationOptions;
+use dicom_ul::association::server::{ServerAssociation, ServerAssociationOptions};
 use dicom_ul::association::Association;
 use dicom_ul::pdu::{PDataValue, PDataValueType, Pdu};
 use serde::Serialize;
@@ -48,6 +50,7 @@ use uuid::Uuid;
 
 use super::activity::{ActivityLog, PersistedActivityEvent};
 use super::error::AppError;
+use super::store::{FindLevel, FindQuery, FindRow, Index, KeyMatch};
 
 // DIMSE Command Field values (PS3.7 Table 7.1-1). Listed even when
 // unused at M3 so the table is in one place for M4/M5/M6.
@@ -67,9 +70,18 @@ mod cmd {
 
 // CommandDataSetType: "No Data Set Present" (PS3.7 Section 9.3.5).
 const NO_DATASET: u16 = 0x0101;
+// CommandDataSetType: "Data Set Present" (any value other than 0x0101).
+const DATASET_PRESENT: u16 = 0x0000;
 
-// DIMSE status codes used at M3.
+// DIMSE status codes (PS3.7 Annex C).
 const STATUS_SUCCESS: u16 = 0x0000;
+const STATUS_PENDING: u16 = 0xFF00;
+#[allow(dead_code)]
+const STATUS_REFUSED_OUT_OF_RESOURCES: u16 = 0xA700;
+#[allow(dead_code)]
+const STATUS_FAILED_IDENTIFIER_DOES_NOT_MATCH_SOP_CLASS: u16 = 0xA900;
+#[allow(dead_code)]
+const STATUS_FAILED_UNABLE_TO_PROCESS: u16 = 0xC000;
 
 // ---------------------------------------------------------------------
 // Activity events
@@ -185,6 +197,7 @@ pub fn start_listener(
     port: u16,
     local_ae_title: String,
     app: AppHandle,
+    index: Arc<Index>,
 ) -> Result<ListenerHandle, AppError> {
     let bind = SocketAddr::from(([0, 0, 0, 0], port));
     let listener =
@@ -200,10 +213,19 @@ pub fn start_listener(
     let shutdown_for_thread = shutdown.clone();
     let app_for_thread = app.clone();
     let ae_for_thread = local_ae_title.clone();
+    let index_for_thread = index.clone();
 
     std::thread::Builder::new()
         .name("phantom-scp-accept".to_string())
-        .spawn(move || run_accept_loop(listener, ae_for_thread, app_for_thread, shutdown_for_thread))
+        .spawn(move || {
+            run_accept_loop(
+                listener,
+                ae_for_thread,
+                app_for_thread,
+                index_for_thread,
+                shutdown_for_thread,
+            )
+        })
         .map_err(|e| AppError::Internal(format!("spawn accept thread: {e}")))?;
 
     emit(
@@ -230,6 +252,7 @@ fn run_accept_loop(
     listener: TcpListener,
     local_ae_title: String,
     app: AppHandle,
+    index: Arc<Index>,
     shutdown: Arc<AtomicBool>,
 ) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -251,10 +274,18 @@ fn run_accept_loop(
 
         let app_clone = app.clone();
         let ae_clone = local_ae_title.clone();
+        let index_clone = index.clone();
         if let Err(err) = std::thread::Builder::new()
             .name(format!("phantom-scp-{}", local_seq))
             .spawn(move || {
-                handle_association(stream, peer, ae_clone, app_clone, association_id);
+                handle_association(
+                    stream,
+                    peer,
+                    ae_clone,
+                    app_clone,
+                    index_clone,
+                    association_id,
+                );
             })
         {
             tracing::error!(error = %err, "spawn association thread failed");
@@ -271,6 +302,7 @@ fn handle_association(
     peer: Option<SocketAddr>,
     local_ae_title: String,
     app: AppHandle,
+    index: Arc<Index>,
     association_id: String,
 ) {
     let peer_host = peer.map(|p| p.to_string());
@@ -279,12 +311,17 @@ fn handle_association(
         tracing::warn!(error = %err, "set_read_timeout failed");
     }
 
-    // Negotiate. We accept Verification on Implicit VR LE and Explicit
-    // VR LE — the minimum for echoscu. Future milestones bolt on more
-    // SOP classes and transfer syntaxes by calling the same builder.
+    // Negotiate. We accept Verification (M3 — C-ECHO) plus the Patient
+    // Root and Study Root Query/Retrieve Information Models for Find
+    // (M4 — C-FIND). Transfer syntaxes: Implicit VR LE (default; every
+    // DICOM peer supports it) and Explicit VR LE (preferred when both
+    // sides support it; what most modern PACS speak). Both are added
+    // to every offered abstract syntax.
     let options = ServerAssociationOptions::new()
         .accept_any()
         .with_abstract_syntax(VERIFICATION)
+        .with_abstract_syntax(PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND)
+        .with_abstract_syntax(STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND)
         .with_transfer_syntax(IMPLICIT_VR_LITTLE_ENDIAN)
         .with_transfer_syntax(EXPLICIT_VR_LITTLE_ENDIAN)
         .ae_title(local_ae_title.clone());
@@ -332,6 +369,12 @@ fn handle_association(
         app: app.clone(),
     };
 
+    // DIMSE messages may span multiple P-DATA PDVs: typically a Command
+    // PDV followed by one or more Data PDVs carrying the identifier or
+    // data set. We hold the Command set and the accumulated data bytes
+    // here until the last Data PDV arrives, then dispatch.
+    let mut in_flight: Option<InFlightCommand> = None;
+
     loop {
         let pdu = match association.receive() {
             Ok(p) => p,
@@ -343,29 +386,26 @@ fn handle_association(
 
         match pdu {
             Pdu::PData { data } => {
-                for value in data {
-                    if value.value_type == PDataValueType::Command {
-                        match dispatch_command(&mut association, &ctx, &value) {
-                            Ok(true) => {} // continue
-                            Ok(false) => {
-                                // Command dispatcher signalled "abort cleanly".
-                                return;
-                            }
-                            Err(err) => {
-                                ctx.emit_lifecycle(
-                                    Status::Error,
-                                    format!("command dispatch failed: {err}"),
-                                );
-                                let _ = association
-                                    .inner_stream()
-                                    .shutdown(Shutdown::Both);
-                                return;
-                            }
+                let mut continue_loop = true;
+                for pdv in data {
+                    match handle_pdv(&mut association, &mut in_flight, &ctx, &index, pdv) {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            continue_loop = false;
+                            break;
+                        }
+                        Err(err) => {
+                            ctx.emit_lifecycle(
+                                Status::Error,
+                                format!("dispatch failed: {err}"),
+                            );
+                            let _ = association.inner_stream().shutdown(Shutdown::Both);
+                            return;
                         }
                     }
-                    // Data PDVs are ignored at M3 (C-ECHO has no data
-                    // set). M4/M5 will route them to query/storage
-                    // handlers.
+                }
+                if !continue_loop {
+                    return;
                 }
             }
             Pdu::ReleaseRQ => {
@@ -391,6 +431,73 @@ fn handle_association(
     }
 
     ctx.emit_lifecycle(Status::Info, "association closed".to_string());
+}
+
+/// Command awaiting its data set across multiple P-DATA PDVs.
+struct InFlightCommand {
+    command: InMemDicomObject,
+    presentation_context_id: u8,
+    data: Vec<u8>,
+}
+
+/// Processes one P-DATA Value. Routes Command PDVs through the
+/// dispatcher (immediately if no data set is expected, otherwise
+/// after collecting the trailing Data PDVs).
+fn handle_pdv(
+    association: &mut ServerAssociation<TcpStream>,
+    in_flight: &mut Option<InFlightCommand>,
+    ctx: &AssociationCtx,
+    index: &Index,
+    pdv: PDataValue,
+) -> Result<bool, AppError> {
+    match pdv.value_type {
+        PDataValueType::Command => {
+            let command = parse_command_set(&pdv.data)?;
+            let data_expected =
+                read_u16(&command, tags::COMMAND_DATA_SET_TYPE).unwrap_or(NO_DATASET)
+                    != NO_DATASET;
+            if data_expected {
+                *in_flight = Some(InFlightCommand {
+                    command,
+                    presentation_context_id: pdv.presentation_context_id,
+                    data: Vec::new(),
+                });
+                Ok(true)
+            } else {
+                dispatch(
+                    association,
+                    ctx,
+                    index,
+                    &command,
+                    &[],
+                    pdv.presentation_context_id,
+                )
+            }
+        }
+        PDataValueType::Data => {
+            let Some(in_f) = in_flight.as_mut() else {
+                ctx.emit_lifecycle(
+                    Status::Warning,
+                    "data pdv received without a preceding command".to_string(),
+                );
+                return Ok(true);
+            };
+            in_f.data.extend_from_slice(&pdv.data);
+            if pdv.is_last {
+                let taken = in_flight.take().expect("checked above");
+                dispatch(
+                    association,
+                    ctx,
+                    index,
+                    &taken.command,
+                    &taken.data,
+                    taken.presentation_context_id,
+                )
+            } else {
+                Ok(true)
+            }
+        }
+    }
 }
 
 struct AssociationCtx {
@@ -454,24 +561,23 @@ impl AssociationCtx {
 // DIMSE command dispatch
 // ---------------------------------------------------------------------
 
+/// Routes a fully-assembled DIMSE message to the right handler.
+///
 /// Returns `Ok(true)` to continue the receive loop, `Ok(false)` to
 /// stop after a clean abort. `Err` indicates a protocol-level failure
 /// the caller should treat as fatal for this association.
-fn dispatch_command(
-    association: &mut dicom_ul::association::server::ServerAssociation<TcpStream>,
+fn dispatch(
+    association: &mut ServerAssociation<TcpStream>,
     ctx: &AssociationCtx,
-    pdv: &PDataValue,
+    index: &Index,
+    command: &InMemDicomObject,
+    data: &[u8],
+    pc_id: u8,
 ) -> Result<bool, AppError> {
-    let command = parse_command_set(&pdv.data)?;
-
-    let command_field: u16 = command
-        .element(tags::COMMAND_FIELD)
-        .map_err(|e| AppError::Internal(format!("missing CommandField: {e}")))?
-        .uint16()
-        .map_err(|e| AppError::Internal(format!("CommandField not US: {e}")))?;
-
+    let command_field = read_u16(command, tags::COMMAND_FIELD)?;
     match command_field {
-        cmd::C_ECHO_RQ => handle_c_echo(association, ctx, &command, pdv.presentation_context_id),
+        cmd::C_ECHO_RQ => handle_c_echo(association, ctx, command, pc_id),
+        cmd::C_FIND_RQ => handle_c_find(association, ctx, index, command, data, pc_id),
         other => {
             ctx.emit_lifecycle(
                 Status::Warning,
@@ -493,16 +599,12 @@ fn parse_command_set(bytes: &[u8]) -> Result<InMemDicomObject, AppError> {
 }
 
 fn handle_c_echo(
-    association: &mut dicom_ul::association::server::ServerAssociation<TcpStream>,
+    association: &mut ServerAssociation<TcpStream>,
     ctx: &AssociationCtx,
     command: &InMemDicomObject,
     presentation_context_id: u8,
 ) -> Result<bool, AppError> {
-    let message_id: u16 = command
-        .element(tags::MESSAGE_ID)
-        .map_err(|e| AppError::Internal(format!("missing MessageID: {e}")))?
-        .uint16()
-        .map_err(|e| AppError::Internal(format!("MessageID not US: {e}")))?;
+    let message_id = read_u16(command, tags::MESSAGE_ID)?;
 
     ctx.emit_inbound("C-ECHO-RQ", format!("message id {message_id}"));
 
@@ -528,6 +630,355 @@ fn handle_c_echo(
     );
 
     Ok(true)
+}
+
+// ---------------------------------------------------------------------
+// C-FIND handler (M4)
+// ---------------------------------------------------------------------
+
+fn handle_c_find(
+    association: &mut ServerAssociation<TcpStream>,
+    ctx: &AssociationCtx,
+    index: &Index,
+    command: &InMemDicomObject,
+    identifier_bytes: &[u8],
+    pc_id: u8,
+) -> Result<bool, AppError> {
+    let message_id = read_u16(command, tags::MESSAGE_ID)?;
+    let sop_class_uid = read_str(command, tags::AFFECTED_SOP_CLASS_UID)?;
+
+    // The identifier dataset uses the negotiated transfer syntax for
+    // this presentation context — not Implicit VR LE like the command
+    // set always is. We pull the UID as an owned String and resolve to
+    // a `&TransferSyntax` on each use; that keeps the immutable borrow
+    // on the association brief so we can call `send` later.
+    let ts_uid = transfer_syntax_uid_for(association, pc_id)?;
+    let ts = lookup_ts(&ts_uid)?;
+
+    let request_identifier = InMemDicomObject::read_dataset_with_ts(identifier_bytes, ts)
+        .map_err(|e| AppError::Internal(format!("C-FIND identifier decode: {e}")))?;
+
+    let level_str = read_str(&request_identifier, tags::QUERY_RETRIEVE_LEVEL)?;
+    let level = match level_str.as_str() {
+        "PATIENT" => FindLevel::Patient,
+        "STUDY" => FindLevel::Study,
+        "SERIES" => FindLevel::Series,
+        "IMAGE" => FindLevel::Image,
+        other => {
+            ctx.emit_inbound(
+                "C-FIND-RQ",
+                format!("message id {message_id} unknown level {other}"),
+            );
+            send_c_find_final(
+                association,
+                ctx,
+                &sop_class_uid,
+                message_id,
+                pc_id,
+                STATUS_FAILED_IDENTIFIER_DOES_NOT_MATCH_SOP_CLASS,
+            )?;
+            return Ok(true);
+        }
+    };
+
+    ctx.emit_inbound(
+        "C-FIND-RQ",
+        format!("message id {message_id} level {level_str}"),
+    );
+
+    let query = build_find_query(&request_identifier, level);
+    let matches = index.find(&query)?;
+    let match_count = matches.len();
+
+    for row in matches {
+        let response_identifier = build_response_identifier(&request_identifier, &row, level);
+        let rsp_command = build_c_find_rsp(message_id, &sop_class_uid, STATUS_PENDING, true);
+        let cmd_bytes = encode_command_set(&rsp_command)?;
+        let id_bytes = encode_identifier(&response_identifier, lookup_ts(&ts_uid)?)?;
+
+        let pdu = Pdu::PData {
+            data: vec![
+                PDataValue {
+                    presentation_context_id: pc_id,
+                    value_type: PDataValueType::Command,
+                    is_last: true,
+                    data: cmd_bytes,
+                },
+                PDataValue {
+                    presentation_context_id: pc_id,
+                    value_type: PDataValueType::Data,
+                    is_last: true,
+                    data: id_bytes,
+                },
+            ],
+        };
+        association
+            .send(&pdu)
+            .map_err(|e| AppError::Internal(format!("send C-FIND-RSP Pending: {e}")))?;
+    }
+
+    send_c_find_final(
+        association,
+        ctx,
+        &sop_class_uid,
+        message_id,
+        pc_id,
+        STATUS_SUCCESS,
+    )?;
+
+    ctx.emit_outbound(
+        "C-FIND-RSP",
+        format!(
+            "{match_count} match{} + final Success",
+            if match_count == 1 { "" } else { "es" }
+        ),
+    );
+
+    Ok(true)
+}
+
+fn send_c_find_final(
+    association: &mut ServerAssociation<TcpStream>,
+    _ctx: &AssociationCtx,
+    sop_class_uid: &str,
+    message_id: u16,
+    pc_id: u8,
+    status: u16,
+) -> Result<(), AppError> {
+    let rsp = build_c_find_rsp(message_id, sop_class_uid, status, false);
+    let bytes = encode_command_set(&rsp)?;
+    association
+        .send(&Pdu::PData {
+            data: vec![PDataValue {
+                presentation_context_id: pc_id,
+                value_type: PDataValueType::Command,
+                is_last: true,
+                data: bytes,
+            }],
+        })
+        .map_err(|e| AppError::Internal(format!("send final C-FIND-RSP: {e}")))
+}
+
+fn build_c_find_rsp(
+    message_id: u16,
+    sop_class_uid: &str,
+    status: u16,
+    has_dataset: bool,
+) -> InMemDicomObject {
+    let dataset_type = if has_dataset {
+        DATASET_PRESENT
+    } else {
+        NO_DATASET
+    };
+    InMemDicomObject::command_from_element_iter([
+        DataElement::new(
+            tags::AFFECTED_SOP_CLASS_UID,
+            VR::UI,
+            sop_class_uid.to_string(),
+        ),
+        DataElement::new(
+            tags::COMMAND_FIELD,
+            VR::US,
+            dicom_value!(U16, [cmd::C_FIND_RSP]),
+        ),
+        DataElement::new(
+            tags::MESSAGE_ID_BEING_RESPONDED_TO,
+            VR::US,
+            dicom_value!(U16, [message_id]),
+        ),
+        DataElement::new(
+            tags::COMMAND_DATA_SET_TYPE,
+            VR::US,
+            dicom_value!(U16, [dataset_type]),
+        ),
+        DataElement::new(tags::STATUS, VR::US, dicom_value!(U16, [status])),
+    ])
+}
+
+/// Translates the inbound C-FIND-RQ identifier into a `FindQuery`.
+///
+/// `*` and `?` are wildcard matches. Backslash-separated UID values
+/// become a `List` match. `YYYYMMDD-YYYYMMDD` on `StudyDate` becomes a
+/// `Range` match. Empty values mean Universal Matching — `None` in the
+/// `FindQuery` — so the response identifier will still carry that key
+/// populated from each matched row.
+fn build_find_query(identifier: &InMemDicomObject, level: FindLevel) -> FindQuery {
+    let mut q = FindQuery::new(level);
+    q.patient_id = key_match_text(identifier, tags::PATIENT_ID);
+    q.patient_name = key_match_text(identifier, tags::PATIENT_NAME);
+    q.study_instance_uid = key_match_uid(identifier, tags::STUDY_INSTANCE_UID);
+    q.study_date = key_match_date(identifier, tags::STUDY_DATE);
+    q.modality = key_match_text(identifier, tags::MODALITY);
+    q.series_instance_uid = key_match_uid(identifier, tags::SERIES_INSTANCE_UID);
+    q.sop_instance_uid = key_match_uid(identifier, tags::SOP_INSTANCE_UID);
+    q.sop_class_uid = key_match_uid(identifier, tags::SOP_CLASS_UID);
+    q
+}
+
+fn key_match_text(obj: &InMemDicomObject, tag: Tag) -> Option<KeyMatch> {
+    let raw = obj.element(tag).ok()?.to_str().ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.contains('*') || raw.contains('?') {
+        Some(KeyMatch::Wildcard(raw))
+    } else {
+        Some(KeyMatch::Single(raw))
+    }
+}
+
+fn key_match_uid(obj: &InMemDicomObject, tag: Tag) -> Option<KeyMatch> {
+    let raw = obj.element(tag).ok()?.to_str().ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    if raw.contains('\\') {
+        let values: Vec<String> = raw
+            .split('\\')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if values.len() == 1 {
+            Some(KeyMatch::Single(values.into_iter().next().unwrap()))
+        } else {
+            Some(KeyMatch::List(values))
+        }
+    } else {
+        Some(KeyMatch::Single(raw))
+    }
+}
+
+fn key_match_date(obj: &InMemDicomObject, tag: Tag) -> Option<KeyMatch> {
+    let raw = obj.element(tag).ok()?.to_str().ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some((start, end)) = raw.split_once('-') {
+        if !start.is_empty() && !end.is_empty() {
+            return Some(KeyMatch::Range(start.to_string(), end.to_string()));
+        }
+    }
+    Some(KeyMatch::Single(raw))
+}
+
+/// Builds the response identifier for one matched row.
+///
+/// Every tag in the request gets a corresponding tag in the response.
+/// QueryRetrieveLevel is copied (well, re-derived from `level`); every
+/// other key is populated from the `FindRow` if we have data, or
+/// returned with an empty value if we do not. This matches DICOM's
+/// behaviour for Universal Matching keys we do not track.
+fn build_response_identifier(
+    request: &InMemDicomObject,
+    row: &FindRow,
+    level: FindLevel,
+) -> InMemDicomObject {
+    let mut rsp = InMemDicomObject::new_empty();
+
+    let level_str = match level {
+        FindLevel::Patient => "PATIENT",
+        FindLevel::Study => "STUDY",
+        FindLevel::Series => "SERIES",
+        FindLevel::Image => "IMAGE",
+    };
+    rsp.put_element(DataElement::new(
+        tags::QUERY_RETRIEVE_LEVEL,
+        VR::CS,
+        level_str.to_string(),
+    ));
+
+    for elem in request.iter() {
+        let tag = elem.header().tag;
+        if tag == tags::QUERY_RETRIEVE_LEVEL {
+            continue;
+        }
+        let vr = elem.header().vr();
+        let value = response_value_for(tag, row);
+        rsp.put_element(DataElement::new(tag, vr, value));
+    }
+
+    rsp
+}
+
+fn response_value_for(tag: Tag, row: &FindRow) -> String {
+    match tag {
+        tags::PATIENT_ID => row.patient_id.clone(),
+        tags::PATIENT_NAME => row.patient_name.clone().unwrap_or_default(),
+        tags::STUDY_INSTANCE_UID => row.study_instance_uid.clone().unwrap_or_default(),
+        tags::STUDY_DESCRIPTION => row.study_description.clone().unwrap_or_default(),
+        tags::STUDY_DATE => row.study_date.clone().unwrap_or_default(),
+        tags::MODALITY => row.modality.clone().unwrap_or_default(),
+        tags::MODALITIES_IN_STUDY => row.modalities_in_study.clone().unwrap_or_default(),
+        tags::SERIES_INSTANCE_UID => row.series_instance_uid.clone().unwrap_or_default(),
+        tags::SERIES_DESCRIPTION => row.series_description.clone().unwrap_or_default(),
+        tags::SOP_INSTANCE_UID => row.sop_instance_uid.clone().unwrap_or_default(),
+        tags::SOP_CLASS_UID => row.sop_class_uid.clone().unwrap_or_default(),
+        tags::NUMBER_OF_STUDY_RELATED_SERIES => row
+            .number_of_study_related_series
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        tags::NUMBER_OF_STUDY_RELATED_INSTANCES => row
+            .number_of_study_related_instances
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        tags::NUMBER_OF_SERIES_RELATED_INSTANCES => row
+            .number_of_series_related_instances
+            .map(|n| n.to_string())
+            .unwrap_or_default(),
+        // Any key we don't track gets an empty value, which is the
+        // DICOM-correct answer for a return key with no source data.
+        _ => String::new(),
+    }
+}
+
+// ---------------------------------------------------------------------
+// Encoding / decoding helpers (M4)
+// ---------------------------------------------------------------------
+
+fn transfer_syntax_uid_for(
+    association: &ServerAssociation<TcpStream>,
+    pc_id: u8,
+) -> Result<String, AppError> {
+    association
+        .presentation_contexts()
+        .iter()
+        .find(|p| p.id == pc_id)
+        .map(|p| p.transfer_syntax.clone())
+        .ok_or_else(|| {
+            AppError::Internal(format!("no negotiated presentation context for id {pc_id}"))
+        })
+}
+
+fn lookup_ts(uid: &str) -> Result<&'static TransferSyntax, AppError> {
+    TransferSyntaxRegistry
+        .get(uid)
+        .ok_or_else(|| AppError::Internal(format!("transfer syntax not in registry: {uid}")))
+}
+
+fn encode_identifier(
+    obj: &InMemDicomObject,
+    ts: &TransferSyntax,
+) -> Result<Vec<u8>, AppError> {
+    let mut bytes: Vec<u8> = Vec::with_capacity(1024);
+    obj.write_dataset_with_ts(&mut bytes, ts)
+        .map_err(|e| AppError::Internal(format!("identifier encode: {e}")))?;
+    let _ = bytes.flush();
+    Ok(bytes)
+}
+
+fn read_u16(obj: &InMemDicomObject, tag: Tag) -> Result<u16, AppError> {
+    obj.element(tag)
+        .map_err(|e| AppError::Internal(format!("missing {tag}: {e}")))?
+        .uint16()
+        .map_err(|e| AppError::Internal(format!("{tag} not US: {e}")))
+}
+
+fn read_str(obj: &InMemDicomObject, tag: Tag) -> Result<String, AppError> {
+    obj.element(tag)
+        .map_err(|e| AppError::Internal(format!("missing {tag}: {e}")))?
+        .to_str()
+        .map(|c| c.trim().to_string())
+        .map_err(|e| AppError::Internal(format!("decode {tag}: {e}")))
 }
 
 fn build_c_echo_rsp(message_id: u16) -> InMemDicomObject {

@@ -210,8 +210,14 @@ pub fn run() {
 
             // Start the SCP listener AFTER managing the activity log
             // so its startup `SCP listening …` event is persisted.
-            let listener =
-                start_listener(cfg.listen_port, cfg.local_ae_title.clone(), handle.clone())?;
+            // Pass the SOP index so the C-FIND handler (M4) can query
+            // against it.
+            let listener = start_listener(
+                cfg.listen_port,
+                cfg.local_ae_title.clone(),
+                handle.clone(),
+                idx.clone(),
+            )?;
 
             app.manage(AppState {
                 config: Mutex::new(cfg.clone()),
