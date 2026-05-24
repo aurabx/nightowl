@@ -39,7 +39,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [x] (2026-05-23) M2: Local Store scanner indexes a directory of DICOM files into a SQLite database and the Store page browses the Patient / Study / Series / SOP Instance hierarchy. `Index` + `parse_dicom` + `rescan_dir` in `src-tauri/src/core/store.rs`, five Tauri commands (`rescan_store`, `list_studies`, `list_series_for_study`, `list_instances_for_series`, `total_instance_count`), Store page tree UI with live-event refresh, initial background scan on boot. Eleven backend tests passing.
 - [x] (2026-05-23) M3: SCP listener accepts an association and answers C-ECHO. `core/dimse.rs` binds `0.0.0.0:<port>` on app start, accepts the Verification SOP Class on Implicit/Explicit VR LE, dispatches DIMSE commands, and emits stable `activity` events. `echoscu -aec PHANTOM -aet TESTSCU localhost 11112` returns "Received Echo Response (Success)" with exit 0. Twelve backend tests passing.
 - [x] (2026-05-23) M4: SCP C-FIND returns matching identifiers from the local index. Patient Root and Study Root Q/R Find SOP classes negotiated; multi-PDV command + data accumulator in `handle_pdv`; identifier-to-SQL translator supports single value, wildcard, UID list, and date range matching; response identifier is constructed by walking the request keys and populating each from the matched `FindRow`. Verified with `findscu -S -k QueryRetrieveLevel=STUDY` (returns full study row), `-S SERIES` filtered by StudyInstanceUID, and `-P PATIENT` with `PatientName=Doe*` wildcard.
-- [ ] M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Verified by `storescu` from DCMTK.
+- [x] (2026-05-23) M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Storage SOP Classes (CT, MR, SC, US, CR, DX, Encapsulated PDF) negotiated; JPEG Baseline 8-bit added to the transfer syntax list; `handle_c_store` decodes the dataset, validates the UIDs as path components, wraps with a Part-10 file meta via `FileMetaTableBuilder`, writes to `<store_dir>/<study>/<series>/<sop>.dcm`, refreshes the SQLite index via `ingest_file`, and responds 0x0000 / 0xA700 / 0xC000. Verified with `storescu` against three real MR files: three `Received Store Response (Success)` and three Part-10 files on disk in the right hierarchy.
 - [ ] M6: SCP C-MOVE and C-GET return matching SOP Instances. Verified by `movescu` and `getscu` from DCMTK.
 - [ ] M7: Peers CRUD UI persists a peer list. Add, edit, delete a peer; the change survives an app restart.
 - [ ] M8: SCU page can run C-ECHO, C-FIND, C-MOVE, C-GET, and C-STORE against a configured peer and display the result.
@@ -215,6 +215,22 @@ Record every decision in the format below.
   Rationale: Holding an immutable borrow on the association across mutable `send()` calls in the response loop is a borrow-checker error. The cheapest fix is to clone the UID once, drop the borrow, and re-resolve `&TransferSyntax` from the (static) registry inside the loop. `lookup_ts` returns a `&'static TransferSyntax` so the lifetime is unbounded.
   Date/Author: 2026-05-23 / M4 implementer.
 
+- Decision (M5): Introduced `ScpContext { index, store_dir }` to bundle the per-association dependencies, rather than threading two separate parameters through `start_listener` → `run_accept_loop` → `handle_association` → `dispatch` → handler.
+  Rationale: Each new handler added in M6 / future milestones will likely need both the index and the store directory (and probably the peer list). One `Arc<ScpContext>` parameter beats N positional arguments; adding a field to `ScpContext` is a one-line change versus a five-site refactor.
+  Date/Author: 2026-05-23 / M5 implementer.
+
+- Decision (M5): The plan asked for Explicit VR Big Endian (UID `1.2.840.10008.1.2.2`) in the negotiated transfer syntax list; we DROPPED it.
+  Rationale: `dicom_dictionary_std::uids::EXPLICIT_VR_BIG_ENDIAN` is marked `#[deprecated = "Retired DICOM UID"]` — DICOM PS3.5-2025 formally retired big-endian transmission. Anything still requiring it is on retired equipment. If a real workflow ever surfaces it, the constant can be inlined as a raw `&str` to bypass the deprecation.
+  Date/Author: 2026-05-23 / M5 implementer.
+
+- Decision (M5): UIDs used as filesystem path components are validated against `is_safe_uid` before any path join: 1-64 chars, only ASCII digits and dots, no leading/trailing dot, no `..` segment.
+  Rationale: PS3.5 §9.1 already constrains UIDs to this character set, but the data on the wire is peer-controlled. Without validation, a hostile or malformed peer could send `../../../etc/passwd` as a SOPInstanceUID and `target_dir.join(uid)` would escape `store_dir`. The validation is six lines and turns the failure into a clean `Failed: Unable to Process` response.
+  Date/Author: 2026-05-23 / M5 implementer.
+
+- Decision (M5): After writing the file, `ingest_c_store` calls `Index::ingest_file(&path)` to refresh the index, re-parsing the file we just wrote.
+  Rationale: The alternative is a parallel `Index::ingest_object(path, &InMemDicomObject)` that skips the re-parse. The re-parse cost for one ~500 KB MR slice is sub-millisecond and the code path is one already-tested function. Optimize if a real ingest rate makes it visible.
+  Date/Author: 2026-05-23 / M5 implementer.
+
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
@@ -345,6 +361,77 @@ Follow-on observations:
 - No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
 - The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
 - Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
+
+### M5 (2026-05-23)
+
+What landed: Phantom accepts inbound DICOM objects via C-STORE. The SCP negotiates seven Storage SOP Classes (CT, MR, Secondary Capture, Ultrasound, Computed Radiography, DX, Encapsulated PDF) on Implicit VR LE / Explicit VR LE / JPEG Baseline 8-bit. Each C-STORE-RQ → the data set is decoded with the negotiated transfer syntax, the UIDs are validated as filesystem-safe, the object is wrapped with a Part-10 file meta header (`FileMetaTableBuilder`) and written to `<store_dir>/<study>/<series>/<sop>.dcm`, the SQLite index is refreshed by calling `Index::ingest_file` on the freshly-written file, and a C-STORE-RSP with status `0x0000` is returned. Parse or write failures map to `0xC000` (Failed: Unable to Process) or `0xA700` (Refused: Out of Resources).
+
+Backend additions (`src-tauri/src/core/dimse.rs`):
+
+- `ScpContext { index, store_dir }` bundles the per-association dependencies. Threaded through `start_listener` → `run_accept_loop` → `handle_association` → `dispatch` → handler. Future modules (peer list, worklist) drop into this struct without further refactors.
+- `STORAGE_SOP_CLASSES` constant array of the seven UIDs; the negotiation builder iterates it. Adding a new modality is a one-line change.
+- `handle_c_store` is the outer half — reads MessageID / SOPClassUID / SOPInstanceUID from the command, emits an `inbound C-STORE-RQ` activity event, calls `ingest_c_store`, and emits the C-STORE-RSP with the right DIMSE status from the inner half's `Result`.
+- `ingest_c_store` is the inner half — decodes the data set, validates UIDs via `is_safe_uid`, builds the file meta, writes the Part-10 file, and refreshes the SQLite index. Returns the written path on success.
+- `build_c_store_rsp` mirrors `build_c_echo_rsp` / `build_c_find_rsp` — the same shape with the C-STORE-RSP command field and an Affected SOP Instance UID echoed back.
+- `is_safe_uid` validates 1–64 ASCII chars of digits and dots, no leading/trailing dot, no `..`.
+
+Backend wiring (`src-tauri/src/lib.rs`):
+
+- Builds `Arc<ScpContext>` in `setup` from the config's `store_dir` plus the index handle.
+- Added an `info`-level `loaded config` trace log so a future debugger does not have to spelunk to find which `store_dir` the running app is honouring.
+
+Verification:
+
+    $ make test-rust
+    test result: ok. 18 passed; 0 failed
+
+    # Repoint config to a clean dir, boot, run storescu against three real MRs.
+    $ npm run tauri dev   (background)
+    INFO phantom_lib: loaded config store_dir=/Users/xtfer/dicom-store-m5 ae_title=PHANTOM port=11112
+    $ storescu -v -aec PHANTOM -aet TESTSCU localhost 11112 \
+        IM000001.dcm IM000002.dcm IM000003.dcm
+    I: Requesting Association
+    I: Association Accepted (Max Send PDV: 16366)
+    I: Sending file: IM000001.dcm
+    I: Sending Store Request (MsgID 1, MR)
+    I: Received Store Response (Success)
+    I: Sending file: IM000002.dcm
+    I: Received Store Response (Success)
+    I: Sending file: IM000003.dcm
+    I: Received Store Response (Success)
+    I: Releasing Association
+
+    # Files on disk in the expected hierarchy.
+    $ find ~/dicom-store-m5 -name "*.dcm" | sort
+    .../723.0/729.0/728.0.dcm
+    .../723.0/729.0/730.0.dcm
+    .../723.0/729.0/731.0.dcm
+
+    # And the SQLite index file_paths agree.
+    $ sqlite3 store.sqlite "SELECT file_path FROM sop_instances"
+    /Users/xtfer/dicom-store-m5/.../728.0.dcm
+    /Users/xtfer/dicom-store-m5/.../730.0.dcm
+    /Users/xtfer/dicom-store-m5/.../731.0.dcm
+
+    # And each file passes dcmdump — valid Part-10.
+    $ dcmdump ~/dicom-store-m5/.../728.0.dcm
+    # Dicom-File-Format
+    # Dicom-Meta-Information-Header
+    (0002,0002) UI =MRImageStorage
+    (0002,0010) UI =LittleEndianExplicit
+    (0002,0012) UI [2.25.269557681719719925684832053554655571250] ImplementationClassUID
+    (0002,0013) SH [DICOM-rs 0.9.1]
+    ...
+
+The Activity page (M9) lights up with one `C-STORE-RQ` (inbound) + one `stored …` (info, success) + one `C-STORE-RSP` (outbound, success) per file — exactly as designed.
+
+Gaps to address before M6: none. The receive loop already accumulates Command + Data PDVs. `Index::find` already returns matched rows. `handle_c_store` already knows how to write a Part-10 file. M6 (C-MOVE / C-GET) is "for each row in the find result, send the file" — which is the same SCU operations that M8 needs anyway, so M6 and M8 share infrastructure.
+
+Follow-on observations:
+
+- Existing rows are replaced via `INSERT OR REPLACE ON sop_instance_uid`. If the same SOP Instance is stored a second time from a different path, the old path is forgotten — but the old file on disk is NOT deleted. A "rescan and purge orphans" garbage-collection pass is a sensible follow-up.
+- Big-endian transfer syntax (1.2.840.10008.1.2.2) is not offered — it was retired in DICOM PS3.5-2025 and the dictionary marks it deprecated. Documented in Decision Log; re-add via raw UID string if needed.
+- The Part-10 file the SCP writes uses Phantom's implementation class UID (auto-derived by dicom-rs). DICOM allows this; some clinical-system test harnesses log the Implementation Class UID for traceability and may report unfamiliar implementations. Not a real problem; documented.
 
 ### M4 (2026-05-23)
 

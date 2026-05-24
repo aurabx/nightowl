@@ -14,7 +14,7 @@ use tauri::{AppHandle, Emitter, Manager, State};
 
 use core::activity::{ActivityFilter, ActivityLog, ActivityPage};
 use core::config::{AppConfig, load_or_default, save};
-use core::dimse::{start_listener, ListenerHandle};
+use core::dimse::{start_listener, ListenerHandle, ScpContext};
 use core::error::AppError;
 use core::store::{Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
 
@@ -197,6 +197,13 @@ pub fn run() {
             let home = home_dir(handle)?;
             let default = AppConfig::default_with_home(&home);
             let cfg = load_or_default(&cfg_path, default)?;
+            tracing::info!(
+                config_path = %cfg_path.display(),
+                store_dir = %cfg.store_dir.display(),
+                ae_title = %cfg.local_ae_title,
+                port = cfg.listen_port,
+                "loaded config",
+            );
             std::fs::create_dir_all(&cfg.store_dir)?;
 
             // Open the SOP Instance index alongside the config.
@@ -210,13 +217,18 @@ pub fn run() {
 
             // Start the SCP listener AFTER managing the activity log
             // so its startup `SCP listening …` event is persisted.
-            // Pass the SOP index so the C-FIND handler (M4) can query
-            // against it.
+            // The ScpContext bundles the SOP index (queried by M4 and
+            // refreshed by M5) and the on-disk store directory (where
+            // M5 writes received SOP Instances).
+            let scp = Arc::new(ScpContext {
+                index: idx.clone(),
+                store_dir: cfg.store_dir.clone(),
+            });
             let listener = start_listener(
                 cfg.listen_port,
                 cfg.local_ae_title.clone(),
                 handle.clone(),
-                idx.clone(),
+                scp,
             )?;
 
             app.manage(AppState {

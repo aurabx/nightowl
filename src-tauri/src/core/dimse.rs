@@ -26,6 +26,7 @@
 
 use std::io::Write;
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,10 +35,14 @@ use chrono::Utc;
 use dicom_core::{dicom_value, DataElement, Tag, VR};
 use dicom_dictionary_std::tags;
 use dicom_dictionary_std::uids::{
-    EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN,
-    PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
-    STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND, VERIFICATION,
+    COMPUTED_RADIOGRAPHY_IMAGE_STORAGE, CT_IMAGE_STORAGE,
+    DIGITAL_X_RAY_IMAGE_STORAGE_FOR_PRESENTATION, ENCAPSULATED_PDF_STORAGE,
+    EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, JPEG_BASELINE8_BIT,
+    MR_IMAGE_STORAGE, PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
+    SECONDARY_CAPTURE_IMAGE_STORAGE, STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
+    ULTRASOUND_IMAGE_STORAGE, VERIFICATION,
 };
+use dicom_object::FileMetaTableBuilder;
 use dicom_encoding::transfer_syntax::{TransferSyntax, TransferSyntaxIndex};
 use dicom_object::InMemDicomObject;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
@@ -167,6 +172,14 @@ fn emit(app: &AppHandle, event: ActivityEvent) {
 // Listener
 // ---------------------------------------------------------------------
 
+/// Shared context the per-association threads need: the SOP Instance
+/// index for query + ingestion, and the on-disk store directory where
+/// inbound C-STORE files land. Cloning the `Arc` is cheap.
+pub struct ScpContext {
+    pub index: Arc<Index>,
+    pub store_dir: PathBuf,
+}
+
 /// Handle to the running SCP listener. Holding this struct alive is
 /// what keeps the listener bound; dropping the inner `shutdown` flag
 /// causes the accept loop to exit on its next iteration.
@@ -174,6 +187,21 @@ pub struct ListenerHandle {
     pub bind_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
 }
+
+/// The full set of Storage SOP Classes Phantom accepts as a C-STORE
+/// SCP. Adding a new modality here is the one-line change required to
+/// accept its objects. Kept as a constant array so the negotiation
+/// builder and any future "what do we support" query share the same
+/// source of truth.
+const STORAGE_SOP_CLASSES: &[&str] = &[
+    CT_IMAGE_STORAGE,
+    MR_IMAGE_STORAGE,
+    SECONDARY_CAPTURE_IMAGE_STORAGE,
+    ULTRASOUND_IMAGE_STORAGE,
+    COMPUTED_RADIOGRAPHY_IMAGE_STORAGE,
+    DIGITAL_X_RAY_IMAGE_STORAGE_FOR_PRESENTATION,
+    ENCAPSULATED_PDF_STORAGE,
+];
 
 impl ListenerHandle {
     /// Asks the accept loop to stop. Currently best-effort: the loop
@@ -197,7 +225,7 @@ pub fn start_listener(
     port: u16,
     local_ae_title: String,
     app: AppHandle,
-    index: Arc<Index>,
+    scp: Arc<ScpContext>,
 ) -> Result<ListenerHandle, AppError> {
     let bind = SocketAddr::from(([0, 0, 0, 0], port));
     let listener =
@@ -213,7 +241,7 @@ pub fn start_listener(
     let shutdown_for_thread = shutdown.clone();
     let app_for_thread = app.clone();
     let ae_for_thread = local_ae_title.clone();
-    let index_for_thread = index.clone();
+    let scp_for_thread = scp.clone();
 
     std::thread::Builder::new()
         .name("phantom-scp-accept".to_string())
@@ -222,7 +250,7 @@ pub fn start_listener(
                 listener,
                 ae_for_thread,
                 app_for_thread,
-                index_for_thread,
+                scp_for_thread,
                 shutdown_for_thread,
             )
         })
@@ -252,7 +280,7 @@ fn run_accept_loop(
     listener: TcpListener,
     local_ae_title: String,
     app: AppHandle,
-    index: Arc<Index>,
+    scp: Arc<ScpContext>,
     shutdown: Arc<AtomicBool>,
 ) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -274,7 +302,7 @@ fn run_accept_loop(
 
         let app_clone = app.clone();
         let ae_clone = local_ae_title.clone();
-        let index_clone = index.clone();
+        let scp_clone = scp.clone();
         if let Err(err) = std::thread::Builder::new()
             .name(format!("phantom-scp-{}", local_seq))
             .spawn(move || {
@@ -283,7 +311,7 @@ fn run_accept_loop(
                     peer,
                     ae_clone,
                     app_clone,
-                    index_clone,
+                    scp_clone,
                     association_id,
                 );
             })
@@ -302,7 +330,7 @@ fn handle_association(
     peer: Option<SocketAddr>,
     local_ae_title: String,
     app: AppHandle,
-    index: Arc<Index>,
+    scp: Arc<ScpContext>,
     association_id: String,
 ) {
     let peer_host = peer.map(|p| p.to_string());
@@ -311,20 +339,32 @@ fn handle_association(
         tracing::warn!(error = %err, "set_read_timeout failed");
     }
 
-    // Negotiate. We accept Verification (M3 — C-ECHO) plus the Patient
-    // Root and Study Root Query/Retrieve Information Models for Find
-    // (M4 — C-FIND). Transfer syntaxes: Implicit VR LE (default; every
-    // DICOM peer supports it) and Explicit VR LE (preferred when both
-    // sides support it; what most modern PACS speak). Both are added
-    // to every offered abstract syntax.
-    let options = ServerAssociationOptions::new()
+    // Negotiate the abstract syntaxes (the DICOM services) we provide:
+    // - Verification (M3 — C-ECHO)
+    // - Patient Root + Study Root Q/R Find (M4 — C-FIND)
+    // - The common Storage SOP Classes (M5 — C-STORE)
+    // …and the transfer syntaxes (wire encodings) we accept:
+    // - Implicit VR Little Endian (the universal baseline)
+    // - Explicit VR Little Endian (preferred when both sides support it)
+    // - JPEG Baseline 8-bit (covers most lossy-compressed imagery; we
+    //   do not decode pixel data — we just write the bytes back out)
+    //
+    // Explicit VR Big Endian (1.2.840.10008.1.2.2) was on the plan but
+    // is a retired DICOM transfer syntax; dicom_dictionary_std marks
+    // the constant deprecated. Anything still offering it is on
+    // retired equipment. Re-add via the raw UID string if needed.
+    let mut options = ServerAssociationOptions::new()
         .accept_any()
         .with_abstract_syntax(VERIFICATION)
         .with_abstract_syntax(PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND)
         .with_abstract_syntax(STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND)
         .with_transfer_syntax(IMPLICIT_VR_LITTLE_ENDIAN)
         .with_transfer_syntax(EXPLICIT_VR_LITTLE_ENDIAN)
+        .with_transfer_syntax(JPEG_BASELINE8_BIT)
         .ae_title(local_ae_title.clone());
+    for sop_class in STORAGE_SOP_CLASSES {
+        options = options.with_abstract_syntax(*sop_class);
+    }
 
     let mut association = match options.establish(stream) {
         Ok(a) => a,
@@ -388,7 +428,7 @@ fn handle_association(
             Pdu::PData { data } => {
                 let mut continue_loop = true;
                 for pdv in data {
-                    match handle_pdv(&mut association, &mut in_flight, &ctx, &index, pdv) {
+                    match handle_pdv(&mut association, &mut in_flight, &ctx, &scp, pdv) {
                         Ok(true) => {}
                         Ok(false) => {
                             continue_loop = false;
@@ -447,7 +487,7 @@ fn handle_pdv(
     association: &mut ServerAssociation<TcpStream>,
     in_flight: &mut Option<InFlightCommand>,
     ctx: &AssociationCtx,
-    index: &Index,
+    scp: &ScpContext,
     pdv: PDataValue,
 ) -> Result<bool, AppError> {
     match pdv.value_type {
@@ -467,7 +507,7 @@ fn handle_pdv(
                 dispatch(
                     association,
                     ctx,
-                    index,
+                    scp,
                     &command,
                     &[],
                     pdv.presentation_context_id,
@@ -488,7 +528,7 @@ fn handle_pdv(
                 dispatch(
                     association,
                     ctx,
-                    index,
+                    scp,
                     &taken.command,
                     &taken.data,
                     taken.presentation_context_id,
@@ -569,7 +609,7 @@ impl AssociationCtx {
 fn dispatch(
     association: &mut ServerAssociation<TcpStream>,
     ctx: &AssociationCtx,
-    index: &Index,
+    scp: &ScpContext,
     command: &InMemDicomObject,
     data: &[u8],
     pc_id: u8,
@@ -577,7 +617,8 @@ fn dispatch(
     let command_field = read_u16(command, tags::COMMAND_FIELD)?;
     match command_field {
         cmd::C_ECHO_RQ => handle_c_echo(association, ctx, command, pc_id),
-        cmd::C_FIND_RQ => handle_c_find(association, ctx, index, command, data, pc_id),
+        cmd::C_FIND_RQ => handle_c_find(association, ctx, &scp.index, command, data, pc_id),
+        cmd::C_STORE_RQ => handle_c_store(association, ctx, scp, command, data, pc_id),
         other => {
             ctx.emit_lifecycle(
                 Status::Warning,
@@ -929,6 +970,201 @@ fn response_value_for(tag: Tag, row: &FindRow) -> String {
         // DICOM-correct answer for a return key with no source data.
         _ => String::new(),
     }
+}
+
+// ---------------------------------------------------------------------
+// C-STORE handler (M5)
+// ---------------------------------------------------------------------
+
+fn handle_c_store(
+    association: &mut ServerAssociation<TcpStream>,
+    ctx: &AssociationCtx,
+    scp: &ScpContext,
+    command: &InMemDicomObject,
+    data: &[u8],
+    pc_id: u8,
+) -> Result<bool, AppError> {
+    let message_id = read_u16(command, tags::MESSAGE_ID)?;
+    let sop_class_uid = read_str(command, tags::AFFECTED_SOP_CLASS_UID)?;
+    let sop_instance_uid = read_str(command, tags::AFFECTED_SOP_INSTANCE_UID)?;
+
+    ctx.emit_inbound(
+        "C-STORE-RQ",
+        format!("message id {message_id} sop {sop_instance_uid}"),
+    );
+
+    // Anything below this point is a peer-data failure rather than a
+    // protocol failure: we want to send back a C-STORE-RSP with a
+    // failure status so the SCU sees the problem, then move on.
+    let status = match ingest_c_store(scp, &sop_class_uid, &sop_instance_uid, data, pc_id, association) {
+        Ok(path) => {
+            ctx.emit_lifecycle(
+                Status::Success,
+                format!("stored {sop_instance_uid} → {}", path.display()),
+            );
+            STATUS_SUCCESS
+        }
+        Err(err) => {
+            ctx.emit_lifecycle(
+                Status::Error,
+                format!("C-STORE ingest failed: {err}"),
+            );
+            // Treat decode / validation failures as "processing
+            // failure" and disk/IO failures as "out of resources".
+            match err {
+                AppError::Io(_) => STATUS_REFUSED_OUT_OF_RESOURCES,
+                _ => STATUS_FAILED_UNABLE_TO_PROCESS,
+            }
+        }
+    };
+
+    let rsp = build_c_store_rsp(message_id, &sop_class_uid, &sop_instance_uid, status);
+    let bytes = encode_command_set(&rsp)?;
+    association
+        .send(&Pdu::PData {
+            data: vec![PDataValue {
+                presentation_context_id: pc_id,
+                value_type: PDataValueType::Command,
+                is_last: true,
+                data: bytes,
+            }],
+        })
+        .map_err(|e| AppError::Internal(format!("send C-STORE-RSP: {e}")))?;
+
+    let status_label = match status {
+        STATUS_SUCCESS => "0x0000 (Success)",
+        STATUS_REFUSED_OUT_OF_RESOURCES => "0xA700 (Refused: Out of Resources)",
+        STATUS_FAILED_UNABLE_TO_PROCESS => "0xC000 (Failed: Unable to Process)",
+        _ => "unknown",
+    };
+    ctx.emit_outbound(
+        "C-STORE-RSP",
+        format!("message id {message_id} status {status_label}"),
+    );
+
+    Ok(true)
+}
+
+/// Inner half of `handle_c_store`: decode the data set, validate the
+/// UIDs, write a Part-10 file, refresh the SQLite index. Any error
+/// flows back to `handle_c_store` which translates it into the right
+/// DIMSE failure status.
+fn ingest_c_store(
+    scp: &ScpContext,
+    sop_class_uid: &str,
+    sop_instance_uid: &str,
+    data: &[u8],
+    pc_id: u8,
+    association: &ServerAssociation<TcpStream>,
+) -> Result<PathBuf, AppError> {
+    let ts_uid = transfer_syntax_uid_for(association, pc_id)?;
+    let ts = lookup_ts(&ts_uid)?;
+
+    // Parse the inbound data set with the negotiated transfer syntax.
+    let dataset = InMemDicomObject::read_dataset_with_ts(data, ts)
+        .map_err(|e| AppError::DicomParse(format!("C-STORE data set decode: {e}")))?;
+
+    // Derive the on-disk layout from the data set itself when present
+    // — the data set's UIDs are authoritative — and fall back to the
+    // command set's Affected* UIDs otherwise.
+    let study_uid = read_str(&dataset, tags::STUDY_INSTANCE_UID)
+        .map_err(|e| AppError::DicomParse(format!("missing StudyInstanceUID: {e}")))?;
+    let series_uid = read_str(&dataset, tags::SERIES_INSTANCE_UID)
+        .map_err(|e| AppError::DicomParse(format!("missing SeriesInstanceUID: {e}")))?;
+
+    if !is_safe_uid(&study_uid) {
+        return Err(AppError::DicomParse(format!(
+            "StudyInstanceUID is not a syntactically valid UID: {study_uid:?}"
+        )));
+    }
+    if !is_safe_uid(&series_uid) {
+        return Err(AppError::DicomParse(format!(
+            "SeriesInstanceUID is not a syntactically valid UID: {series_uid:?}"
+        )));
+    }
+    if !is_safe_uid(sop_instance_uid) {
+        return Err(AppError::DicomParse(format!(
+            "SOPInstanceUID is not a syntactically valid UID: {sop_instance_uid:?}"
+        )));
+    }
+
+    let target_dir = scp.store_dir.join(&study_uid).join(&series_uid);
+    std::fs::create_dir_all(&target_dir)
+        .map_err(|e| AppError::Io(format!("create {}: {e}", target_dir.display())))?;
+    let target = target_dir.join(format!("{sop_instance_uid}.dcm"));
+
+    // Wrap the in-memory data set with a Part-10 file meta header so
+    // the on-disk file is openable by any DICOM tool.
+    let file_obj = dataset
+        .with_meta(
+            FileMetaTableBuilder::new()
+                .transfer_syntax(&ts_uid)
+                .media_storage_sop_class_uid(sop_class_uid)
+                .media_storage_sop_instance_uid(sop_instance_uid),
+        )
+        .map_err(|e| AppError::DicomParse(format!("build file meta: {e}")))?;
+    file_obj
+        .write_to_file(&target)
+        .map_err(|e| AppError::Io(format!("write {}: {e}", target.display())))?;
+
+    // Refresh the SQLite index from the file we just wrote. Re-parsing
+    // here is the cost of consistency: the index reflects exactly what
+    // is on disk.
+    scp.index.ingest_file(&target)?;
+
+    Ok(target)
+}
+
+fn build_c_store_rsp(
+    message_id: u16,
+    sop_class_uid: &str,
+    sop_instance_uid: &str,
+    status: u16,
+) -> InMemDicomObject {
+    InMemDicomObject::command_from_element_iter([
+        DataElement::new(
+            tags::AFFECTED_SOP_CLASS_UID,
+            VR::UI,
+            sop_class_uid.to_string(),
+        ),
+        DataElement::new(
+            tags::COMMAND_FIELD,
+            VR::US,
+            dicom_value!(U16, [cmd::C_STORE_RSP]),
+        ),
+        DataElement::new(
+            tags::MESSAGE_ID_BEING_RESPONDED_TO,
+            VR::US,
+            dicom_value!(U16, [message_id]),
+        ),
+        DataElement::new(
+            tags::COMMAND_DATA_SET_TYPE,
+            VR::US,
+            dicom_value!(U16, [NO_DATASET]),
+        ),
+        DataElement::new(tags::STATUS, VR::US, dicom_value!(U16, [status])),
+        DataElement::new(
+            tags::AFFECTED_SOP_INSTANCE_UID,
+            VR::UI,
+            sop_instance_uid.to_string(),
+        ),
+    ])
+}
+
+/// Filesystem-safe DICOM UID check: 1-64 ASCII chars, only digits and
+/// dots, no leading or trailing dot, no `..` segment. Reject anything
+/// else before using a UID as a path component.
+fn is_safe_uid(uid: &str) -> bool {
+    if uid.is_empty() || uid.len() > 64 {
+        return false;
+    }
+    if uid.starts_with('.') || uid.ends_with('.') {
+        return false;
+    }
+    if uid.contains("..") {
+        return false;
+    }
+    uid.chars().all(|c| c.is_ascii_digit() || c == '.')
 }
 
 // ---------------------------------------------------------------------
