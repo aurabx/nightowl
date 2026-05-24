@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ClipboardList, Pencil, Plus, Trash2 } from "lucide-react";
+import { ClipboardList, Pencil, Plus, Trash2, X } from "lucide-react";
 import {
   type NewWorklistEntry,
   type WorklistEntry,
@@ -11,7 +11,6 @@ import {
   updateWorklistEntry,
 } from "../lib/api";
 import { Field } from "../components/Field";
-import { Modal } from "../components/Modal";
 import { Select } from "../components/Select";
 
 const INPUT_CLASS =
@@ -129,11 +128,20 @@ export function WorklistPage() {
     setSavingErr(null);
   };
 
-  const closeModal = () => {
+  const cancelEdit = () => {
     setEditing(null);
     setFieldErrors({});
     setSavingErr(null);
   };
+
+  useEffect(() => {
+    if (editing === null) return;
+    const handler = (e: KeyboardEvent) => {
+      if (e.key === "Escape") cancelEdit();
+    };
+    document.addEventListener("keydown", handler);
+    return () => document.removeEventListener("keydown", handler);
+  }, [editing]);
 
   const handleSave = async () => {
     if (!editing) return;
@@ -187,7 +195,7 @@ export function WorklistPage() {
         await createWorklistEntry(created);
       }
       await refresh();
-      closeModal();
+      cancelEdit();
     } catch (err: unknown) {
       if (isAppError(err) && err.kind === "Validation") {
         setFieldErrors({ [err.message.field]: err.message.reason });
@@ -227,14 +235,16 @@ export function WorklistPage() {
             C-FIND query on the Modality Worklist Information Model.
           </p>
         </div>
-        <button
-          type="button"
-          onClick={openAdd}
-          className="flex items-center gap-1.5 rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500"
-        >
-          <Plus className="size-4" />
-          Add entry
-        </button>
+        {editing === null && (
+          <button
+            type="button"
+            onClick={openAdd}
+            className="flex items-center gap-1.5 rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500"
+          >
+            <Plus className="size-4" />
+            Add entry
+          </button>
+        )}
       </div>
 
       {loadError && (
@@ -243,6 +253,17 @@ export function WorklistPage() {
         </p>
       )}
 
+      {editing !== null ? (
+        <EntryForm
+          editing={editing}
+          setEditing={setEditing}
+          fieldErrors={fieldErrors}
+          savingErr={savingErr}
+          saving={saving}
+          onCancel={cancelEdit}
+          onSave={handleSave}
+        />
+      ) : (
       <div className="mt-6 overflow-x-auto rounded border border-slate-800 bg-slate-900/30">
         <table className="w-full text-sm">
           <thead className="border-b border-slate-800 bg-slate-900/60 text-xs uppercase tracking-wide text-slate-500">
@@ -344,33 +365,47 @@ export function WorklistPage() {
           </tbody>
         </table>
       </div>
+      )}
+    </section>
+  );
+}
 
-      <Modal
-        open={editing !== null}
-        onClose={closeModal}
-        title={editing?.id ? "Edit worklist entry" : "Add worklist entry"}
-        footer={
-          <>
-            <button
-              type="button"
-              onClick={closeModal}
-              className="rounded border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:border-slate-500"
-            >
-              Cancel
-            </button>
-            <button
-              type="button"
-              onClick={handleSave}
-              disabled={saving}
-              className="rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
-            >
-              {saving ? "Saving…" : "Save"}
-            </button>
-          </>
-        }
-      >
-        {editing && (
-          <div className="space-y-4">
+interface EntryFormProps {
+  editing: DraftEntry;
+  setEditing: (draft: DraftEntry) => void;
+  fieldErrors: Record<string, string>;
+  savingErr: string | null;
+  saving: boolean;
+  onCancel: () => void;
+  onSave: () => void;
+}
+
+function EntryForm({
+  editing,
+  setEditing,
+  fieldErrors,
+  savingErr,
+  saving,
+  onCancel,
+  onSave,
+}: EntryFormProps) {
+  return (
+    <div className="mt-6 flex max-h-[calc(100vh-12rem)] flex-col overflow-hidden rounded border border-slate-800 bg-slate-900/30">
+      <div className="flex items-center justify-between border-b border-slate-800 px-4 py-3">
+        <h2 className="text-base font-semibold text-slate-100">
+          {editing.id ? "Edit worklist entry" : "Add worklist entry"}
+        </h2>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded p-1 text-slate-500 hover:bg-slate-800 hover:text-slate-200"
+          aria-label="Cancel"
+        >
+          <X className="size-4" />
+        </button>
+      </div>
+      <div className="flex-1 overflow-y-auto px-4 py-4">
+        <div className="space-y-4">
             <div className="grid grid-cols-2 gap-3">
               <Field
                 label="Accession #"
@@ -581,9 +616,25 @@ export function WorklistPage() {
                 {savingErr}
               </p>
             )}
-          </div>
-        )}
-      </Modal>
-    </section>
+        </div>
+      </div>
+      <div className="flex justify-end gap-2 border-t border-slate-800 bg-slate-950/50 px-4 py-3">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="rounded border border-slate-700 px-3 py-1.5 text-sm text-slate-300 hover:border-slate-500"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={onSave}
+          disabled={saving}
+          className="rounded bg-sky-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-sky-500 disabled:opacity-50"
+        >
+          {saving ? "Saving…" : "Save"}
+        </button>
+      </div>
+    </div>
   );
 }
