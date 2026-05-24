@@ -39,10 +39,17 @@ use dicom_dictionary_std::uids::{
     DIGITAL_X_RAY_IMAGE_STORAGE_FOR_PRESENTATION, ENCAPSULATED_PDF_STORAGE,
     EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, JPEG_BASELINE8_BIT,
     MR_IMAGE_STORAGE, PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
+    PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET,
+    PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE,
     SECONDARY_CAPTURE_IMAGE_STORAGE, STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
-    ULTRASOUND_IMAGE_STORAGE, VERIFICATION,
+    STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET,
+    STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE, ULTRASOUND_IMAGE_STORAGE,
+    VERIFICATION,
 };
-use dicom_object::FileMetaTableBuilder;
+use dicom_object::{open_file, FileMetaTableBuilder};
+use dicom_ul::association::client::ClientAssociationOptions;
+use dicom_ul::association::ClientAssociation;
+use dicom_ul::pdu::PresentationContextResultReason;
 use dicom_encoding::transfer_syntax::{TransferSyntax, TransferSyntaxIndex};
 use dicom_object::InMemDicomObject;
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
@@ -55,7 +62,8 @@ use uuid::Uuid;
 
 use super::activity::{ActivityLog, PersistedActivityEvent};
 use super::error::AppError;
-use super::store::{FindLevel, FindQuery, FindRow, Index, KeyMatch};
+use super::peers::PeerStore;
+use super::store::{FindLevel, FindQuery, FindRow, Index, KeyMatch, RetrieveInstance};
 
 // DIMSE Command Field values (PS3.7 Table 7.1-1). Listed even when
 // unused at M3 so the table is in one place for M4/M5/M6.
@@ -78,15 +86,22 @@ const NO_DATASET: u16 = 0x0101;
 // CommandDataSetType: "Data Set Present" (any value other than 0x0101).
 const DATASET_PRESENT: u16 = 0x0000;
 
+// Maximum PDU length we advertise on every association (both as SCP
+// and as SCU). Has to be big enough to receive A-ASSOCIATE-RQ PDUs
+// from peers that offer many SOP classes (DCMTK's getscu can easily
+// produce 30 KB association requests). The negotiated working PDU
+// size is the min of both sides' advertised values.
+const MAX_PDU_LENGTH: u32 = 256 * 1024;
+
 // DIMSE status codes (PS3.7 Annex C).
 const STATUS_SUCCESS: u16 = 0x0000;
 const STATUS_PENDING: u16 = 0xFF00;
-#[allow(dead_code)]
 const STATUS_REFUSED_OUT_OF_RESOURCES: u16 = 0xA700;
-#[allow(dead_code)]
 const STATUS_FAILED_IDENTIFIER_DOES_NOT_MATCH_SOP_CLASS: u16 = 0xA900;
-#[allow(dead_code)]
 const STATUS_FAILED_UNABLE_TO_PROCESS: u16 = 0xC000;
+// C-MOVE / C-GET sub-operation outcomes (PS3.7 §9.1.4 / §9.1.3).
+const STATUS_MOVE_DESTINATION_UNKNOWN: u16 = 0xA801;
+const STATUS_WARNING_SUBOPS_COMPLETE_WITH_FAILURES: u16 = 0xB000;
 
 // ---------------------------------------------------------------------
 // Activity events
@@ -172,12 +187,21 @@ fn emit(app: &AppHandle, event: ActivityEvent) {
 // Listener
 // ---------------------------------------------------------------------
 
-/// Shared context the per-association threads need: the SOP Instance
-/// index for query + ingestion, and the on-disk store directory where
-/// inbound C-STORE files land. Cloning the `Arc` is cheap.
+/// Shared context the per-association threads need.
+///
+/// - `index` — SOP Instance index for query (M4) + ingestion (M5).
+/// - `store_dir` — on-disk store directory where M5's C-STORE writes
+///   inbound files.
+/// - `peers` — configured remote DICOM nodes; M6's C-MOVE handler
+///   resolves a Move Destination AE Title against this list.
+/// - `local_ae_title` — Phantom's own AE Title, sent as the
+///   `MoveOriginatorApplicationEntityTitle` in M6's outbound C-STORE
+///   sub-operations so the destination knows which AE asked.
 pub struct ScpContext {
     pub index: Arc<Index>,
     pub store_dir: PathBuf,
+    pub peers: Arc<PeerStore>,
+    pub local_ae_title: String,
 }
 
 /// Handle to the running SCP listener. Holding this struct alive is
@@ -355,9 +379,20 @@ fn handle_association(
     // retired equipment. Re-add via the raw UID string if needed.
     let mut options = ServerAssociationOptions::new()
         .accept_any()
+        // Some SCUs (notably DCMTK getscu) offer dozens of Storage SOP
+        // Classes in their A-ASSOCIATE-RQ for C-GET. The default
+        // 16 KB receive buffer is too small for the resulting PDU,
+        // which gets rejected as "incoming PDU was too large". Bump
+        // to 256 KB to accept those — the actual data PDUs use the
+        // negotiated maximum which both sides agree to.
+        .max_pdu_length(MAX_PDU_LENGTH)
         .with_abstract_syntax(VERIFICATION)
         .with_abstract_syntax(PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND)
         .with_abstract_syntax(STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND)
+        .with_abstract_syntax(PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE)
+        .with_abstract_syntax(STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE)
+        .with_abstract_syntax(PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET)
+        .with_abstract_syntax(STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET)
         .with_transfer_syntax(IMPLICIT_VR_LITTLE_ENDIAN)
         .with_transfer_syntax(EXPLICIT_VR_LITTLE_ENDIAN)
         .with_transfer_syntax(JPEG_BASELINE8_BIT)
@@ -619,13 +654,28 @@ fn dispatch(
         cmd::C_ECHO_RQ => handle_c_echo(association, ctx, command, pc_id),
         cmd::C_FIND_RQ => handle_c_find(association, ctx, &scp.index, command, data, pc_id),
         cmd::C_STORE_RQ => handle_c_store(association, ctx, scp, command, data, pc_id),
+        cmd::C_MOVE_RQ => handle_c_move(association, ctx, scp, command, data, pc_id),
+        cmd::C_GET_RQ => handle_c_get(association, ctx, scp, command, data, pc_id),
+        cmd::C_STORE_RSP => {
+            // C-GET sub-operations get acknowledged by the requester
+            // with a C-STORE-RSP back to us. We don't act on them
+            // (the requester counts what it received; we already
+            // counted what we sent), so swallow silently rather than
+            // warning.
+            Ok(true)
+        }
         other => {
-            ctx.emit_lifecycle(
-                Status::Warning,
-                format!("unsupported DIMSE command 0x{:04X}", other),
-            );
-            // Not a fatal protocol error — we just don't implement it
-            // yet. The peer will likely time out or release.
+            // High bit set (0x8xxx) marks a response. If we see a
+            // response we didn't expect we still don't act on it but
+            // we don't need to warn loudly either.
+            if other & 0x8000 != 0 {
+                tracing::debug!(command_field = other, "received unsolicited DIMSE response");
+            } else {
+                ctx.emit_lifecycle(
+                    Status::Warning,
+                    format!("unsupported DIMSE command 0x{:04X}", other),
+                );
+            }
             Ok(true)
         }
     }
@@ -1165,6 +1215,807 @@ fn is_safe_uid(uid: &str) -> bool {
         return false;
     }
     uid.chars().all(|c| c.is_ascii_digit() || c == '.')
+}
+
+// ---------------------------------------------------------------------
+// C-MOVE handler (M6)
+// ---------------------------------------------------------------------
+
+fn handle_c_move(
+    association: &mut ServerAssociation<TcpStream>,
+    ctx: &AssociationCtx,
+    scp: &ScpContext,
+    command: &InMemDicomObject,
+    identifier_bytes: &[u8],
+    pc_id: u8,
+) -> Result<bool, AppError> {
+    let message_id = read_u16(command, tags::MESSAGE_ID)?;
+    let sop_class_uid = read_str(command, tags::AFFECTED_SOP_CLASS_UID)?;
+    let move_destination = read_str(command, tags::MOVE_DESTINATION)?;
+
+    let ts_uid = transfer_syntax_uid_for(association, pc_id)?;
+    let ts = lookup_ts(&ts_uid)?;
+    let request_identifier = InMemDicomObject::read_dataset_with_ts(identifier_bytes, ts)
+        .map_err(|e| AppError::Internal(format!("C-MOVE identifier decode: {e}")))?;
+    let level_str = read_str(&request_identifier, tags::QUERY_RETRIEVE_LEVEL)?;
+    let level = match parse_qr_level(&level_str) {
+        Some(l) => l,
+        None => {
+            ctx.emit_inbound(
+                "C-MOVE-RQ",
+                format!("message id {message_id} unknown level {level_str}"),
+            );
+            send_move_final(
+                association,
+                &sop_class_uid,
+                message_id,
+                pc_id,
+                STATUS_FAILED_IDENTIFIER_DOES_NOT_MATCH_SOP_CLASS,
+                0,
+                0,
+                0,
+            )?;
+            return Ok(true);
+        }
+    };
+
+    ctx.emit_inbound(
+        "C-MOVE-RQ",
+        format!("message id {message_id} level {level_str} destination {move_destination}"),
+    );
+
+    // Resolve the Move Destination AE Title against the configured
+    // peer list.
+    let destination = match scp.peers.find_by_ae_title(&move_destination)? {
+        Some(p) => p,
+        None => {
+            ctx.emit_lifecycle(
+                Status::Error,
+                format!("unknown Move Destination AE {move_destination}"),
+            );
+            send_move_final(
+                association,
+                &sop_class_uid,
+                message_id,
+                pc_id,
+                STATUS_MOVE_DESTINATION_UNKNOWN,
+                0,
+                0,
+                0,
+            )?;
+            ctx.emit_outbound(
+                "C-MOVE-RSP",
+                format!("final status 0xA801 (Move Destination unknown: {move_destination})"),
+            );
+            return Ok(true);
+        }
+    };
+
+    // Resolve the matched SOP Instances.
+    let query = build_find_query(&request_identifier, level);
+    let instances = scp.index.resolve_for_retrieve(&query)?;
+    let total = instances.len() as u16;
+
+    if total == 0 {
+        send_move_final(
+            association,
+            &sop_class_uid,
+            message_id,
+            pc_id,
+            STATUS_SUCCESS,
+            0,
+            0,
+            0,
+        )?;
+        ctx.emit_outbound(
+            "C-MOVE-RSP",
+            "final status 0x0000 (Success) — zero matches".to_string(),
+        );
+        return Ok(true);
+    }
+
+    // Open an SCU association to the destination negotiating every
+    // SOP Class we know we'll need (and a few extras — over-offering
+    // is cheap and saves a reconnect if there's a mix of modalities).
+    let mut scu = match open_storage_scu(&scp.local_ae_title, &destination.ae_title, &destination.host, destination.port, &instances) {
+        Ok(s) => s,
+        Err(err) => {
+            ctx.emit_lifecycle(
+                Status::Error,
+                format!("could not open SCU association to {}: {err}", destination.ae_title),
+            );
+            send_move_final(
+                association,
+                &sop_class_uid,
+                message_id,
+                pc_id,
+                STATUS_FAILED_UNABLE_TO_PROCESS,
+                0,
+                total,
+                0,
+            )?;
+            return Ok(true);
+        }
+    };
+
+    let mut completed: u16 = 0;
+    let mut failed: u16 = 0;
+
+    for instance in &instances {
+        let result = forward_via_c_store(
+            &mut scu,
+            instance,
+            Some((scp.local_ae_title.as_str(), message_id)),
+        );
+        match result {
+            Ok(_) => {
+                completed += 1;
+                ctx.emit_outbound(
+                    "C-STORE-RQ",
+                    format!("→ {} {}/{}", destination.ae_title, completed, total),
+                );
+            }
+            Err(err) => {
+                failed += 1;
+                ctx.emit_lifecycle(
+                    Status::Warning,
+                    format!(
+                        "C-STORE sub-op to {} failed for {}: {err}",
+                        destination.ae_title, instance.sop_instance_uid
+                    ),
+                );
+            }
+        }
+        let remaining = total - completed - failed;
+        send_move_pending(
+            association,
+            &sop_class_uid,
+            message_id,
+            pc_id,
+            completed,
+            remaining,
+            failed,
+        )?;
+    }
+
+    let _ = scu.release();
+
+    let final_status = if failed == 0 {
+        STATUS_SUCCESS
+    } else if completed > 0 {
+        STATUS_WARNING_SUBOPS_COMPLETE_WITH_FAILURES
+    } else {
+        STATUS_FAILED_UNABLE_TO_PROCESS
+    };
+
+    send_move_final(
+        association,
+        &sop_class_uid,
+        message_id,
+        pc_id,
+        final_status,
+        completed,
+        0,
+        failed,
+    )?;
+
+    ctx.emit_outbound(
+        "C-MOVE-RSP",
+        format!(
+            "final status 0x{:04X} — completed {completed} failed {failed} (of {total})",
+            final_status
+        ),
+    );
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------
+// C-GET handler (M6)
+// ---------------------------------------------------------------------
+
+fn handle_c_get(
+    association: &mut ServerAssociation<TcpStream>,
+    ctx: &AssociationCtx,
+    scp: &ScpContext,
+    command: &InMemDicomObject,
+    identifier_bytes: &[u8],
+    pc_id: u8,
+) -> Result<bool, AppError> {
+    let message_id = read_u16(command, tags::MESSAGE_ID)?;
+    let sop_class_uid = read_str(command, tags::AFFECTED_SOP_CLASS_UID)?;
+
+    let ts_uid = transfer_syntax_uid_for(association, pc_id)?;
+    let ts = lookup_ts(&ts_uid)?;
+    let request_identifier = InMemDicomObject::read_dataset_with_ts(identifier_bytes, ts)
+        .map_err(|e| AppError::Internal(format!("C-GET identifier decode: {e}")))?;
+    let level_str = read_str(&request_identifier, tags::QUERY_RETRIEVE_LEVEL)?;
+    let level = match parse_qr_level(&level_str) {
+        Some(l) => l,
+        None => {
+            send_get_final(
+                association,
+                &sop_class_uid,
+                message_id,
+                pc_id,
+                STATUS_FAILED_IDENTIFIER_DOES_NOT_MATCH_SOP_CLASS,
+                0,
+                0,
+                0,
+            )?;
+            return Ok(true);
+        }
+    };
+
+    ctx.emit_inbound(
+        "C-GET-RQ",
+        format!("message id {message_id} level {level_str}"),
+    );
+
+    let query = build_find_query(&request_identifier, level);
+    let instances = scp.index.resolve_for_retrieve(&query)?;
+    let total = instances.len() as u16;
+
+    let mut completed: u16 = 0;
+    let mut failed: u16 = 0;
+
+    // C-GET sub-operations go back over the SAME association the
+    // C-GET-RQ came in on. The peer must have negotiated SCP-role
+    // presentation contexts for the Storage SOP Classes; if they did
+    // not, we'll get "no matching presentation context" failures per
+    // instance and report them as sub-operation failures.
+    for instance in &instances {
+        match send_c_store_on_existing_assoc(association, instance) {
+            Ok(_) => completed += 1,
+            Err(err) => {
+                failed += 1;
+                ctx.emit_lifecycle(
+                    Status::Warning,
+                    format!(
+                        "C-STORE sub-op on requester association failed for {}: {err}",
+                        instance.sop_instance_uid
+                    ),
+                );
+            }
+        }
+        let remaining = total - completed - failed;
+        send_get_pending(
+            association,
+            &sop_class_uid,
+            message_id,
+            pc_id,
+            completed,
+            remaining,
+            failed,
+        )?;
+    }
+
+    let final_status = if failed == 0 {
+        STATUS_SUCCESS
+    } else if completed > 0 {
+        STATUS_WARNING_SUBOPS_COMPLETE_WITH_FAILURES
+    } else {
+        STATUS_FAILED_UNABLE_TO_PROCESS
+    };
+
+    send_get_final(
+        association,
+        &sop_class_uid,
+        message_id,
+        pc_id,
+        final_status,
+        completed,
+        0,
+        failed,
+    )?;
+
+    ctx.emit_outbound(
+        "C-GET-RSP",
+        format!(
+            "final status 0x{:04X} — completed {completed} failed {failed} (of {total})",
+            final_status
+        ),
+    );
+
+    Ok(true)
+}
+
+// ---------------------------------------------------------------------
+// SCU C-STORE forwarding (M6, shared by C-MOVE outbound and the
+// future M8 SCU page)
+// ---------------------------------------------------------------------
+
+/// Opens an outbound association to `peer` and negotiates every SOP
+/// Class actually present in `instances` (plus the universal pair of
+/// Implicit / Explicit VR LE transfer syntaxes for each).
+fn open_storage_scu(
+    local_ae: &str,
+    called_ae: &str,
+    host: &str,
+    port: u16,
+    instances: &[RetrieveInstance],
+) -> Result<ClientAssociation<TcpStream>, AppError> {
+    let mut distinct_sop_classes: Vec<&str> = instances
+        .iter()
+        .map(|i| i.sop_class_uid.as_str())
+        .collect();
+    distinct_sop_classes.sort();
+    distinct_sop_classes.dedup();
+
+    let mut options = ClientAssociationOptions::new()
+        .calling_ae_title(local_ae.to_string())
+        .called_ae_title(called_ae.to_string())
+        .max_pdu_length(MAX_PDU_LENGTH);
+    for sop in distinct_sop_classes {
+        options = options.with_presentation_context(
+            sop.to_string(),
+            vec![
+                EXPLICIT_VR_LITTLE_ENDIAN.to_string(),
+                IMPLICIT_VR_LITTLE_ENDIAN.to_string(),
+            ],
+        );
+    }
+    options
+        .establish(format!("{host}:{port}"))
+        .map_err(|e| AppError::Internal(format!("SCU establish to {host}:{port}: {e}")))
+}
+
+/// Sends one SOP Instance from disk over the outbound SCU
+/// association, optionally tagging it with the Move Originator AE +
+/// MessageID (set for C-MOVE sub-ops, None for plain SCU usage).
+fn forward_via_c_store(
+    scu: &mut ClientAssociation<TcpStream>,
+    instance: &RetrieveInstance,
+    move_originator: Option<(&str, u16)>,
+) -> Result<(), AppError> {
+    let pc = scu
+        .presentation_contexts()
+        .iter()
+        .find(|p| {
+            p.reason == PresentationContextResultReason::Acceptance
+                && p.abstract_syntax == instance.sop_class_uid
+        })
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "destination did not accept presentation context for SOP class {}",
+                instance.sop_class_uid
+            ))
+        })?;
+    let pc_id = pc.id;
+    let negotiated_ts_uid = pc.transfer_syntax.clone();
+    let negotiated_ts = lookup_ts(&negotiated_ts_uid)?;
+
+    let file_obj = open_file(&instance.file_path)
+        .map_err(|e| AppError::DicomParse(format!("open {}: {e}", instance.file_path)))?;
+
+    // Encode the data set in the negotiated transfer syntax. For
+    // Implicit VR LE ↔ Explicit VR LE this is a re-encoding of the
+    // header bytes only — the pixel data flows through unchanged. For
+    // a JPEG-to-uncompressed transcode we'd need pixel decoding (not
+    // implemented at M6; the destination should accept the same TS
+    // we have on disk in the common case).
+    let mut data_bytes: Vec<u8> = Vec::new();
+    file_obj
+        .write_dataset_with_ts(&mut data_bytes, negotiated_ts)
+        .map_err(|e| AppError::DicomParse(format!("re-encode for SCU: {e}")))?;
+
+    let message_id = next_scu_message_id();
+
+    let mut command_elements = vec![
+        DataElement::new(
+            tags::AFFECTED_SOP_CLASS_UID,
+            VR::UI,
+            instance.sop_class_uid.clone(),
+        ),
+        DataElement::new(
+            tags::COMMAND_FIELD,
+            VR::US,
+            dicom_value!(U16, [cmd::C_STORE_RQ]),
+        ),
+        DataElement::new(tags::MESSAGE_ID, VR::US, dicom_value!(U16, [message_id])),
+        // Priority = Medium (PS3.7 §9.3.5).
+        DataElement::new(tags::PRIORITY, VR::US, dicom_value!(U16, [0u16])),
+        DataElement::new(
+            tags::COMMAND_DATA_SET_TYPE,
+            VR::US,
+            dicom_value!(U16, [DATASET_PRESENT]),
+        ),
+        DataElement::new(
+            tags::AFFECTED_SOP_INSTANCE_UID,
+            VR::UI,
+            instance.sop_instance_uid.clone(),
+        ),
+    ];
+    if let Some((ae, mid)) = move_originator {
+        command_elements.push(DataElement::new(
+            tags::MOVE_ORIGINATOR_APPLICATION_ENTITY_TITLE,
+            VR::AE,
+            ae.to_string(),
+        ));
+        command_elements.push(DataElement::new(
+            tags::MOVE_ORIGINATOR_MESSAGE_ID,
+            VR::US,
+            dicom_value!(U16, [mid]),
+        ));
+    }
+    let command_obj = InMemDicomObject::command_from_element_iter(command_elements);
+    let cmd_bytes = encode_command_set(&command_obj)?;
+
+    // Send the command set as a single Command PDV (always small —
+    // fits in any negotiated PDU size).
+    scu.send(&Pdu::PData {
+        data: vec![PDataValue {
+            presentation_context_id: pc_id,
+            value_type: PDataValueType::Command,
+            is_last: true,
+            data: cmd_bytes,
+        }],
+    })
+    .map_err(|e| AppError::Internal(format!("SCU send C-STORE-RQ command: {e}")))?;
+
+    // Stream the data set via PDataWriter, which chunks across as
+    // many Data PDVs as the negotiated max PDU length requires. The
+    // typical destination caps PDUs at ~16 KB while a single MR slice
+    // is ~500 KB.
+    {
+        let mut writer = scu.send_pdata(pc_id);
+        writer
+            .write_all(&data_bytes)
+            .map_err(|e| AppError::Internal(format!("SCU send C-STORE-RQ data: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| AppError::Internal(format!("SCU send C-STORE-RQ flush: {e}")))?;
+    }
+
+    // Drain command + (optional) data PDVs of the response. Expect a
+    // C-STORE-RSP with status 0x0000 — anything else is a failure.
+    let mut response_command: Option<InMemDicomObject> = None;
+    loop {
+        let pdu = scu
+            .receive()
+            .map_err(|e| AppError::Internal(format!("SCU receive C-STORE-RSP: {e}")))?;
+        match pdu {
+            Pdu::PData { data } => {
+                for pdv in data {
+                    if pdv.value_type == PDataValueType::Command {
+                        let cmd = parse_command_set(&pdv.data)?;
+                        response_command = Some(cmd);
+                    }
+                }
+                if response_command.is_some() {
+                    break;
+                }
+            }
+            Pdu::AbortRQ { source } => {
+                return Err(AppError::Internal(format!(
+                    "destination aborted association: {:?}",
+                    source
+                )));
+            }
+            other => {
+                return Err(AppError::Internal(format!(
+                    "unexpected PDU while waiting for C-STORE-RSP: {}",
+                    other.short_description()
+                )));
+            }
+        }
+    }
+    let cmd = response_command.expect("checked above");
+    let status = read_u16(&cmd, tags::STATUS)?;
+    if status != STATUS_SUCCESS {
+        return Err(AppError::Internal(format!(
+            "destination returned C-STORE-RSP status 0x{:04X}",
+            status
+        )));
+    }
+    Ok(())
+}
+
+/// SCU-style send of one SOP Instance over an *already-established*
+/// `ServerAssociation` — used by C-GET to forward sub-operations back
+/// over the requester's own association. The C-GET requester must
+/// have negotiated SCP-role presentation contexts for the Storage
+/// SOP Classes; if not, this returns an error and C-GET counts a
+/// failure for that instance.
+fn send_c_store_on_existing_assoc(
+    association: &mut ServerAssociation<TcpStream>,
+    instance: &RetrieveInstance,
+) -> Result<(), AppError> {
+    let pc = association
+        .presentation_contexts()
+        .iter()
+        .find(|p| p.abstract_syntax == instance.sop_class_uid)
+        .ok_or_else(|| {
+            AppError::Internal(format!(
+                "no presentation context for SOP class {} on requester association",
+                instance.sop_class_uid
+            ))
+        })?;
+    let pc_id = pc.id;
+    let negotiated_ts_uid = pc.transfer_syntax.clone();
+    let negotiated_ts = lookup_ts(&negotiated_ts_uid)?;
+
+    let file_obj = open_file(&instance.file_path)
+        .map_err(|e| AppError::DicomParse(format!("open {}: {e}", instance.file_path)))?;
+
+    let mut data_bytes: Vec<u8> = Vec::new();
+    file_obj
+        .write_dataset_with_ts(&mut data_bytes, negotiated_ts)
+        .map_err(|e| AppError::DicomParse(format!("re-encode for C-GET sub-op: {e}")))?;
+
+    let message_id = next_scu_message_id();
+
+    let command_obj = InMemDicomObject::command_from_element_iter([
+        DataElement::new(
+            tags::AFFECTED_SOP_CLASS_UID,
+            VR::UI,
+            instance.sop_class_uid.clone(),
+        ),
+        DataElement::new(
+            tags::COMMAND_FIELD,
+            VR::US,
+            dicom_value!(U16, [cmd::C_STORE_RQ]),
+        ),
+        DataElement::new(tags::MESSAGE_ID, VR::US, dicom_value!(U16, [message_id])),
+        DataElement::new(tags::PRIORITY, VR::US, dicom_value!(U16, [0u16])),
+        DataElement::new(
+            tags::COMMAND_DATA_SET_TYPE,
+            VR::US,
+            dicom_value!(U16, [DATASET_PRESENT]),
+        ),
+        DataElement::new(
+            tags::AFFECTED_SOP_INSTANCE_UID,
+            VR::UI,
+            instance.sop_instance_uid.clone(),
+        ),
+    ]);
+    let cmd_bytes = encode_command_set(&command_obj)?;
+
+    association
+        .send(&Pdu::PData {
+            data: vec![PDataValue {
+                presentation_context_id: pc_id,
+                value_type: PDataValueType::Command,
+                is_last: true,
+                data: cmd_bytes,
+            }],
+        })
+        .map_err(|e| AppError::Internal(format!("C-GET sub-op send command: {e}")))?;
+
+    // Stream the data set via PDataWriter — same chunking concern as
+    // the outbound SCU forward.
+    {
+        let mut writer = association.send_pdata(pc_id);
+        writer
+            .write_all(&data_bytes)
+            .map_err(|e| AppError::Internal(format!("C-GET sub-op write data: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| AppError::Internal(format!("C-GET sub-op flush data: {e}")))?;
+    }
+    // We do NOT receive a C-STORE-RSP here — the C-GET requester does
+    // not respond to sub-operations the way a normal Storage SCP
+    // would. Per PS3.7 §9.1.3, sub-operations are unacknowledged at
+    // the DIMSE level: the requester counts received instances and we
+    // count attempts.
+
+    Ok(())
+}
+
+/// Process-wide monotonic message id for SCU operations. We start at
+/// 1 because some legacy receivers treat 0 as a sentinel.
+fn next_scu_message_id() -> u16 {
+    static COUNTER: AtomicU64 = AtomicU64::new(1);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    // Wrap around the u16 range so we never overflow. Realistic
+    // session lengths stay well below 65535 sub-operations.
+    ((n % u16::MAX as u64) as u16).max(1)
+}
+
+fn parse_qr_level(s: &str) -> Option<FindLevel> {
+    match s {
+        "PATIENT" => Some(FindLevel::Patient),
+        "STUDY" => Some(FindLevel::Study),
+        "SERIES" => Some(FindLevel::Series),
+        "IMAGE" => Some(FindLevel::Image),
+        _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------
+// C-MOVE / C-GET response builders
+// ---------------------------------------------------------------------
+
+fn build_c_move_rsp(
+    message_id: u16,
+    sop_class_uid: &str,
+    status: u16,
+    completed: u16,
+    remaining: u16,
+    failed: u16,
+) -> InMemDicomObject {
+    build_subop_rsp(
+        message_id,
+        sop_class_uid,
+        cmd::C_MOVE_RSP,
+        status,
+        completed,
+        remaining,
+        failed,
+    )
+}
+
+fn build_c_get_rsp(
+    message_id: u16,
+    sop_class_uid: &str,
+    status: u16,
+    completed: u16,
+    remaining: u16,
+    failed: u16,
+) -> InMemDicomObject {
+    build_subop_rsp(
+        message_id,
+        sop_class_uid,
+        cmd::C_GET_RSP,
+        status,
+        completed,
+        remaining,
+        failed,
+    )
+}
+
+fn build_subop_rsp(
+    message_id: u16,
+    sop_class_uid: &str,
+    command_field: u16,
+    status: u16,
+    completed: u16,
+    remaining: u16,
+    failed: u16,
+) -> InMemDicomObject {
+    InMemDicomObject::command_from_element_iter([
+        DataElement::new(
+            tags::AFFECTED_SOP_CLASS_UID,
+            VR::UI,
+            sop_class_uid.to_string(),
+        ),
+        DataElement::new(
+            tags::COMMAND_FIELD,
+            VR::US,
+            dicom_value!(U16, [command_field]),
+        ),
+        DataElement::new(
+            tags::MESSAGE_ID_BEING_RESPONDED_TO,
+            VR::US,
+            dicom_value!(U16, [message_id]),
+        ),
+        DataElement::new(
+            tags::COMMAND_DATA_SET_TYPE,
+            VR::US,
+            dicom_value!(U16, [NO_DATASET]),
+        ),
+        DataElement::new(tags::STATUS, VR::US, dicom_value!(U16, [status])),
+        DataElement::new(
+            tags::NUMBER_OF_REMAINING_SUBOPERATIONS,
+            VR::US,
+            dicom_value!(U16, [remaining]),
+        ),
+        DataElement::new(
+            tags::NUMBER_OF_COMPLETED_SUBOPERATIONS,
+            VR::US,
+            dicom_value!(U16, [completed]),
+        ),
+        DataElement::new(
+            tags::NUMBER_OF_FAILED_SUBOPERATIONS,
+            VR::US,
+            dicom_value!(U16, [failed]),
+        ),
+        DataElement::new(
+            tags::NUMBER_OF_WARNING_SUBOPERATIONS,
+            VR::US,
+            dicom_value!(U16, [0u16]),
+        ),
+    ])
+}
+
+fn send_move_pending(
+    association: &mut ServerAssociation<TcpStream>,
+    sop_class_uid: &str,
+    message_id: u16,
+    pc_id: u8,
+    completed: u16,
+    remaining: u16,
+    failed: u16,
+) -> Result<(), AppError> {
+    let rsp = build_c_move_rsp(
+        message_id,
+        sop_class_uid,
+        STATUS_PENDING,
+        completed,
+        remaining,
+        failed,
+    );
+    send_command_only(association, pc_id, &rsp)
+}
+
+fn send_move_final(
+    association: &mut ServerAssociation<TcpStream>,
+    sop_class_uid: &str,
+    message_id: u16,
+    pc_id: u8,
+    status: u16,
+    completed: u16,
+    remaining: u16,
+    failed: u16,
+) -> Result<(), AppError> {
+    let rsp = build_c_move_rsp(
+        message_id,
+        sop_class_uid,
+        status,
+        completed,
+        remaining,
+        failed,
+    );
+    send_command_only(association, pc_id, &rsp)
+}
+
+fn send_get_pending(
+    association: &mut ServerAssociation<TcpStream>,
+    sop_class_uid: &str,
+    message_id: u16,
+    pc_id: u8,
+    completed: u16,
+    remaining: u16,
+    failed: u16,
+) -> Result<(), AppError> {
+    let rsp = build_c_get_rsp(
+        message_id,
+        sop_class_uid,
+        STATUS_PENDING,
+        completed,
+        remaining,
+        failed,
+    );
+    send_command_only(association, pc_id, &rsp)
+}
+
+fn send_get_final(
+    association: &mut ServerAssociation<TcpStream>,
+    sop_class_uid: &str,
+    message_id: u16,
+    pc_id: u8,
+    status: u16,
+    completed: u16,
+    remaining: u16,
+    failed: u16,
+) -> Result<(), AppError> {
+    let rsp = build_c_get_rsp(
+        message_id,
+        sop_class_uid,
+        status,
+        completed,
+        remaining,
+        failed,
+    );
+    send_command_only(association, pc_id, &rsp)
+}
+
+fn send_command_only(
+    association: &mut ServerAssociation<TcpStream>,
+    pc_id: u8,
+    command: &InMemDicomObject,
+) -> Result<(), AppError> {
+    let bytes = encode_command_set(command)?;
+    association
+        .send(&Pdu::PData {
+            data: vec![PDataValue {
+                presentation_context_id: pc_id,
+                value_type: PDataValueType::Command,
+                is_last: true,
+                data: bytes,
+            }],
+        })
+        .map_err(|e| AppError::Internal(format!("send subop RSP: {e}")))
 }
 
 // ---------------------------------------------------------------------

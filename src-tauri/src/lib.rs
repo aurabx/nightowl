@@ -250,8 +250,14 @@ pub fn run() {
 
             // Open the persistent peer list (peers.json next to
             // config.json). Empty on first launch.
-            let peers = Arc::new(PeerStore::open(&peers_path(handle)?)?);
-            app.manage(peers);
+            let peers_path = peers_path(handle)?;
+            let peers = Arc::new(PeerStore::open(&peers_path)?);
+            tracing::info!(
+                peers_path = %peers_path.display(),
+                peer_count = peers.list().map(|p| p.len()).unwrap_or(0),
+                "loaded peers",
+            );
+            app.manage(peers.clone());
 
             // Start the SCP listener AFTER managing the activity log
             // so its startup `SCP listening …` event is persisted.
@@ -261,6 +267,8 @@ pub fn run() {
             let scp = Arc::new(ScpContext {
                 index: idx.clone(),
                 store_dir: cfg.store_dir.clone(),
+                peers: peers.clone(),
+                local_ae_title: cfg.local_ae_title.clone(),
             });
             let listener = start_listener(
                 cfg.listen_port,

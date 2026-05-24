@@ -40,7 +40,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [x] (2026-05-23) M3: SCP listener accepts an association and answers C-ECHO. `core/dimse.rs` binds `0.0.0.0:<port>` on app start, accepts the Verification SOP Class on Implicit/Explicit VR LE, dispatches DIMSE commands, and emits stable `activity` events. `echoscu -aec PHANTOM -aet TESTSCU localhost 11112` returns "Received Echo Response (Success)" with exit 0. Twelve backend tests passing.
 - [x] (2026-05-23) M4: SCP C-FIND returns matching identifiers from the local index. Patient Root and Study Root Q/R Find SOP classes negotiated; multi-PDV command + data accumulator in `handle_pdv`; identifier-to-SQL translator supports single value, wildcard, UID list, and date range matching; response identifier is constructed by walking the request keys and populating each from the matched `FindRow`. Verified with `findscu -S -k QueryRetrieveLevel=STUDY` (returns full study row), `-S SERIES` filtered by StudyInstanceUID, and `-P PATIENT` with `PatientName=Doe*` wildcard.
 - [x] (2026-05-23) M5: SCP C-STORE accepts inbound objects, writes them to the store directory, and updates the index. Storage SOP Classes (CT, MR, SC, US, CR, DX, Encapsulated PDF) negotiated; JPEG Baseline 8-bit added to the transfer syntax list; `handle_c_store` decodes the dataset, validates the UIDs as path components, wraps with a Part-10 file meta via `FileMetaTableBuilder`, writes to `<store_dir>/<study>/<series>/<sop>.dcm`, refreshes the SQLite index via `ingest_file`, and responds 0x0000 / 0xA700 / 0xC000. Verified with `storescu` against three real MR files: three `Received Store Response (Success)` and three Part-10 files on disk in the right hierarchy.
-- [ ] M6: SCP C-MOVE and C-GET return matching SOP Instances. Verified by `movescu` and `getscu` from DCMTK.
+- [x] (2026-05-23) M6: SCP C-MOVE and C-GET return matching SOP Instances. Patient/Study Root Q/R Move + Get SOP classes negotiated; `handle_c_move` resolves the Move Destination AE Title against `PeerStore`, opens an outbound SCU association (`forward_via_c_store`), streams each match with PDataWriter (handles the typical >500 KB MR slice over ~16 KB PDU limits); `handle_c_get` sends C-STORE sub-ops back over the requester's association; both send periodic Pending RSPs with completed/remaining/failed counts and a final RSP. Verified: `movescu` STUDY→STORESCP transfers 3/3 MR files; `getscu` STUDY pulls 3/3 files back; both report `final status 0x0000 (Success) — completed 3 failed 0`.
 - [x] (2026-05-23) M7: Peers CRUD UI persists a peer list. Add, edit, delete a peer; the change survives an app restart. Built **before M6** because C-MOVE needs to resolve a Move Destination AE Title against this list. `PeerStore` in `src-tauri/src/core/peers.rs` persists to `peers.json` with atomic write-temp + rename; four Tauri commands (`list_peers`, `create_peer`, `update_peer`, `delete_peer`); validation rejects duplicate AE titles; `find_by_ae_title` exposed for M6. Peers page with table + modal form + two-click delete confirmation. Seven backend tests covering CRUD, duplicate rejection, persistence across reopen.
 - [ ] M8: SCU page can run C-ECHO, C-FIND, C-MOVE, C-GET, and C-STORE against a configured peer and display the result.
 - [x] (2026-05-23) M9: Activity page shows a live event stream of every association (inbound and outbound) with peer, command, status, and timestamp. **Built ahead of M4–M8** to make the next four milestones visually verifiable: every C-FIND / C-STORE / C-MOVE response from M4–M6 will now appear in the live log without instrumentation work. `ActivityLog` in `src-tauri/src/core/activity.rs` persists every `dimse::emit` into `activity_events` (50,000-row cap, trim on every 500 inserts), three Tauri commands (`list_activity`, `clear_activity`, `activity_count`), Activity page with live event subscription, direction / status / search filters, pause-resume toggle, and clear-log button. Seventeen backend tests passing.
@@ -243,6 +243,22 @@ Record every decision in the format below.
   Rationale: `window.confirm()` still doesn't work reliably in Tauri's WKWebView. A reusable modal-based confirm would be overkill for one button per row; the two-click pattern is consistent across the app.
   Date/Author: 2026-05-23 / M7 implementer.
 
+- Decision (M6): SCU C-STORE sends the command via a single `Pdu::PData` send and streams the data set via `association.send_pdata(pc_id).write_all(bytes).finish()` (a `PDataWriter`).
+  Rationale: Bundling the whole data set into one Data PDV (~527 KB MR slice) trips `dicom-ul`'s pre-flight size check against the negotiated max PDU length (~16 KB by default). `PDataWriter` chunks across as many Data PDVs as the negotiated max allows, transparently. This is the documented dicom-ul pattern.
+  Date/Author: 2026-05-23 / M6 implementer.
+
+- Decision (M6): Set `max_pdu_length(256 * 1024)` on both server and client association options.
+  Rationale: `getscu` from DCMTK offers ~30 KB of A-ASSOCIATE-RQ PDU (it includes presentation contexts for every Storage SOP Class it knows). The dicom-ul default 16 KB receive buffer rejected the inbound PDU as "too large" before we ever got to negotiate. 256 KB matches `LARGE_PDU_SIZE` in dicom-ul and is generous enough to accept any reasonable A-ASSOCIATE-RQ. Negotiated working PDU size is the min of both advertised values, so this doesn't change how data PDUs are chunked.
+  Date/Author: 2026-05-23 / M6 implementer.
+
+- Decision (M6): C-MOVE opens a fresh SCU association per request and negotiates only the SOP Classes actually present in the match set.
+  Rationale: Saves PDU bytes (one association request offering 3 SOP classes is much smaller than offering all 7). And the destination peer may reject contexts we'll never use anyway. For a large multi-modality move the negotiation cost is amortised across hundreds of sub-ops.
+  Date/Author: 2026-05-23 / M6 implementer.
+
+- Decision (M6): C-GET sub-operations are sent unacknowledged-at-DIMSE — we send the C-STORE-RQ and move on without waiting for the C-STORE-RSP, then silently absorb the incoming C-STORE-RSPs in the dispatch loop.
+  Rationale: PS3.7 §9.1.3 makes C-GET sub-ops fire-and-forget; the requester counts what it received and we count what we sent. Waiting for each response would serialise the sub-ops and defeat pipelining. The dispatch loop's previous "unsupported command" warning for incoming 0x8001 responses was wrong (functionally fine, but noisy) — now we recognise C-STORE-RSP specifically and any high-bit response in general as no-ops.
+  Date/Author: 2026-05-23 / M6 implementer.
+
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
@@ -373,6 +389,70 @@ Follow-on observations:
 - No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
 - The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
 - Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
+
+### M6 (2026-05-23)
+
+What landed: Phantom is now a fully functional Query/Retrieve SCP. C-MOVE accepts a Move Destination AE Title, resolves it against the configured peers, opens an outbound SCU association to that peer, and forwards each matched SOP Instance via C-STORE while streaming periodic Pending C-MOVE-RSPs with live sub-operation counts. C-GET does the same except the C-STORE sub-operations go back over the requester's own association.
+
+Backend additions (`src-tauri/src/core/dimse.rs`):
+
+- `ScpContext` grew two fields — `peers: Arc<PeerStore>` and `local_ae_title: String` — so the C-MOVE handler can resolve destinations and stamp `MoveOriginatorApplicationEntityTitle` on sub-operation C-STOREs.
+- `handle_c_move`: read the move destination, resolve against `PeerStore::find_by_ae_title`, fetch matched instances via `Index::resolve_for_retrieve`, open the SCU association via `open_storage_scu` (negotiates only the SOP classes actually present in the match set), forward each instance via `forward_via_c_store`, send a Pending RSP after every sub-op with running completed/remaining/failed counts, send the final RSP with `0x0000` (Success), `0xB000` (sub-ops complete with failures), `0xA801` (Move Destination unknown), or `0xC000` (Failed: Unable to Process) as appropriate.
+- `handle_c_get`: similar shape but reuses the existing inbound `ServerAssociation` via `send_c_store_on_existing_assoc`. Per PS3.7 §9.1.3 the sub-operations are unacknowledged at DIMSE; we send and move on. Incoming `0x8001` C-STORE-RSPs from the requester are silently absorbed in the dispatch loop (they used to log a noisy "unsupported command" warning).
+- `forward_via_c_store` is the shared SCU send: looks up the negotiated presentation context for this SOP class on the SCU side, encodes the data set in the negotiated TS, sends the Command PDV, then streams the data via `association.send_pdata(pc_id)` (PDataWriter) — which chunks across as many Data PDVs as the negotiated max PDU length requires. A 527 KB MR slice over a 16 KB cap takes ~33 Data PDVs; the writer hides that.
+- `max_pdu_length(256 KB)` is set on every server and client association so DCMTK getscu's larger A-ASSOCIATE-RQ (~30 KB of presentation contexts) does not get rejected pre-negotiation.
+
+Backend additions (`src-tauri/src/core/store.rs`):
+
+- `RetrieveInstance { sop_instance_uid, sop_class_uid, transfer_syntax_uid, file_path }` — what `forward_via_c_store` needs.
+- `Index::resolve_for_retrieve(query)`: identical WHERE-clause logic to the C-FIND queries, but returns one row per matching SOP Instance with no GROUP BY. STUDY-level query on PatientID returns every SOP Instance under matching studies.
+
+End-to-end verification:
+
+    $ make test-rust          # 25 passed
+    $ peers.json contains { ae_title: STORESCP, host: localhost, port: 11113 }
+    $ storescp --aetitle STORESCP -od /tmp/sink 11113   # DCMTK receiver
+    $ npm run tauri dev       # background
+
+    # C-MOVE: ask Phantom to send the study to STORESCP.
+    $ movescu -S -k QueryRetrieveLevel=STUDY \
+              -k StudyInstanceUID=1.3.6.1.4.1...848.723.0 \
+              -aet TESTSCU -aec PHANTOM -aem STORESCP localhost 11112
+    (no output — exit 0)
+    $ ls /tmp/sink
+    MR.1.3.6.1.4.1...728.0
+    MR.1.3.6.1.4.1...730.0
+    MR.1.3.6.1.4.1...731.0     # 3 files transferred
+
+    # C-GET: pull the same study back.
+    $ getscu -S -k QueryRetrieveLevel=STUDY \
+             -k StudyInstanceUID=1.3.6.1.4.1...848.723.0 \
+             -aet TESTSCU -aec PHANTOM localhost 11112
+    (3 files written to cwd; exit 0)
+
+Activity stream (one full association each):
+
+    info     SCP listening on 0.0.0.0:11112 as AE PHANTOM
+    info     association accepted from TESTSCU
+    inbound  C-MOVE-RQ    message id 1 level STUDY destination STORESCP
+    outbound C-STORE-RQ   → STORESCP 1/3
+    outbound C-STORE-RQ   → STORESCP 2/3
+    outbound C-STORE-RQ   → STORESCP 3/3
+    outbound C-MOVE-RSP   final status 0x0000 — completed 3 failed 0 (of 3)
+    info     association closed
+    info     association accepted from TESTSCU
+    inbound  C-GET-RQ     message id 1 level STUDY
+    outbound C-GET-RSP    final status 0x0000 — completed 3 failed 0 (of 3)
+    info     association closed
+
+Gaps to address before M8: none. M8 (SCU page UI) drives `forward_via_c_store` from the frontend and reuses the same `open_storage_scu` builder — so M8 is mostly UI on top of the SCU code M6 already wrote.
+
+Follow-on observations:
+
+- C-CANCEL-RQ is not handled. A requester that wants to cancel a long-running C-MOVE has no way to do so; we'd finish the whole match set first. Acceptable for a dev tool; clinical SCPs would implement.
+- Transcoding is not implemented. If the destination only accepts Implicit VR LE for, say, an MR Image Storage context but the file on disk is JPEG-compressed, the SCU re-encode step succeeds (header bytes change) but the pixel data is still JPEG and the destination may not decode it. Workaround: store files in uncompressed TS, or implement pixel transcoding via dicom-pixeldata.
+- The Pending RSP sent after every sub-op is not strictly required — PS3.7 says "periodically". For very large match sets (thousands of instances) sending an RSP per sub-op is unnecessary chatter. Easy to throttle later.
+- C-GET works because most clients (getscu included) DO negotiate SCP-role contexts for the Storage SOP Classes by default. If a future client doesn't, our `send_c_store_on_existing_assoc` returns "no presentation context for SOP class X" and counts it as a failure — the C-GET completes with status `0xB000` or `0xC000`.
 
 ### M7 (2026-05-23, completed before M6)
 

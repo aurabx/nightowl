@@ -208,6 +208,15 @@ pub struct FindRow {
     pub sop_class_uid: Option<String>,
 }
 
+/// One SOP Instance enough for `forward_via_c_store` to forward it.
+#[derive(Debug, Clone)]
+pub struct RetrieveInstance {
+    pub sop_instance_uid: String,
+    pub sop_class_uid: String,
+    pub transfer_syntax_uid: String,
+    pub file_path: String,
+}
+
 /// All tags extracted from a DICOM file, ready to insert.
 #[derive(Debug, Clone)]
 struct ParsedInstance {
@@ -568,6 +577,57 @@ impl Index {
                     modality: row.get(5)?,
                     number_of_series_related_instances: Some(row.get(6)?),
                     ..FindRow::default()
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Returns one row per matching SOP Instance regardless of the
+    /// query level, with everything `forward_via_c_store` needs to
+    /// forward each instance: the SOP Class UID, the on-disk transfer
+    /// syntax, and the file path.
+    ///
+    /// At PATIENT / STUDY / SERIES levels this expands the match: a
+    /// STUDY-level query for `PatientID=12345` returns every SOP
+    /// Instance under every matching study. At IMAGE level the same
+    /// keys filter individual instances.
+    pub fn resolve_for_retrieve(
+        &self,
+        q: &FindQuery,
+    ) -> Result<Vec<RetrieveInstance>, AppError> {
+        let mut where_parts: Vec<String> = Vec::new();
+        let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
+        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
+        apply_match("study_instance_uid", q.study_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("study_date", q.study_date.as_ref(), &mut where_parts, &mut bound);
+        apply_match("series_instance_uid", q.series_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("modality", q.modality.as_ref(), &mut where_parts, &mut bound);
+        apply_match("sop_instance_uid", q.sop_instance_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match("sop_class_uid", q.sop_class_uid.as_ref(), &mut where_parts, &mut bound);
+
+        let mut sql = String::from(
+            "SELECT sop_instance_uid, sop_class_uid, transfer_syntax_uid, file_path
+             FROM sop_instances",
+        );
+        if !where_parts.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&where_parts.join(" AND "));
+        }
+        sql.push_str(" ORDER BY study_instance_uid, series_instance_uid, sop_instance_uid");
+
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            bound.iter().map(|b| &**b as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(params.as_slice(), |row| {
+                Ok(RetrieveInstance {
+                    sop_instance_uid: row.get(0)?,
+                    sop_class_uid: row.get(1)?,
+                    transfer_syntax_uid: row.get(2)?,
+                    file_path: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
