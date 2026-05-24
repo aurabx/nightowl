@@ -160,6 +160,27 @@ storescu: ## C-STORE one file (FILE=path.dcm) to AET@HOST:PORT (works from M5).
 
 # --- cleanup -----------------------------------------------------------
 
+.PHONY: kill-dev
+kill-dev: ## Force-kill any lingering dev processes and free relevant ports.
+	@for proc in phantom vite tauri cargo-tauri node; do \
+		pkill -9 -f $$proc 2>/dev/null || true; \
+	done
+	@for port in 5173 11112 11113; do \
+		pids=$$(lsof -ti :$$port 2>/dev/null); \
+		if [ -n "$$pids" ]; then \
+			echo "killing $$pids on port $$port"; \
+			kill -9 $$pids 2>/dev/null || true; \
+		fi; \
+	done
+	@sleep 1
+	@for port in 5173 11112 11113; do \
+		if lsof -i :$$port 2>/dev/null | grep -q LISTEN; then \
+			echo "WARNING: port $$port still in use"; \
+		else \
+			echo "port $$port clear"; \
+		fi; \
+	done
+
 .PHONY: clean
 clean: ## Remove build artifacts (target/, dist/) but keep node_modules.
 	rm -rf src-tauri/target dist src-tauri/gen
