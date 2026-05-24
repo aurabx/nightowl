@@ -286,3 +286,56 @@ export function scuStore(
 ): Promise<ScuStoreOutcome[]> {
   return invoke<ScuStoreOutcome[]>("scu_store_cmd", { peerId, files });
 }
+
+// --- Worklist (M11) --------------------------------------------------
+
+export interface WorklistEntry {
+  id: string;
+  accession_number: string;
+  patient_id: string;
+  patient_name: string;
+  patient_birth_date: string | null;
+  patient_sex: string | null;
+  study_instance_uid: string;
+  requested_procedure_id: string | null;
+  requested_procedure_description: string | null;
+  scheduled_station_ae_title: string;
+  scheduled_procedure_step_start_date: string;
+  scheduled_procedure_step_start_time: string | null;
+  scheduled_procedure_step_id: string;
+  scheduled_procedure_step_description: string | null;
+  modality: string;
+}
+
+export interface NewWorklistEntry {
+  accession_number: string;
+  patient_id: string;
+  patient_name: string;
+  patient_birth_date?: string;
+  patient_sex?: string;
+  study_instance_uid?: string;
+  requested_procedure_id?: string;
+  requested_procedure_description?: string;
+  scheduled_station_ae_title: string;
+  scheduled_procedure_step_start_date: string;
+  scheduled_procedure_step_start_time?: string;
+  scheduled_procedure_step_id?: string;
+  scheduled_procedure_step_description?: string;
+  modality: string;
+}
+
+export function listWorklist(): Promise<WorklistEntry[]> {
+  return invoke<WorklistEntry[]>("list_worklist");
+}
+
+export function createWorklistEntry(entry: NewWorklistEntry): Promise<WorklistEntry> {
+  return invoke<WorklistEntry>("create_worklist_entry", { entry });
+}
+
+export function updateWorklistEntry(entry: WorklistEntry): Promise<WorklistEntry> {
+  return invoke<WorklistEntry>("update_worklist_entry", { entry });
+}
+
+export function deleteWorklistEntry(id: string): Promise<void> {
+  return invoke<void>("delete_worklist_entry", { id });
+}

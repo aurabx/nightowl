@@ -23,6 +23,7 @@ use core::dimse::{
 use core::error::AppError;
 use core::peers::{NewPeer, Peer, PeerStore, UpdatePeer};
 use core::store::{FindLevel, Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
+use core::worklist::{NewWorklistEntry, WorklistEntry, WorklistStore};
 
 /// Process-wide state shared across Tauri commands.
 struct AppState {
@@ -59,6 +60,10 @@ fn index_path(app: &AppHandle) -> Result<PathBuf, AppError> {
 
 fn peers_path(app: &AppHandle) -> Result<PathBuf, AppError> {
     Ok(app_config_dir(app)?.join("peers.json"))
+}
+
+fn worklist_path(app: &AppHandle) -> Result<PathBuf, AppError> {
+    Ok(app_config_dir(app)?.join("worklist.sqlite"))
 }
 
 fn app_config_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
@@ -283,6 +288,39 @@ async fn scu_store_cmd(
         .map_err(|e| AppError::Internal(format!("scu_store join: {e}")))?
 }
 
+// --- Worklist (M11) --------------------------------------------------
+
+#[tauri::command]
+fn list_worklist(
+    worklist: State<'_, Arc<WorklistStore>>,
+) -> Result<Vec<WorklistEntry>, AppError> {
+    worklist.list()
+}
+
+#[tauri::command]
+fn create_worklist_entry(
+    worklist: State<'_, Arc<WorklistStore>>,
+    entry: NewWorklistEntry,
+) -> Result<WorklistEntry, AppError> {
+    worklist.create(entry)
+}
+
+#[tauri::command]
+fn update_worklist_entry(
+    worklist: State<'_, Arc<WorklistStore>>,
+    entry: WorklistEntry,
+) -> Result<WorklistEntry, AppError> {
+    worklist.update(entry)
+}
+
+#[tauri::command]
+fn delete_worklist_entry(
+    worklist: State<'_, Arc<WorklistStore>>,
+    id: String,
+) -> Result<(), AppError> {
+    worklist.delete(&id)
+}
+
 // ---------------------------------------------------------------------
 // Entrypoint
 // ---------------------------------------------------------------------
@@ -340,6 +378,16 @@ pub fn run() {
             );
             app.manage(peers.clone());
 
+            // Open the worklist store (M11). Its own SQLite file so a
+            // user reset of the SOP index does not nuke their
+            // worklist data.
+            let worklist = Arc::new(WorklistStore::open(&worklist_path(handle)?)?);
+            tracing::info!(
+                worklist_count = worklist.count().unwrap_or(0),
+                "loaded worklist",
+            );
+            app.manage(worklist.clone());
+
             // Start the SCP listener AFTER managing the activity log
             // so its startup `SCP listening …` event is persisted.
             // The ScpContext bundles the SOP index (queried by M4 and
@@ -350,6 +398,7 @@ pub fn run() {
                 store_dir: cfg.store_dir.clone(),
                 peers: peers.clone(),
                 local_ae_title: cfg.local_ae_title.clone(),
+                worklist: worklist.clone(),
             });
             let listener = start_listener(
                 cfg.listen_port,
@@ -409,6 +458,10 @@ pub fn run() {
             scu_find_cmd,
             scu_move_cmd,
             scu_store_cmd,
+            list_worklist,
+            create_worklist_entry,
+            update_worklist_entry,
+            delete_worklist_entry,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

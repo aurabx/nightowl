@@ -45,6 +45,8 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [x] (2026-05-23) M8: SCU page can run C-ECHO, C-FIND, C-MOVE, and C-STORE against a configured peer and display the result. Four new Tauri commands (`scu_echo_cmd`, `scu_find_cmd`, `scu_move_cmd`, `scu_store_cmd`) each call into a pure-Rust SCU function in `core::dimse`; the SCU page has a peer dropdown, operation switcher, per-operation form, and op-specific result panels (echo: green/red status; find: dynamic-column results table with friendly tag names; move: completed/failed counts; store: per-file outcome table). C-GET deferred — it overlaps the same code path as C-MOVE from the SCU's side but `getscu`-style negotiation with SCP-role contexts is more involved; not blocking.
 - [x] (2026-05-23) M9: Activity page shows a live event stream of every association (inbound and outbound) with peer, command, status, and timestamp. **Built ahead of M4–M8** to make the next four milestones visually verifiable: every C-FIND / C-STORE / C-MOVE response from M4–M6 will now appear in the live log without instrumentation work. `ActivityLog` in `src-tauri/src/core/activity.rs` persists every `dimse::emit` into `activity_events` (50,000-row cap, trim on every 500 inserts), three Tauri commands (`list_activity`, `clear_activity`, `activity_count`), Activity page with live event subscription, direction / status / search filters, pause-resume toggle, and clear-log button. Seventeen backend tests passing.
 - [x] (2026-05-23) M10: Modality Worklist SCP placeholder page in `src/pages/Worklist.tsx`; sidebar entry between Store and Settings with a ClipboardList icon. The page says "Modality Worklist support is planned" — DMWL implementation is the next iteration's milestone.
+- [x] (2026-05-23) M11: Modality Worklist (DMWL) — data model + CRUD + UI. `WorklistStore` in `src-tauri/src/core/worklist.rs` persists scheduled procedure steps to its own `worklist.sqlite`; CRUD Tauri commands (`list_worklist`, `create_worklist_entry`, `update_worklist_entry`, `delete_worklist_entry`); Worklist page replaced the stub with a full table + add/edit modal supporting all the standard DICOM key attributes. Seven backend tests passing (CRUD, validation, wildcard + date-range find).
+- [x] (2026-05-23) M12: DMWL SCP — answer C-FIND for scheduled procedure steps. Modality Worklist Information Model FIND (1.2.840.10008.5.1.4.31) negotiated; `handle_find_dispatch` routes C-FIND-RQ on SOP class to either the existing store-based handler (M4) or the new `handle_dmwl_find`; the DMWL handler parses the request identifier (patient keys at top + Scheduled Procedure Step Sequence with SPS-level keys), translates to `WorklistQuery`, and emits Pending C-FIND-RSPs with response identifiers carrying the full patient + SPS sequence structure. Verified with `findscu -W` against three seeded entries: filtering by `ScheduledStationAETitle=MR1` and by date range both return the right rows with complete sequence-wrapped responses.
 
 Use timestamps when entries are completed, like `- [x] (2026-05-23 11:00Z) Scaffold created.`
 
@@ -271,6 +273,22 @@ Record every decision in the format below.
   Rationale: From the SCU side, C-GET needs the client to offer SCP-role presentation contexts for every Storage SOP Class it expects back. `dicom-ul`'s `ClientAssociationOptions` does not (as of 0.9.1) expose a SCP/SCU role-selection negotiation knob, so a hand-built A-ASSOCIATE-RQ would be needed. The use case is also narrow: C-GET only makes sense over the same association as the query, and our M6 SCP-side C-GET already lets external tools (getscu) pull from us. Document and skip.
   Date/Author: 2026-05-23 / M8 implementer.
 
+- Decision (M11): Worklist data lives in its own `worklist.sqlite` file rather than alongside `sop_instances` and `activity_events` in `store.sqlite`.
+  Rationale: A user who clears or rebuilds the SOP index (e.g. by deleting `store.sqlite` to recover from a corrupt DB) should not lose their worklist data. Separate files = independent lifecycles.
+  Date/Author: 2026-05-23 / M11 implementer.
+
+- Decision (M11): When the UI does not supply `study_instance_uid` or `scheduled_procedure_step_id`, the store generates them — UIDs as `2.25.<128-bit UUID>` per PS3.5 §B.2, SPS IDs as `SPS-<short uuid>`.
+  Rationale: Both fields are required (NOT NULL) and a real user would not type a 64-character UID by hand. The 2.25 OID branch is officially registered for UUID-derived DICOM UIDs.
+  Date/Author: 2026-05-23 / M11 implementer.
+
+- Decision (M12): C-FIND dispatch first reads `AffectedSOPClassUID` and routes between `handle_c_find` (study-index) and `handle_dmwl_find` (worklist).
+  Rationale: Both DIMSE services share the same `cmd::C_FIND_RQ` command field; only the SOP class tells them apart. Putting the dispatch one level above keeps each handler focused on its own identifier shape.
+  Date/Author: 2026-05-23 / M12 implementer.
+
+- Decision (M12): DMWL response identifier always emits exactly one Scheduled Procedure Step Sequence item per matched entry.
+  Rationale: Our schema is one row per scheduled procedure step. DICOM allows multi-step procedures with multiple SPS items per top-level row, but expressing that requires a more complex data model (parent procedure + child steps). One item per match keeps the data flow simple and is what the vast majority of real worklists do anyway.
+  Date/Author: 2026-05-23 / M12 implementer.
+
 ## Outcomes & Retrospective
 
 Summarize outcomes, gaps, and lessons learned at major milestones or at completion.
@@ -401,6 +419,86 @@ Follow-on observations:
 - No filesystem watcher yet. If a file is dropped into the store dir while the app is running, the user has to click "Rescan now". `notify` is in the dep list and a small follow-up can hook it up.
 - The Settings page still has a free-text store-dir input. With the Store page now showing real data, the UX argument for a native folder picker is stronger; queueing for the M7/M8 round.
 - Changing `store_dir` in Settings does not currently re-open the index against the new directory; restart needed. Noting for an M3 or M7 cleanup.
+
+### M11 + M12 (2026-05-23)
+
+What landed: Modality Worklist (DMWL) — both halves. M11 added the data model + CRUD + UI; M12 added the DMWL SCP that answers C-FIND queries against the worklist.
+
+Backend (`src-tauri/src/core/worklist.rs`, ~470 lines):
+
+- `WorklistEntry` carries the standard DICOM key attributes for a scheduled procedure step: PatientID, PatientName, PatientBirthDate, PatientSex, AccessionNumber, StudyInstanceUID, RequestedProcedureID, RequestedProcedureDescription, ScheduledStationAETitle, ScheduledProcedureStepStartDate, ScheduledProcedureStepStartTime, ScheduledProcedureStepID, ScheduledProcedureStepDescription, Modality.
+- `WorklistStore::open(path)` creates the schema (one indexed table) in its own SQLite file (`worklist.sqlite`) so a SOP-index reset can't take the worklist with it.
+- CRUD methods validate required fields, generate StudyInstanceUID as `2.25.<UUID>` and ScheduledProcedureStepID as `SPS-<uuid>` when the UI omits them.
+- `find(query)` runs the typed `WorklistQuery` against the table — Single / Wildcard / Range matching, same translation rules as M4's store query.
+- Seven unit tests covering create + UID generation, validation rejection, date format rejection, update, delete, find-by-station-and-date-range, find-by-name-wildcard.
+
+Backend wiring (`src-tauri/src/lib.rs`):
+
+- `setup()` opens `WorklistStore` from `<app config dir>/worklist.sqlite` and manages an `Arc<WorklistStore>`.
+- Info log on boot reports loaded entry count.
+- Four Tauri commands: `list_worklist`, `create_worklist_entry`, `update_worklist_entry`, `delete_worklist_entry`.
+
+DMWL SCP wiring (`src-tauri/src/core/dimse.rs`):
+
+- `ScpContext` gains `worklist: Arc<WorklistStore>`.
+- Negotiation builder adds `MODALITY_WORKLIST_INFORMATION_MODEL_FIND` (1.2.840.10008.5.1.4.31).
+- `handle_find_dispatch` reads `AffectedSOPClassUID` and routes between the existing `handle_c_find` (M4 study-index) and the new `handle_dmwl_find`.
+- `handle_dmwl_find`:
+  - Decodes the request identifier with the negotiated TS.
+  - Builds a `WorklistQuery`: patient keys from the top level (PatientID, PatientName with wildcards, AccessionNumber); SPS-level keys (Modality, ScheduledStationAETitle, ScheduledProcedureStepStartDate with range support) from the first item of the Scheduled Procedure Step Sequence (0040,0100).
+  - Runs `worklist.find(query)`.
+  - For each match, emits a Pending C-FIND-RSP with a response identifier shaped like the request: patient keys at top level + an SPS Sequence with one item carrying the SPS-level fields.
+  - Final RSP with Success.
+- New helpers: `build_worklist_query`, `worklist_key_match`, `worklist_key_match_date`, `build_dmwl_response`. Sequence construction via `DataSetSequence::new` + `Value::Sequence` from `dicom_core::value`.
+
+Frontend (`src/pages/Worklist.tsx` + `src/lib/api.ts`):
+
+- Table with one row per entry: Scheduled date/time, patient (name + ID), accession, requested procedure + SPS description, modality badge, scheduled station AE, edit + delete actions.
+- Add/Edit modal: required fields (Accession, Modality, PatientID, PatientName, ScheduledStationAETitle, ScheduledDate); optional fields (BirthDate, Sex, time, descriptions); advanced disclosure for StudyInstanceUID + SPS ID + RequestedProcedureID (auto-generated when blank).
+- Two-click delete confirmation (same pattern as Peers).
+- Default scheduled date pre-fills today.
+
+Verification:
+
+    $ make test-rust             # 32 passed (7 new for worklist)
+    $ make build-web             # clean
+
+End-to-end DMWL with three seeded entries (Doe/MR/MR1@20260601,
+Smith/CT/CT1@20260601, Doe/CT/MR1@20260602):
+
+    $ findscu -W \
+        -k "(0040,0100)[0].(0040,0001)=MR1" \
+        -k "(0010,0010)" -k "(0010,0020)" -k "(0040,0100)[0].(0040,0002)" \
+        -aec PHANTOM -aet TESTSCU localhost 11112
+    Find Response: 1 (Pending)
+      PatientName       = Doe^John
+      PatientID         = P0001
+      AccessionNumber   = A12345
+      StudyInstanceUID  = 2.25.111
+      RequestedProcedureDescription = MRI Knee
+      ScheduledProcedureStepSequence Item:
+        Modality        = MR
+        ScheduledStationAETitle = MR1
+        ScheduledProcedureStepStartDate = 20260601
+        ScheduledProcedureStepStartTime = 093000
+        ScheduledProcedureStepDescription = T1 sequence
+        ScheduledProcedureStepID = SPS-1
+    Find Response: 2 (Pending)
+      (Doe^John CT Abdomen on 20260602 — same station MR1)
+    Received Final Find Response (Success)
+
+    # Date range query
+    $ findscu -W -k "(0040,0100)[0].(0040,0002)=20260601-20260601" ...
+    (returns Doe^John MR + Smith^Jane CT — both on that date)
+
+Gaps to address: none. The worklist is now a fully functional DMWL SCP.
+
+Follow-on observations:
+
+- No N-SET / N-CREATE / N-DELETE for the MPPS (Modality Performed Procedure Step) protocol — that's a separate DICOM service that lets a modality report back when it finishes an exam. Not in scope here.
+- No N-ACTION for worklist update commitment. Same — separate protocol.
+- The SPS Sequence in our response always carries one item. A real worklist may want multi-step procedures; documented in Decision Log.
+- A "Duplicate" button on the Worklist table row would be nice for creating a series of similar entries. Easy follow-up.
 
 ### M8 (2026-05-23)
 

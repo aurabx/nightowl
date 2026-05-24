@@ -13,6 +13,8 @@
 //! - `peers`    — configured remote DICOM peers, persisted as
 //!               peers.json. M7 in the plan, but C-MOVE in M6 needs
 //!               it to resolve Move Destination AE Titles.
+//! - `worklist` — Modality Worklist (DMWL) entries — scheduled
+//!               procedure steps, M11. Served by M12's DMWL SCP.
 
 pub mod activity;
 pub mod config;
@@ -20,6 +22,7 @@ pub mod dimse;
 pub mod error;
 pub mod peers;
 pub mod store;
+pub mod worklist;
 
 /// IPC self-check used by the frontend on mount. Returns the fixed string
 /// `"pong"`; if the frontend sees anything else, the IPC channel is broken.

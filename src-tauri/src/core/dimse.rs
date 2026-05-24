@@ -35,11 +35,14 @@ use std::time::{Duration, Instant};
 use chrono::Utc;
 use dicom_core::{dicom_value, DataElement, Tag, VR};
 use dicom_dictionary_std::tags;
+use dicom_core::value::{DataSetSequence, Value};
+use dicom_core::Length;
 use dicom_dictionary_std::uids::{
     COMPUTED_RADIOGRAPHY_IMAGE_STORAGE, CT_IMAGE_STORAGE,
     DIGITAL_X_RAY_IMAGE_STORAGE_FOR_PRESENTATION, ENCAPSULATED_PDF_STORAGE,
     EXPLICIT_VR_LITTLE_ENDIAN, IMPLICIT_VR_LITTLE_ENDIAN, JPEG_BASELINE8_BIT,
-    MR_IMAGE_STORAGE, PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
+    MODALITY_WORKLIST_INFORMATION_MODEL_FIND, MR_IMAGE_STORAGE,
+    PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
     PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET,
     PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE,
     SECONDARY_CAPTURE_IMAGE_STORAGE, STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
@@ -65,6 +68,9 @@ use super::activity::{ActivityLog, PersistedActivityEvent};
 use super::error::AppError;
 use super::peers::{Peer, PeerStore};
 use super::store::{FindLevel, FindQuery, FindRow, Index, KeyMatch, RetrieveInstance};
+use super::worklist::{
+    KeyMatch as WlKeyMatch, WorklistEntry, WorklistQuery, WorklistStore,
+};
 
 // DIMSE Command Field values (PS3.7 Table 7.1-1). Listed even when
 // unused at M3 so the table is in one place for M4/M5/M6.
@@ -203,6 +209,8 @@ pub struct ScpContext {
     pub store_dir: PathBuf,
     pub peers: Arc<PeerStore>,
     pub local_ae_title: String,
+    /// Modality Worklist store. M12's DMWL C-FIND handler queries it.
+    pub worklist: Arc<WorklistStore>,
 }
 
 /// Handle to the running SCP listener. Holding this struct alive is
@@ -394,6 +402,7 @@ fn handle_association(
         .with_abstract_syntax(STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE)
         .with_abstract_syntax(PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET)
         .with_abstract_syntax(STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET)
+        .with_abstract_syntax(MODALITY_WORKLIST_INFORMATION_MODEL_FIND)
         .with_transfer_syntax(IMPLICIT_VR_LITTLE_ENDIAN)
         .with_transfer_syntax(EXPLICIT_VR_LITTLE_ENDIAN)
         .with_transfer_syntax(JPEG_BASELINE8_BIT)
@@ -653,7 +662,7 @@ fn dispatch(
     let command_field = read_u16(command, tags::COMMAND_FIELD)?;
     match command_field {
         cmd::C_ECHO_RQ => handle_c_echo(association, ctx, command, pc_id),
-        cmd::C_FIND_RQ => handle_c_find(association, ctx, &scp.index, command, data, pc_id),
+        cmd::C_FIND_RQ => handle_find_dispatch(association, ctx, scp, command, data, pc_id),
         cmd::C_STORE_RQ => handle_c_store(association, ctx, scp, command, data, pc_id),
         cmd::C_MOVE_RQ => handle_c_move(association, ctx, scp, command, data, pc_id),
         cmd::C_GET_RQ => handle_c_get(association, ctx, scp, command, data, pc_id),
@@ -725,7 +734,32 @@ fn handle_c_echo(
 }
 
 // ---------------------------------------------------------------------
-// C-FIND handler (M4)
+// C-FIND dispatch (M4 + M12)
+// ---------------------------------------------------------------------
+
+/// Routes a C-FIND-RQ to the right handler based on the SOP class. The
+/// command field alone is not enough — both Patient/Study Root Q/R Find
+/// and Modality Worklist Find share `cmd::C_FIND_RQ`, but the
+/// identifier they expect and the data source they query are entirely
+/// different.
+fn handle_find_dispatch(
+    association: &mut ServerAssociation<TcpStream>,
+    ctx: &AssociationCtx,
+    scp: &ScpContext,
+    command: &InMemDicomObject,
+    data: &[u8],
+    pc_id: u8,
+) -> Result<bool, AppError> {
+    let sop_class = read_str(command, tags::AFFECTED_SOP_CLASS_UID)?;
+    if sop_class == MODALITY_WORKLIST_INFORMATION_MODEL_FIND {
+        handle_dmwl_find(association, ctx, scp, command, data, pc_id)
+    } else {
+        handle_c_find(association, ctx, &scp.index, command, data, pc_id)
+    }
+}
+
+// ---------------------------------------------------------------------
+// C-FIND handler — Patient / Study Root (M4)
 // ---------------------------------------------------------------------
 
 fn handle_c_find(
@@ -849,6 +883,233 @@ fn send_c_find_final(
             }],
         })
         .map_err(|e| AppError::Internal(format!("send final C-FIND-RSP: {e}")))
+}
+
+// ---------------------------------------------------------------------
+// DMWL Find handler (M12)
+// ---------------------------------------------------------------------
+
+/// Handles a C-FIND-RQ on the Modality Worklist Information Model.
+///
+/// The request identifier has patient-level keys at the top level
+/// (`PatientID`, `PatientName`, `AccessionNumber`) plus a Scheduled
+/// Procedure Step Sequence (0040,0100) — one item carrying SPS-level
+/// keys (`Modality`, `ScheduledStationAETitle`,
+/// `ScheduledProcedureStepStartDate`). The response identifier has
+/// the same shape, populated from the matched `WorklistEntry`.
+fn handle_dmwl_find(
+    association: &mut ServerAssociation<TcpStream>,
+    ctx: &AssociationCtx,
+    scp: &ScpContext,
+    command: &InMemDicomObject,
+    identifier_bytes: &[u8],
+    pc_id: u8,
+) -> Result<bool, AppError> {
+    let message_id = read_u16(command, tags::MESSAGE_ID)?;
+    let sop_class_uid = MODALITY_WORKLIST_INFORMATION_MODEL_FIND.to_string();
+
+    let ts_uid = transfer_syntax_uid_for(association, pc_id)?;
+    let ts = lookup_ts(&ts_uid)?;
+    let request_identifier = InMemDicomObject::read_dataset_with_ts(identifier_bytes, ts)
+        .map_err(|e| AppError::Internal(format!("DMWL identifier decode: {e}")))?;
+
+    ctx.emit_inbound("C-FIND-RQ", format!("message id {message_id} DMWL"));
+
+    let query = build_worklist_query(&request_identifier);
+    let matches = scp.worklist.find(&query)?;
+    let match_count = matches.len();
+
+    for entry in matches {
+        let response_identifier = build_dmwl_response(&entry);
+        let rsp_command = build_c_find_rsp(message_id, &sop_class_uid, STATUS_PENDING, true);
+        let cmd_bytes = encode_command_set(&rsp_command)?;
+        let id_bytes = encode_identifier(&response_identifier, lookup_ts(&ts_uid)?)?;
+
+        association
+            .send(&Pdu::PData {
+                data: vec![PDataValue {
+                    presentation_context_id: pc_id,
+                    value_type: PDataValueType::Command,
+                    is_last: true,
+                    data: cmd_bytes,
+                }],
+            })
+            .map_err(|e| AppError::Internal(format!("send DMWL Pending command: {e}")))?;
+        {
+            let mut writer = association.send_pdata(pc_id);
+            writer
+                .write_all(&id_bytes)
+                .map_err(|e| AppError::Internal(format!("send DMWL Pending data: {e}")))?;
+            writer
+                .finish()
+                .map_err(|e| AppError::Internal(format!("flush DMWL Pending data: {e}")))?;
+        }
+    }
+
+    send_c_find_final(association, ctx, &sop_class_uid, message_id, pc_id, STATUS_SUCCESS)?;
+    ctx.emit_outbound(
+        "C-FIND-RSP",
+        format!(
+            "DMWL {match_count} match{} + final Success",
+            if match_count == 1 { "" } else { "es" }
+        ),
+    );
+
+    Ok(true)
+}
+
+/// Translates the inbound DMWL request identifier into a typed
+/// `WorklistQuery`. Patient-level keys come from the top level; SPS-
+/// level keys come from the first item of the Scheduled Procedure
+/// Step Sequence.
+fn build_worklist_query(identifier: &InMemDicomObject) -> WorklistQuery {
+    let mut q = WorklistQuery::default();
+    q.patient_id = worklist_key_match(identifier, tags::PATIENT_ID, true);
+    q.patient_name = worklist_key_match(identifier, tags::PATIENT_NAME, true);
+    q.accession_number = worklist_key_match(identifier, tags::ACCESSION_NUMBER, false);
+
+    // Drill into the first SPS sequence item (if any) for SPS-level
+    // matching keys. A real worklist client typically sends exactly
+    // one item with the modality's matching criteria.
+    if let Ok(sps_element) = identifier.element(tags::SCHEDULED_PROCEDURE_STEP_SEQUENCE) {
+        if let Some(items) = sps_element.value().items() {
+            if let Some(item) = items.first() {
+                q.modality = worklist_key_match(item, tags::MODALITY, false);
+                q.scheduled_station_ae_title =
+                    worklist_key_match(item, tags::SCHEDULED_STATION_AE_TITLE, false);
+                q.scheduled_start_date = worklist_key_match_date(
+                    item,
+                    tags::SCHEDULED_PROCEDURE_STEP_START_DATE,
+                );
+            }
+        }
+    }
+    q
+}
+
+fn worklist_key_match(
+    obj: &InMemDicomObject,
+    tag: Tag,
+    allow_wildcards: bool,
+) -> Option<WlKeyMatch> {
+    let raw = obj.element(tag).ok()?.to_str().ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    if allow_wildcards && (raw.contains('*') || raw.contains('?')) {
+        Some(WlKeyMatch::Wildcard(raw))
+    } else {
+        Some(WlKeyMatch::Single(raw))
+    }
+}
+
+fn worklist_key_match_date(obj: &InMemDicomObject, tag: Tag) -> Option<WlKeyMatch> {
+    let raw = obj.element(tag).ok()?.to_str().ok()?.trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    if let Some((start, end)) = raw.split_once('-') {
+        if !start.is_empty() && !end.is_empty() {
+            return Some(WlKeyMatch::Range(start.to_string(), end.to_string()));
+        }
+    }
+    Some(WlKeyMatch::Single(raw))
+}
+
+/// Builds a DMWL response identifier with patient-level keys at the
+/// top and one Scheduled Procedure Step Sequence item populated from
+/// the matched entry.
+fn build_dmwl_response(entry: &WorklistEntry) -> InMemDicomObject {
+    let mut rsp = InMemDicomObject::new_empty();
+
+    // Patient-level keys.
+    rsp.put_element(DataElement::new(
+        tags::PATIENT_ID,
+        VR::LO,
+        entry.patient_id.clone(),
+    ));
+    rsp.put_element(DataElement::new(
+        tags::PATIENT_NAME,
+        VR::PN,
+        entry.patient_name.clone(),
+    ));
+    rsp.put_element(DataElement::new(
+        tags::PATIENT_BIRTH_DATE,
+        VR::DA,
+        entry.patient_birth_date.clone().unwrap_or_default(),
+    ));
+    rsp.put_element(DataElement::new(
+        tags::PATIENT_SEX,
+        VR::CS,
+        entry.patient_sex.clone().unwrap_or_default(),
+    ));
+
+    // Imaging Service Request keys.
+    rsp.put_element(DataElement::new(
+        tags::ACCESSION_NUMBER,
+        VR::SH,
+        entry.accession_number.clone(),
+    ));
+    rsp.put_element(DataElement::new(
+        tags::STUDY_INSTANCE_UID,
+        VR::UI,
+        entry.study_instance_uid.clone(),
+    ));
+    rsp.put_element(DataElement::new(
+        tags::REQUESTED_PROCEDURE_ID,
+        VR::SH,
+        entry.requested_procedure_id.clone().unwrap_or_default(),
+    ));
+    rsp.put_element(DataElement::new(
+        tags::REQUESTED_PROCEDURE_DESCRIPTION,
+        VR::LO,
+        entry.requested_procedure_description.clone().unwrap_or_default(),
+    ));
+
+    // Scheduled Procedure Step Sequence — one item with the SPS-level
+    // keys. DICOM allows a worklist response to carry multiple SPS
+    // items per top-level row (multi-step procedure); our schema is
+    // one row per step, so we always emit a single item.
+    let mut sps_item = InMemDicomObject::new_empty();
+    sps_item.put_element(DataElement::new(
+        tags::SCHEDULED_STATION_AE_TITLE,
+        VR::AE,
+        entry.scheduled_station_ae_title.clone(),
+    ));
+    sps_item.put_element(DataElement::new(
+        tags::SCHEDULED_PROCEDURE_STEP_START_DATE,
+        VR::DA,
+        entry.scheduled_procedure_step_start_date.clone(),
+    ));
+    sps_item.put_element(DataElement::new(
+        tags::SCHEDULED_PROCEDURE_STEP_START_TIME,
+        VR::TM,
+        entry.scheduled_procedure_step_start_time.clone().unwrap_or_default(),
+    ));
+    sps_item.put_element(DataElement::new(
+        tags::MODALITY,
+        VR::CS,
+        entry.modality.clone(),
+    ));
+    sps_item.put_element(DataElement::new(
+        tags::SCHEDULED_PROCEDURE_STEP_ID,
+        VR::SH,
+        entry.scheduled_procedure_step_id.clone(),
+    ));
+    sps_item.put_element(DataElement::new(
+        tags::SCHEDULED_PROCEDURE_STEP_DESCRIPTION,
+        VR::LO,
+        entry.scheduled_procedure_step_description.clone().unwrap_or_default(),
+    ));
+
+    let seq = DataSetSequence::new(vec![sps_item], Length::UNDEFINED);
+    rsp.put_element(DataElement::new(
+        tags::SCHEDULED_PROCEDURE_STEP_SEQUENCE,
+        VR::SQ,
+        Value::Sequence(seq),
+    ));
+
+    rsp
 }
 
 fn build_c_find_rsp(
