@@ -214,11 +214,12 @@ pub struct FindRow {
 }
 
 /// One SOP Instance enough for `forward_via_c_store` to forward it.
+/// The transfer syntax is re-derived per association from the negotiated
+/// presentation context, so it is not carried here.
 #[derive(Debug, Clone)]
 pub struct RetrieveInstance {
     pub sop_instance_uid: String,
     pub sop_class_uid: String,
-    pub transfer_syntax_uid: String,
     pub file_path: String,
 }
 
@@ -613,7 +614,7 @@ impl Index {
         apply_match("sop_class_uid", q.sop_class_uid.as_ref(), &mut where_parts, &mut bound);
 
         let mut sql = String::from(
-            "SELECT sop_instance_uid, sop_class_uid, transfer_syntax_uid, file_path
+            "SELECT sop_instance_uid, sop_class_uid, file_path
              FROM sop_instances",
         );
         if !where_parts.is_empty() {
@@ -631,8 +632,7 @@ impl Index {
                 Ok(RetrieveInstance {
                     sop_instance_uid: row.get(0)?,
                     sop_class_uid: row.get(1)?,
-                    transfer_syntax_uid: row.get(2)?,
-                    file_path: row.get(3)?,
+                    file_path: row.get(2)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

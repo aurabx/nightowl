@@ -217,7 +217,6 @@ pub struct ScpContext {
 /// what keeps the listener bound; dropping the inner `shutdown` flag
 /// causes the accept loop to exit on its next iteration.
 pub struct ListenerHandle {
-    pub bind_addr: SocketAddr,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -303,10 +302,7 @@ pub fn start_listener(
         },
     );
 
-    Ok(ListenerHandle {
-        bind_addr,
-        shutdown,
-    })
+    Ok(ListenerHandle { shutdown })
 }
 
 fn run_accept_loop(
@@ -3030,13 +3026,11 @@ fn tag_to_friendly_name(tag: Tag) -> String {
 }
 
 /// Parses one local file enough to feed it into `forward_via_c_store`:
-/// SOP Instance UID, SOP Class UID, transfer syntax. Used by
-/// `scu_store` so the UI can drive C-STORE without going through the
-/// SCP-side ingest path.
+/// SOP Instance UID and SOP Class UID. Used by `scu_store` so the UI
+/// can drive C-STORE without going through the SCP-side ingest path.
 fn scan_store_file(path: &Path) -> Result<RetrieveInstance, AppError> {
     let obj = open_file(path)
         .map_err(|e| AppError::DicomParse(format!("open {}: {e}", path.display())))?;
-    let transfer_syntax_uid = obj.meta().transfer_syntax.clone();
     let sop_instance_uid = obj
         .element(tags::SOP_INSTANCE_UID)
         .map_err(|e| AppError::DicomParse(format!("missing SOPInstanceUID: {e}")))?
@@ -3054,7 +3048,6 @@ fn scan_store_file(path: &Path) -> Result<RetrieveInstance, AppError> {
     Ok(RetrieveInstance {
         sop_instance_uid,
         sop_class_uid,
-        transfer_syntax_uid,
         file_path: path.to_string_lossy().to_string(),
     })
 }
