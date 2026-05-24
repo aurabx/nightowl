@@ -1,0 +1,199 @@
+name: "publish"
+
+# Builds + signs Phantom for macOS (arm64 + intel), Linux, and Windows
+# whenever main moves, and uploads to a draft GitHub release named after
+# the version in src-tauri/tauri.conf.json.
+#
+# Tag scheme: plain semver (v0.1.0, v0.2.0, ...). To cut a real release,
+# bump `"version"` in src-tauri/tauri.conf.json, push to main, then go
+# to GitHub Releases and publish the draft this workflow creates.
+#
+# Apple Developer signing uses the same organisation-level secrets as
+# the sibling Bounce app (APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD,
+# KEYCHAIN_PASSWORD, APPLE_ID, APPLE_ID_PASSWORD, APPLE_PASSWORD,
+# APPLE_TEAM_ID). Windows and Linux artefacts are unsigned.
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  # First job: check if a draft release already exists for the current
+  # version. Create one if not, otherwise reuse it so the platform jobs
+  # all upload artefacts to the same release.
+  check-or-create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.get_or_create_release.outputs.release_id }}
+      release_upload_url: ${{ steps.get_or_create_release.outputs.release_upload_url }}
+      tag_name: ${{ steps.get_or_create_release.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get app version
+        id: get_version
+        run: |
+          VERSION=$(grep -o '"version": *"[^"]*"' src-tauri/tauri.conf.json | cut -d'"' -f4)
+          TAG_NAME="v$VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Get or create release
+        id: get_or_create_release
+        env:
+          # Pass every interpolated value through env so the shell never
+          # sees untrusted input concatenated into a command string.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          TAG_NAME: ${{ steps.get_version.outputs.tag_name }}
+          VERSION: ${{ steps.get_version.outputs.version }}
+        run: |
+          # Look for an existing draft release with this tag (avoids
+          # racing the four platform jobs into duplicate releases).
+          RELEASES=$(curl -s -H "Authorization: token $GITHUB_TOKEN" \
+            "https://api.github.com/repos/${REPO}/releases?per_page=100")
+
+          RELEASE_ID=$(echo "$RELEASES" | jq -r --arg tag "$TAG_NAME" \
+            '.[] | select(.draft == true and .tag_name == $tag) | .id')
+
+          if [ -z "$RELEASE_ID" ]; then
+            echo "Creating a new draft release for $TAG_NAME..."
+            BODY=$(jq -nc --arg tag "$TAG_NAME" --arg name "Phantom $TAG_NAME" \
+              '{tag_name:$tag, name:$name, body:"See the assets to download this version and install.", draft:true}')
+            RESPONSE=$(curl -s -X POST \
+              -H "Authorization: token $GITHUB_TOKEN" \
+              -H "Content-Type: application/json" \
+              -d "$BODY" \
+              "https://api.github.com/repos/${REPO}/releases")
+
+            RELEASE_ID=$(echo "$RESPONSE" | jq -r '.id')
+            UPLOAD_URL=$(echo "$RESPONSE" | jq -r '.upload_url')
+          else
+            echo "Reusing existing draft release ID: $RELEASE_ID"
+            UPLOAD_URL=$(echo "$RELEASES" | jq -r --arg id "$RELEASE_ID" \
+              '.[] | select(.id == ($id | tonumber)) | .upload_url')
+          fi
+
+          echo "release_id=$RELEASE_ID" >> "$GITHUB_OUTPUT"
+          echo "release_upload_url=$UPLOAD_URL" >> "$GITHUB_OUTPUT"
+          echo "tag_name=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+  # Second job: build the app for each platform and attach the bundle
+  # to the draft release.
+  publish-tauri:
+    needs: check-or-create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "macos-latest"
+            target: "aarch64-apple-darwin"
+            name: "macOS-arm64"
+          - platform: "macos-latest"
+            target: "x86_64-apple-darwin"
+            name: "macOS-intel"
+          - platform: "ubuntu-22.04"
+            target: ""
+            name: "linux"
+          - platform: "windows-latest"
+            target: ""
+            name: "windows"
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'ubuntu-22.04'
+        # webkit2gtk + libappindicator + librsvg are the Tauri-on-Linux
+        # baseline; patchelf is needed for AppImage RPATH fixups.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            build-essential \
+            libssl-dev
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          # On macOS we cross-compile to two targets from one runner;
+          # both targets must be installed. On Linux/Windows the host
+          # target is the only target needed and is installed by default.
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src-tauri/target
+          key: ${{ runner.os }}-${{ matrix.target }}-cargo-${{ hashFiles('src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-cargo-
+
+      - name: Install frontend dependencies
+        # Reproducible install based on package-lock.json — what's in
+        # the repo is what CI builds.
+        run: npm ci
+
+      - name: Import Apple Developer Certificate
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          security find-identity -v -p codesigning build.keychain
+
+      - name: Resolve signing identity
+        if: matrix.platform == 'macos-latest'
+        run: |
+          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | grep "Developer ID Application")
+          CERT_ID=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
+          echo "CERT_ID=$CERT_ID" >> "$GITHUB_ENV"
+          echo "Using signing identity: $CERT_ID"
+
+      - name: Build the app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Apple notarisation + signing. Empty on Linux/Windows;
+          # tauri-action ignores them on those platforms.
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
+        with:
+          tagName: ${{ needs.check-or-create-release.outputs.tag_name }}
+          releaseName: "Phantom v__VERSION__"
+          releaseId: ${{ needs.check-or-create-release.outputs.release_id }}
+          releaseBody: "See the assets to download this version and install."
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.target != '' && format('--target {0}', matrix.target) || '' }}
