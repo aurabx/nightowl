@@ -4,6 +4,7 @@ import {
   Database,
   Info,
   Network,
+  Plug,
   Send,
   Settings,
 } from "lucide-react";
@@ -15,6 +16,7 @@ export type PageId =
   | "activity"
   | "store"
   | "worklist"
+  | "mcp"
   | "settings"
   | "about";
 
@@ -30,6 +32,7 @@ const ITEMS: ReadonlyArray<SidebarItem> = [
   { id: "activity", label: "Activity", icon: Activity },
   { id: "store", label: "Store", icon: Database },
   { id: "worklist", label: "Worklist", icon: ClipboardList },
+  { id: "mcp", label: "MCP", icon: Plug },
   { id: "settings", label: "Settings", icon: Settings },
   { id: "about", label: "About", icon: Info },
 ];

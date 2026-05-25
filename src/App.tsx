@@ -6,6 +6,7 @@ import { ScuPage } from "./pages/Scu";
 import { ActivityPage } from "./pages/Activity";
 import { StorePage } from "./pages/Store";
 import { WorklistPage } from "./pages/Worklist";
+import { McpPage } from "./pages/Mcp";
 import { SettingsPage } from "./pages/Settings";
 import { AboutPage } from "./pages/About";
 
@@ -32,6 +33,7 @@ function App() {
           {currentPage === "activity" && <ActivityPage />}
           {currentPage === "store" && <StorePage />}
           {currentPage === "worklist" && <WorklistPage />}
+          {currentPage === "mcp" && <McpPage />}
           {currentPage === "settings" && <SettingsPage />}
           {currentPage === "about" && <AboutPage />}
         </div>
