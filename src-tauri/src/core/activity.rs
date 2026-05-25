@@ -58,7 +58,7 @@ pub struct PersistedActivityEvent {
 /// Free-text + categorical filter applied to `list`. Every field is
 /// optional; omitted fields do not narrow the result set. Strings are
 /// matched case-insensitively.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ActivityFilter {
     pub direction: Option<String>,

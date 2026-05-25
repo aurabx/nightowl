@@ -21,6 +21,7 @@ use core::dimse::{
     ScpContext, ScuEchoResult, ScuFindResult, ScuMoveResult, ScuQueryKeys, ScuStoreOutcome,
 };
 use core::error::AppError;
+use core::mcp;
 use core::peers::{NewPeer, Peer, PeerStore, UpdatePeer};
 use core::store::{FindLevel, Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
 use core::worklist::{NewWorklistEntry, WorklistEntry, WorklistStore};
@@ -36,6 +37,12 @@ struct AppState {
     /// dropping shuts the listener down.
     #[allow(dead_code)]
     listener: ListenerHandle,
+    /// Local MCP server handle (M24). `None` when the server is
+    /// disabled in `AppConfig.mcp.enabled` or when bind failed at
+    /// boot. Held purely to keep the background serve task alive for
+    /// the process lifetime.
+    #[allow(dead_code)]
+    mcp: Option<mcp::ServerHandle>,
 }
 
 // The activity log is managed as its own `Arc<ActivityLog>` (separate
@@ -376,7 +383,7 @@ pub fn run() {
             // store.sqlite file but our own Connection so the activity
             // mutex does not contend with the SOP-index mutex.
             let activity = Arc::new(ActivityLog::open(&index_path(handle)?)?);
-            app.manage(activity);
+            app.manage(activity.clone());
 
             // Open the persistent peer list (peers.json next to
             // config.json). Empty on first launch.
@@ -418,10 +425,34 @@ pub fn run() {
                 scp,
             )?;
 
+            // M24: start the local MCP server when enabled. Treated as
+            // ancillary — bind failure logs an error and continues, so
+            // a busy port does not block app launch the way an SCP
+            // bind failure does.
+            let mcp_handle = if cfg.mcp.enabled {
+                match tauri::async_runtime::block_on(mcp::start_server(
+                    handle.clone(),
+                    cfg.clone(),
+                    idx.clone(),
+                    peers.clone(),
+                    worklist.clone(),
+                    activity.clone(),
+                )) {
+                    Ok(h) => Some(h),
+                    Err(err) => {
+                        tracing::error!(error = %err, port = cfg.mcp.port, "MCP server failed to start");
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
             app.manage(AppState {
                 config: Mutex::new(cfg.clone()),
                 index: idx.clone(),
                 listener,
+                mcp: mcp_handle,
             });
 
             // Initial background scan so the Store page is populated

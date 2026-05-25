@@ -124,7 +124,9 @@ pub struct InstanceRow {
 /// Serialised in upper-case (`"PATIENT"`, `"STUDY"`, …) matching the
 /// DICOM `QueryRetrieveLevel` (0008,0052) values, so the SCU frontend
 /// can send the level over IPC using the same vocabulary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
+)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum FindLevel {
     Patient,

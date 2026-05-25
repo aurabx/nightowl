@@ -15,11 +15,15 @@
 //!               it to resolve Move Destination AE Titles.
 //! - `worklist` — Modality Worklist (DMWL) entries — scheduled
 //!               procedure steps, M11. Served by M12's DMWL SCP.
+//! - `mcp`      — local Model Context Protocol server (M24) exposing
+//!               read + active SCU tools over Streamable HTTP on
+//!               127.0.0.1, disabled by default.
 
 pub mod activity;
 pub mod config;
 pub mod dimse;
 pub mod error;
+pub mod mcp;
 pub mod peers;
 pub mod store;
 pub mod worklist;

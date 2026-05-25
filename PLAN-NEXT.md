@@ -35,6 +35,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [ ] M21: C-GET SCU with explicit SCP-role presentation contexts. The SCU page gets a C-GET button that actually works.
 - [ ] M22: Live C-MOVE progress in the SCU page. Sub-operation counts stream in as the operation runs rather than landing all at once on completion.
 - [ ] M23: Drag-and-drop file picker for the SCU C-STORE form. Replaces the textarea with a real drop zone.
+- [x] (2026-05-25) M24: Local MCP server. NightOwl binds an rmcp Streamable-HTTP server on 127.0.0.1:&lt;mcp.port&gt; (default 7300, disabled by default) and exposes 14 tools covering read + active SCU surface for LLM clients (Claude Code, etc.).
 
 Use timestamps in completed entries to measure rates of progress, like:
 
@@ -357,6 +358,51 @@ Files to edit:
 Verification: select 5 `.dcm` files in Finder, drag them onto the drop zone, see them appear. Click Send Store.
 
 Acceptance: a developer can complete a C-STORE without typing or clicking through a file picker.
+
+### Phase E — Local MCP server
+
+This phase exposes NightOwl's existing capabilities to LLM clients (Claude Code, etc.) through a Model Context Protocol (MCP) server bound on the loopback interface. The goal is to make NightOwl a drivable fixture for automated DICOM testing: an agent can list studies, inspect peers, and actively send DIMSE messages without going through the GUI.
+
+#### M24 — Local MCP server (delivered 2026-05-25)
+
+Goal: an external MCP client can connect to `http://127.0.0.1:<mcp.port>/mcp` (default 7300) and call 14 tools covering the read + active SCU surface. Disabled by default; enabled from a new "Local MCP server" section in Settings. Loopback bind is the only access control — consistent with the existing "no TLS / no auth" posture documented in `PLAN.md`.
+
+Files touched:
+
+- `src-tauri/Cargo.toml` — added `rmcp = "1.7"` with the `server`, `macros`, `schemars` and `transport-streamable-http-server` features; plus `axum = "0.8"`, `tower = "0.5"`, `schemars = "1.2"`.
+- `src-tauri/src/core/config.rs` — added nested `McpConfig { enabled, port }` field on `AppConfig` (default `{ enabled: false, port: 7300 }`), `#[serde(default)]` for backwards compatibility with pre-M24 `config.json` files. Validation rejects ports below 1024, port 0, and collisions with `listen_port`, but only when `enabled` is true.
+- `src-tauri/src/core/dimse.rs`, `src-tauri/src/core/store.rs`, `src-tauri/src/core/activity.rs` — added `schemars::JsonSchema` derive to `QrRoot`, `ScuQueryKeys`, `FindLevel`, `ActivityFilter` so the rmcp tool macro can derive their input schemas. `ActivityFilter` also gained `Clone`.
+- `src-tauri/src/core/mcp.rs` (new) — `NightowlMcp` handler with 14 `#[tool]`-annotated methods (10 read tools, 4 SCU tools); typed parameter structs for each tool; a `ServerHandle` and `start_server(...)` that binds the axum router and spawns the serve loop on the tokio runtime. Four unit tests cover the error mapping and result rendering helpers.
+- `src-tauri/src/lib.rs` — `AppState` gained a `mcp: Option<ServerHandle>` field; `setup()` calls `tauri::async_runtime::block_on(mcp::start_server(...))` when `cfg.mcp.enabled`, treating bind failure as logged-and-continue rather than fatal (unlike the SCP listener, MCP is opt-in ancillary).
+- `src/lib/api.ts`, `src/pages/Settings.tsx` — `AppConfig` TypeScript interface gained the `mcp` block; Settings page renders a new "Local MCP server" section with an enable checkbox, a port input that disables when the toggle is off, and a copy-to-clipboard preview of the cross-client `mcpServers` JSON snippet (works in Claude Desktop, Claude Code's `~/.claude.json`, Cursor, etc.). The snippet is built from the SAVED port so a typed-but-unsaved port cannot mislead the consumer.
+
+Verification (commands run, output captured):
+
+    $ cd src-tauri && cargo check
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 0.28s
+
+    $ cd src-tauri && cargo test --lib
+    test result: ok. 44 passed; 0 failed; 0 ignored; 0 measured
+
+    $ npm run build
+    ✓ 1767 modules transformed, built in 1.43s
+
+End-to-end verification (still to do by the operator):
+
+1. Launch the app: `npm run tauri dev`.
+2. Open Settings → "Local MCP server" → check Enable → set port 7300 → Save. Restart NightOwl.
+3. From a terminal: `claude mcp add --transport http nightowl http://127.0.0.1:7300/mcp`.
+4. In a Claude Code session: `/mcp` should show `nightowl` connected with 14 tools.
+5. Call `list_peers` → returns the configured peers JSON.
+6. Configure a peer pointing at a local DCMTK `storescp -d 11113 PHANTOM`; call `scu_echo` with that peer's id → returns `{ "success": true, "status": 0, ... }`. The Activity page shows the inbound/outbound association events.
+
+Out of scope (deferred):
+
+- Hot-reload of the MCP server when Settings change — restart required for now. Waits for M15 (Settings hot-reload).
+- Multi-AE awareness — the MCP server sees the single-AE config only. Will follow M19.
+- Authentication and TLS on the MCP endpoint — loopback bind is the only barrier.
+- CRUD tools for peers and worklist — read + SCU only by explicit choice.
+- MCP resources and prompts — v1 exposes tools only.
 
 ## Concrete Steps
 

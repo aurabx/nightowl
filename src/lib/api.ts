@@ -6,10 +6,16 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+export interface McpConfig {
+  enabled: boolean;
+  port: number;
+}
+
 export interface AppConfig {
   local_ae_title: string;
   listen_port: number;
   store_dir: string;
+  mcp: McpConfig;
 }
 
 // Shape of the error object the backend rejects with. See

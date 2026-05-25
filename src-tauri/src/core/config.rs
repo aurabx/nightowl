@@ -31,6 +31,39 @@ pub struct AppConfig {
     /// Directory on disk that holds received SOP Instances and is the
     /// source of truth for C-FIND / C-MOVE / C-GET responses.
     pub store_dir: PathBuf,
+
+    /// Local MCP (Model Context Protocol) server settings (M24). Default
+    /// disabled. When enabled, an HTTP MCP server binds on
+    /// `127.0.0.1:<mcp.port>` so external LLM clients can drive
+    /// NightOwl's read + SCU capabilities as MCP tools.
+    ///
+    /// `#[serde(default)]` keeps existing on-disk `config.json` files
+    /// (written before M24) backwards-compatible: a missing field
+    /// deserialises to `McpConfig::default()` rather than failing.
+    #[serde(default)]
+    pub mcp: McpConfig,
+}
+
+/// MCP server settings nested inside `AppConfig`.
+///
+/// Default port `7300` is IANA-unassigned and chosen to avoid the obvious
+/// collisions: 11112 is NightOwl's DICOM listener, 11434 is Ollama. The
+/// user may override the port from the Settings page; the value is
+/// validated only when `enabled` is true so a disabled-but-malformed
+/// entry does not block saving the rest of the config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct McpConfig {
+    pub enabled: bool,
+    pub port: u16,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            port: 7300,
+        }
+    }
 }
 
 impl AppConfig {
@@ -41,6 +74,7 @@ impl AppConfig {
             local_ae_title: "NIGHTOWL".to_string(),
             listen_port: 11112,
             store_dir: home.join("dicom-store"),
+            mcp: McpConfig::default(),
         }
     }
 }
@@ -104,6 +138,38 @@ pub fn validate(cfg: &AppConfig) -> Result<(), AppError> {
         return Err(AppError::validation(
             "store_dir",
             "Store directory must be an absolute path.",
+        ));
+    }
+    validate_mcp(&cfg.mcp, cfg.listen_port)?;
+    Ok(())
+}
+
+/// Validates `mcp` only when it is enabled. A disabled-but-malformed
+/// entry is accepted so the user is not blocked from saving the rest of
+/// the config while toying with the port number.
+fn validate_mcp(mcp: &McpConfig, listen_port: u16) -> Result<(), AppError> {
+    if !mcp.enabled {
+        return Ok(());
+    }
+    if mcp.port == 0 {
+        return Err(AppError::validation(
+            "mcp.port",
+            "Port must be between 1 and 65535.",
+        ));
+    }
+    if mcp.port < 1024 {
+        return Err(AppError::validation(
+            "mcp.port",
+            "Ports below 1024 require root privileges on macOS. Choose 1024 or higher.",
+        ));
+    }
+    // Refusing to bind both services to the same port surfaces the
+    // mistake at save time rather than at the moment the second bind
+    // call fails inside `setup`.
+    if mcp.port == listen_port {
+        return Err(AppError::validation(
+            "mcp.port",
+            "MCP port must differ from the DICOM listen port.",
         ));
     }
     Ok(())
@@ -194,6 +260,65 @@ mod tests {
         let default = AppConfig::default_with_home(Path::new("/tmp"));
         let cfg = load_or_default(&tmp, default.clone()).expect("ok");
         assert_eq!(cfg, default);
+    }
+
+    #[test]
+    fn validate_accepts_default_mcp_disabled() {
+        let cfg = AppConfig::default_with_home(Path::new("/tmp"));
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_enabled_mcp_below_1024() {
+        let mut cfg = AppConfig::default_with_home(Path::new("/tmp"));
+        cfg.mcp = McpConfig {
+            enabled: true,
+            port: 80,
+        };
+        assert!(matches!(validate(&cfg), Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn validate_rejects_mcp_port_collision_with_listener() {
+        let mut cfg = AppConfig::default_with_home(Path::new("/tmp"));
+        cfg.mcp = McpConfig {
+            enabled: true,
+            port: cfg.listen_port,
+        };
+        assert!(matches!(validate(&cfg), Err(AppError::Validation(_))));
+    }
+
+    #[test]
+    fn validate_accepts_disabled_mcp_with_invalid_port() {
+        // Saving while toying with the port should not be blocked when
+        // the user has not actually enabled the server.
+        let mut cfg = AppConfig::default_with_home(Path::new("/tmp"));
+        cfg.mcp = McpConfig {
+            enabled: false,
+            port: 80,
+        };
+        assert!(validate(&cfg).is_ok());
+    }
+
+    #[test]
+    fn load_or_default_accepts_pre_m24_config_without_mcp_field() {
+        // Backwards compatibility: a config.json written before the
+        // McpConfig field existed must still load.
+        let tmp_dir = std::env::temp_dir().join("nightowl-test-pre-m24");
+        let _ = std::fs::remove_dir_all(&tmp_dir);
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        let cfg_path = tmp_dir.join("config.json");
+        std::fs::write(
+            &cfg_path,
+            br#"{"local_ae_title":"OLD","listen_port":11112,"store_dir":"/tmp/store"}"#,
+        )
+        .unwrap();
+
+        let cfg = load_or_default(&cfg_path, AppConfig::default_with_home(&tmp_dir)).unwrap();
+        assert_eq!(cfg.local_ae_title, "OLD");
+        assert_eq!(cfg.mcp, McpConfig::default());
+
+        let _ = std::fs::remove_dir_all(&tmp_dir);
     }
 
     #[test]

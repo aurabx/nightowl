@@ -53,6 +53,18 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 # Wall-clock timestamps for the activity stream.
 chrono = { version = "0.4", features = ["serde"] }
 
+# Local MCP server (M24). `rmcp` is the official Model Context Protocol
+# Rust SDK. We host a Streamable HTTP MCP service on 127.0.0.1 from
+# inside the existing Tauri tokio runtime so external LLM clients can
+# drive NightOwl's read + active SCU surface as MCP tools. `axum` and
+# `tower` provide the HTTP server the rmcp StreamableHttpService nests
+# into. `schemars` produces the JSON schemas that rmcp's `#[tool]` macro
+# exposes for each tool's input shape.
+rmcp = { version = "1.7", features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
+axum = "0.8"
+tower = "0.5"
+schemars = "1.2"
+
 [profile.release]
 panic = "abort"
 codegen-units = 1

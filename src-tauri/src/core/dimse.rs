@@ -2439,7 +2439,7 @@ impl<'a> ScuCtx<'a> {
 /// Which Q/R Information Model the SCU should use. Patient Root for
 /// queries that start from a patient identifier; Study Root for queries
 /// that start from a study/series/image identifier. PS3.4 Annex C.
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum QrRoot {
     Patient,
@@ -2466,7 +2466,7 @@ impl QrRoot {
 /// Every field is optional. Empty fields become Universal Matching
 /// (return key only). Wildcards (`*`, `?`) are allowed in PatientName
 /// and PatientID; backslash-separated UIDs become a list match.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ScuQueryKeys {
     pub patient_id: Option<String>,
