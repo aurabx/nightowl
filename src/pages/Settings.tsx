@@ -2,9 +2,11 @@ import { useEffect, useMemo, useState } from "react";
 import { Check, Copy, ShieldAlert } from "lucide-react";
 import {
   type AppConfig,
+  type McpStatus,
   formatError,
   getConfig,
   isAppError,
+  mcpStatus,
   saveConfig,
 } from "../lib/api";
 import { Field } from "../components/Field";
@@ -32,6 +34,15 @@ function buildMcpConfigSnippet(port: number): string {
   );
 }
 
+/**
+ * Builds the `claude mcp add` one-liner for Claude Code users who prefer
+ * the CLI over hand-editing `~/.claude.json`. Idempotent: re-running
+ * `claude mcp add` with the same name updates the existing entry.
+ */
+function buildMcpCliCommand(port: number): string {
+  return `claude mcp add --transport http nightowl http://127.0.0.1:${port}/mcp`;
+}
+
 const INPUT_CLASS =
   "w-full rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm " +
   "text-slate-100 focus:border-sky-500 focus:outline-none";
@@ -50,6 +61,14 @@ export function SettingsPage() {
   // snippet.
   const [mcpCopiedAt, setMcpCopiedAt] = useState<number | null>(null);
   const [mcpCopyError, setMcpCopyError] = useState<string | null>(null);
+  const [mcpCliCopiedAt, setMcpCliCopiedAt] = useState<number | null>(null);
+  const [mcpCliCopyError, setMcpCliCopyError] = useState<string | null>(null);
+  // MCP runtime status snapshot at page mount. Until M15 (Settings
+  // hot-reload), this reflects the boot-time state and only changes
+  // across app restarts; refetching after save would not change it.
+  const [mcpRuntimeStatus, setMcpRuntimeStatus] = useState<McpStatus | null>(
+    null,
+  );
 
   useEffect(() => {
     getConfig()
@@ -58,6 +77,13 @@ export function SettingsPage() {
         setDraft(cfg);
       })
       .catch((err) => setLoadError(formatError(err)));
+    mcpStatus()
+      .then(setMcpRuntimeStatus)
+      .catch(() => {
+        // mcp_status is a read-only IPC; failure here means the backend
+        // rejected the call entirely (unusual). Silently swallow and
+        // leave the badge hidden — the rest of Settings still works.
+      });
   }, []);
 
   const dirty = useMemo(() => {
@@ -81,6 +107,15 @@ export function SettingsPage() {
       setLoaded(saved);
       setDraft(saved);
       setSavedAt(Date.now());
+      // Refetch the live MCP status: M15 hot-reload may have changed
+      // the runtime state (started, stopped, rebound on a new port,
+      // or failed). The badge reflects the post-save reality.
+      try {
+        const status = await mcpStatus();
+        setMcpRuntimeStatus(status);
+      } catch {
+        // Swallowed — see the on-mount fetch.
+      }
     } catch (err: unknown) {
       if (isAppError(err) && err.kind === "Validation") {
         setFieldErrors({ [err.message.field]: err.message.reason });
@@ -99,33 +134,58 @@ export function SettingsPage() {
     setSaveError(null);
   };
 
-  // Snippet reflects the SAVED port, not the in-flight draft. Copying a
+  // Snippets reflect the SAVED port, not the in-flight draft. Copying a
   // snippet built from a port that has not been persisted would point
   // the other app at a port NightOwl is not actually listening on.
   const mcpConfigSnippet = useMemo(
     () => (loaded ? buildMcpConfigSnippet(loaded.mcp.port) : ""),
     [loaded],
   );
+  const mcpCliCommand = useMemo(
+    () => (loaded ? buildMcpCliCommand(loaded.mcp.port) : ""),
+    [loaded],
+  );
 
-  const handleCopyMcpConfig = async () => {
-    if (!mcpConfigSnippet) return;
-    setMcpCopyError(null);
+  const copyToClipboard = async (
+    body: string,
+    onSuccess: (ts: number) => void,
+    onError: (msg: string) => void,
+  ) => {
+    if (!body) return;
+    onError("");
     try {
-      await navigator.clipboard.writeText(mcpConfigSnippet);
-      setMcpCopiedAt(Date.now());
-      // Reset the "Copied!" badge after two seconds so a repeat copy
-      // visibly re-fires.
-      window.setTimeout(() => setMcpCopiedAt(null), 2000);
+      await navigator.clipboard.writeText(body);
+      onSuccess(Date.now());
     } catch (err: unknown) {
       // The Tauri webview should grant clipboard write to the in-app
       // origin, but a future capability tightening could break this.
       // Surface the failure inline so the user can fall back to
       // selecting the snippet text and copying manually.
-      setMcpCopyError(
-        err instanceof Error ? err.message : "Clipboard write failed.",
-      );
+      onError(err instanceof Error ? err.message : "Clipboard write failed.");
     }
   };
+
+  const handleCopyMcpConfig = () =>
+    copyToClipboard(
+      mcpConfigSnippet,
+      (ts) => {
+        setMcpCopyError(null);
+        setMcpCopiedAt(ts);
+        window.setTimeout(() => setMcpCopiedAt(null), 2000);
+      },
+      setMcpCopyError,
+    );
+
+  const handleCopyMcpCli = () =>
+    copyToClipboard(
+      mcpCliCommand,
+      (ts) => {
+        setMcpCliCopyError(null);
+        setMcpCliCopiedAt(ts);
+        window.setTimeout(() => setMcpCliCopiedAt(null), 2000);
+      },
+      setMcpCliCopyError,
+    );
 
   if (loadError) {
     return (
@@ -208,14 +268,22 @@ export function SettingsPage() {
       </div>
 
       <div className="mt-10">
-        <h2 className="text-lg font-semibold">Local MCP server</h2>
+        <div className="flex items-center gap-3">
+          <h2 className="text-lg font-semibold">Local MCP server</h2>
+          {mcpRuntimeStatus && <McpStatusBadge status={mcpRuntimeStatus} />}
+        </div>
         <p className="mt-1 text-sm text-slate-400">
           Optional. When enabled, NightOwl binds a Model Context Protocol server
           on <code className="rounded bg-slate-800 px-1 text-xs">127.0.0.1</code>
           {" "}so LLM clients (Claude Code, etc.) can drive NightOwl's read and
           SCU operations as MCP tools. Loopback only — no authentication.
-          Restart NightOwl after changing these settings.
+          Changes apply on save (no restart required).
         </p>
+        {mcpRuntimeStatus?.state === "failed" && (
+          <p className="mt-2 rounded border border-red-700/40 bg-red-900/20 p-2 text-xs text-red-300">
+            MCP server failed to start at boot: {mcpRuntimeStatus.reason}
+          </p>
+        )}
 
         <div className="mt-4 space-y-5">
           <label className="flex items-center gap-2 text-sm text-slate-200">
@@ -314,6 +382,55 @@ export function SettingsPage() {
                   copy manually.
                 </p>
               )}
+
+              <div className="space-y-2 pt-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-xs uppercase tracking-wide text-slate-400">
+                    Claude Code CLI
+                  </span>
+                  <button
+                    type="button"
+                    onClick={handleCopyMcpCli}
+                    aria-label="Copy claude mcp add command to clipboard"
+                    className={
+                      "inline-flex items-center gap-1.5 rounded border border-slate-700 " +
+                      "bg-slate-800 px-2.5 py-1 text-xs text-slate-200 " +
+                      "hover:border-slate-500 hover:bg-slate-700"
+                    }
+                  >
+                    {mcpCliCopiedAt ? (
+                      <>
+                        <Check className="size-3.5 text-emerald-400" />
+                        Copied
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="size-3.5" />
+                        Copy
+                      </>
+                    )}
+                  </button>
+                </div>
+                <pre
+                  className={
+                    "overflow-x-auto rounded border border-slate-700 bg-slate-950 " +
+                    "p-3 text-xs text-slate-200"
+                  }
+                >
+                  {mcpCliCommand}
+                </pre>
+                <p className="text-xs text-slate-500">
+                  Run this in a terminal to register the server with Claude
+                  Code. Idempotent — re-running it updates the existing
+                  entry.
+                </p>
+                {mcpCliCopyError && (
+                  <p className="text-xs text-red-400">
+                    Could not copy: {mcpCliCopyError}. Select the text above
+                    and copy manually.
+                  </p>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -363,5 +480,41 @@ export function SettingsPage() {
         </div>
       </div>
     </section>
+  );
+}
+
+/**
+ * Small pill that reports whether the MCP server is currently bound,
+ * disabled, or failed to start. Reflects the boot-time state — toggling
+ * settings does not update it until M15 (Settings hot-reload).
+ */
+function McpStatusBadge({ status }: { status: McpStatus }) {
+  if (status.state === "running") {
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 rounded-full border border-emerald-700/40 bg-emerald-900/30 px-2 py-0.5 text-xs text-emerald-300"
+        title={`Listening on ${status.bind_addr}`}
+      >
+        <span className="size-1.5 rounded-full bg-emerald-400" />
+        Running on {status.bind_addr}
+      </span>
+    );
+  }
+  if (status.state === "failed") {
+    return (
+      <span
+        className="inline-flex items-center gap-1.5 rounded-full border border-red-700/40 bg-red-900/30 px-2 py-0.5 text-xs text-red-300"
+        title={status.reason}
+      >
+        <span className="size-1.5 rounded-full bg-red-400" />
+        Failed
+      </span>
+    );
+  }
+  return (
+    <span className="inline-flex items-center gap-1.5 rounded-full border border-slate-700 bg-slate-800 px-2 py-0.5 text-xs text-slate-400">
+      <span className="size-1.5 rounded-full bg-slate-500" />
+      Disabled
+    </span>
   );
 }

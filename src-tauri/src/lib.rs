@@ -21,28 +21,37 @@ use core::dimse::{
     ScpContext, ScuEchoResult, ScuFindResult, ScuMoveResult, ScuQueryKeys, ScuStoreOutcome,
 };
 use core::error::AppError;
-use core::mcp;
+use core::mcp::{self, McpRuntimeState, McpStatus};
 use core::peers::{NewPeer, Peer, PeerStore, UpdatePeer};
 use core::store::{FindLevel, Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
 use core::worklist::{NewWorklistEntry, WorklistEntry, WorklistStore};
 
 /// Process-wide state shared across Tauri commands.
+///
+/// M15 wraps the SCP listener and the MCP runtime state in `Mutex` so
+/// `save_config` can swap them in place when the user changes the port,
+/// AE Title, store directory, or MCP toggle from Settings — no restart
+/// required. The Mutexes are held only across the swap (microseconds),
+/// never across an `.await`.
 struct AppState {
     config: Mutex<AppConfig>,
-    /// SOP Instance index. Cloning the `Arc` is the cheap way to share
-    /// the SQLite-backed store with the background rescan task and
-    /// every command thread.
+    /// SOP Instance index. The SQLite database itself is at the fixed
+    /// path `<app config dir>/store.sqlite` and is never swapped. Only
+    /// the directory it scans (`AppConfig.store_dir`) is user-mutable,
+    /// and that triggers an SCP rebind (so the new `ScpContext.store_dir`
+    /// is in force) without touching the index database.
     index: Arc<Index>,
-    /// DIMSE SCP listener handle. Kept alive for the process lifetime;
-    /// dropping shuts the listener down.
-    #[allow(dead_code)]
-    listener: ListenerHandle,
-    /// Local MCP server handle (M24). `None` when the server is
-    /// disabled in `AppConfig.mcp.enabled` or when bind failed at
-    /// boot. Held purely to keep the background serve task alive for
-    /// the process lifetime.
-    #[allow(dead_code)]
-    mcp: Option<mcp::ServerHandle>,
+    /// DIMSE SCP listener handle. Replaced by `save_config` when the
+    /// AE Title, port, or store directory changes. `None` after a
+    /// failed rebind — the previous listener has already been shut
+    /// down at that point, and the user has to fix the config and
+    /// save again to bring it back.
+    listener: Mutex<Option<ListenerHandle>>,
+    /// Local MCP server runtime state (M24). Carries the live
+    /// `ServerHandle` when running, the reason string when start failed,
+    /// or `Disabled` when the user has not opted in. Replaced by
+    /// `save_config` when `mcp.enabled` or `mcp.port` changes.
+    mcp: Mutex<McpRuntimeState>,
 }
 
 // The activity log is managed as its own `Arc<ActivityLog>` (separate
@@ -112,6 +121,34 @@ fn get_config(state: State<'_, AppState>) -> Result<AppConfig, AppError> {
     read_config(&state)
 }
 
+/// Returns the live MCP server runtime status. The frontend renders a
+/// badge from this in the Settings page so the user sees whether the
+/// server is actually bound (and on what address), failed at boot or a
+/// hot-reload (with the failure reason), or is intentionally disabled.
+#[tauri::command]
+fn mcp_status(state: State<'_, AppState>) -> Result<McpStatus, AppError> {
+    let guard = state
+        .mcp
+        .lock()
+        .map_err(|_| AppError::Internal("mcp mutex poisoned".to_string()))?;
+    Ok(guard.status())
+}
+
+/// Validates the new config, persists it to disk, swaps the in-memory
+/// copy, and applies any rebinds the change implies — no app restart
+/// required (M15).
+///
+/// Rebind triggers:
+/// - SCP listener: `local_ae_title`, `listen_port`, or `store_dir`
+///   changed. The new bind is pre-validated (when the port also
+///   changed) before the old listener is torn down, so a port that is
+///   already in use surfaces as a save error without leaving the user
+///   without a listener.
+/// - MCP server: `mcp.enabled` or `mcp.port` changed. Old server is
+///   gracefully shut down, new server starts in its place. Bind
+///   failure transitions `mcp` to the `Failed` state rather than
+///   propagating the error — MCP is opt-in ancillary and the rest of
+///   the config save should still succeed.
 #[tauri::command]
 fn save_config(
     app: AppHandle,
@@ -120,12 +157,190 @@ fn save_config(
 ) -> Result<AppConfig, AppError> {
     let path = config_path(&app)?;
     save(&path, &cfg)?;
-    let mut guard = state
-        .config
-        .lock()
-        .map_err(|_| AppError::Internal("config mutex poisoned".to_string()))?;
-    *guard = cfg.clone();
+
+    let old_cfg = {
+        let mut guard = state
+            .config
+            .lock()
+            .map_err(|_| AppError::Internal("config mutex poisoned".to_string()))?;
+        let old = guard.clone();
+        *guard = cfg.clone();
+        old
+    };
+
+    if cfg.local_ae_title != old_cfg.local_ae_title
+        || cfg.listen_port != old_cfg.listen_port
+        || cfg.store_dir != old_cfg.store_dir
+    {
+        // SCP rebind failure is fatal to the save: without a listener
+        // the app is non-functional for inbound DICOM, and the user
+        // needs to know immediately so they can revert or pick a
+        // different port.
+        rebind_scp(&app, &state, &cfg)?;
+    }
+
+    if cfg.mcp != old_cfg.mcp {
+        rebind_mcp(&app, &state, &cfg);
+    }
+
     Ok(cfg)
+}
+
+/// Rebuilds the `ScpContext` from current state + the new config, then
+/// swaps the listener atomically.
+///
+/// Strategy:
+/// 1. If the port changed, do a throwaway test-bind on the new port
+///    first. Catches "port already in use" before tearing down the old
+///    listener. Same-port rebinds (AE Title or store_dir only) skip
+///    this — the old listener is on that port, so a test would always
+///    fail.
+/// 2. Shut down the old listener (joins its accept thread → port
+///    released).
+/// 3. Start the new listener. Failure leaves `state.listener` empty
+///    and returns the error to the caller.
+fn rebind_scp(
+    app: &AppHandle,
+    state: &State<'_, AppState>,
+    cfg: &AppConfig,
+) -> Result<(), AppError> {
+    let old_port = {
+        let guard = state
+            .listener
+            .lock()
+            .map_err(|_| AppError::Internal("listener mutex poisoned".to_string()))?;
+        guard.as_ref().map(|l| l.bind_port())
+    };
+    if Some(cfg.listen_port) != old_port {
+        try_test_bind(cfg.listen_port)?;
+    }
+
+    let peers = app
+        .try_state::<Arc<PeerStore>>()
+        .ok_or_else(|| AppError::Internal("peers state missing".to_string()))?
+        .inner()
+        .clone();
+    let worklist = app
+        .try_state::<Arc<WorklistStore>>()
+        .ok_or_else(|| AppError::Internal("worklist state missing".to_string()))?
+        .inner()
+        .clone();
+    let scp = Arc::new(ScpContext {
+        index: state.index.clone(),
+        store_dir: cfg.store_dir.clone(),
+        peers,
+        local_ae_title: cfg.local_ae_title.clone(),
+        worklist,
+    });
+
+    let old = {
+        let mut guard = state
+            .listener
+            .lock()
+            .map_err(|_| AppError::Internal("listener mutex poisoned".to_string()))?;
+        guard.take()
+    };
+    if let Some(old) = old {
+        old.shutdown();
+    }
+
+    let new_listener = start_listener(
+        cfg.listen_port,
+        cfg.local_ae_title.clone(),
+        app.clone(),
+        scp,
+    )?;
+
+    let mut guard = state
+        .listener
+        .lock()
+        .map_err(|_| AppError::Internal("listener mutex poisoned".to_string()))?;
+    *guard = Some(new_listener);
+    tracing::info!(port = cfg.listen_port, ae = %cfg.local_ae_title, "SCP rebound");
+    Ok(())
+}
+
+/// Shuts down the previous MCP server (if any) and starts a new one
+/// when the new config has it enabled. Errors are absorbed into
+/// `McpRuntimeState::Failed` rather than propagated — see the
+/// `save_config` doc comment.
+fn rebind_mcp(app: &AppHandle, state: &State<'_, AppState>, cfg: &AppConfig) {
+    let old = {
+        let mut guard = match state.mcp.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                tracing::error!("mcp mutex poisoned during rebind");
+                return;
+            }
+        };
+        std::mem::replace(&mut *guard, McpRuntimeState::Disabled)
+    };
+    if let McpRuntimeState::Running(handle) = old {
+        // Block_on is OK here: we are inside a sync Tauri command, and
+        // `shutdown` is bounded by the graceful-shutdown future plus
+        // serve-task await — typically sub-second.
+        tauri::async_runtime::block_on(handle.shutdown());
+    }
+
+    let new_state = if cfg.mcp.enabled {
+        match build_and_start_mcp(app, state.index.clone(), cfg) {
+            Ok(handle) => McpRuntimeState::Running(handle),
+            Err(reason) => {
+                tracing::error!(error = %reason, port = cfg.mcp.port, "MCP rebind failed");
+                McpRuntimeState::Failed(reason)
+            }
+        }
+    } else {
+        McpRuntimeState::Disabled
+    };
+
+    if let Ok(mut guard) = state.mcp.lock() {
+        *guard = new_state;
+    }
+}
+
+/// Fetches the Arc-shared stores from Tauri-managed state and starts a
+/// fresh MCP server. Errors are stringified for storage in
+/// `McpRuntimeState::Failed`.
+fn build_and_start_mcp(
+    app: &AppHandle,
+    index: Arc<Index>,
+    cfg: &AppConfig,
+) -> Result<mcp::ServerHandle, String> {
+    let activity = app
+        .try_state::<Arc<ActivityLog>>()
+        .ok_or_else(|| "activity log state missing".to_string())?
+        .inner()
+        .clone();
+    let peers = app
+        .try_state::<Arc<PeerStore>>()
+        .ok_or_else(|| "peers state missing".to_string())?
+        .inner()
+        .clone();
+    let worklist = app
+        .try_state::<Arc<WorklistStore>>()
+        .ok_or_else(|| "worklist state missing".to_string())?
+        .inner()
+        .clone();
+    tauri::async_runtime::block_on(mcp::start_server(
+        Some(app.clone()),
+        cfg.clone(),
+        index,
+        peers,
+        worklist,
+        activity,
+    ))
+    .map_err(|e| e.to_string())
+}
+
+/// Verifies a port is bindable by opening and immediately dropping a
+/// throwaway listener. Used by `rebind_scp` to fail fast before tearing
+/// down the active listener.
+fn try_test_bind(port: u16) -> Result<(), AppError> {
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let _probe = std::net::TcpListener::bind(addr)
+        .map_err(|e| AppError::Io(format!("bind {addr} failed: {e}")))?;
+    Ok(())
 }
 
 /// Walks the configured store directory and re-ingests every file.
@@ -429,30 +644,31 @@ pub fn run() {
             // ancillary — bind failure logs an error and continues, so
             // a busy port does not block app launch the way an SCP
             // bind failure does.
-            let mcp_handle = if cfg.mcp.enabled {
+            let mcp_state = if cfg.mcp.enabled {
                 match tauri::async_runtime::block_on(mcp::start_server(
-                    handle.clone(),
+                    Some(handle.clone()),
                     cfg.clone(),
                     idx.clone(),
                     peers.clone(),
                     worklist.clone(),
                     activity.clone(),
                 )) {
-                    Ok(h) => Some(h),
+                    Ok(h) => McpRuntimeState::Running(h),
                     Err(err) => {
-                        tracing::error!(error = %err, port = cfg.mcp.port, "MCP server failed to start");
-                        None
+                        let reason = err.to_string();
+                        tracing::error!(error = %reason, port = cfg.mcp.port, "MCP server failed to start");
+                        McpRuntimeState::Failed(reason)
                     }
                 }
             } else {
-                None
+                McpRuntimeState::Disabled
             };
 
             app.manage(AppState {
                 config: Mutex::new(cfg.clone()),
                 index: idx.clone(),
-                listener,
-                mcp: mcp_handle,
+                listener: Mutex::new(Some(listener)),
+                mcp: Mutex::new(mcp_state),
             });
 
             // Initial background scan so the Store page is populated
@@ -485,6 +701,7 @@ pub fn run() {
             open_url,
             get_config,
             save_config,
+            mcp_status,
             rescan_store,
             list_studies,
             list_series_for_study,

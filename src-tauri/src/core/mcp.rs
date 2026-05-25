@@ -35,6 +35,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use tauri::AppHandle;
 use tokio::net::TcpListener;
+use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
 use super::activity::{ActivityFilter, ActivityLog};
@@ -51,22 +52,73 @@ use super::worklist::WorklistStore;
 
 /// Owns the background task serving the MCP HTTP endpoint.
 ///
-/// The task lives for the process lifetime. Dropping the handle drops
-/// the `JoinHandle`, which detaches but does not abort the task; the
-/// underlying tokio runtime cleanup (on app exit) tears the listener
-/// down. Hot-reload of the server is out of scope for v1 — toggling
-/// `AppConfig.mcp` in Settings requires an app restart to take effect.
+/// `shutdown` carries a oneshot sender wired to axum's graceful
+/// shutdown future; sending on it causes the serve loop to stop
+/// accepting and drain. `serve_task` is awaited after the signal so
+/// the port is fully released before this returns. Both are wrapped
+/// in `Mutex<Option<...>>` so `shutdown()` is idempotent via a
+/// `&self` receiver — second calls find empty options and return
+/// quickly.
 pub struct ServerHandle {
-    /// Effective bind address (useful for telemetry / future hot-reload
-    /// status panels). Currently read only via tracing in
-    /// `start_server`; the field is preserved for future consumers.
-    #[allow(dead_code)]
     pub bind_addr: SocketAddr,
-    /// Background HTTP serve task. Kept alive for the process lifetime;
-    /// dropping the handle detaches the task — the tokio runtime
-    /// teardown on app exit closes the listener.
-    #[allow(dead_code)]
-    serve_task: JoinHandle<()>,
+    shutdown: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+    serve_task: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+impl ServerHandle {
+    /// Stops the server gracefully: signals axum to exit its serve
+    /// loop, waits for the serve task to finish so the bound port is
+    /// fully released, then returns. Safe to call multiple times.
+    pub async fn shutdown(&self) {
+        let tx = self.shutdown.lock().ok().and_then(|mut g| g.take());
+        if let Some(tx) = tx {
+            let _ = tx.send(());
+        }
+        let task = self.serve_task.lock().ok().and_then(|mut g| g.take());
+        if let Some(task) = task {
+            let _ = task.await;
+        }
+    }
+}
+
+/// Runtime state of the MCP server, held by the Tauri-managed
+/// `AppState`. The serialisable projection used by the frontend is
+/// `McpStatus` below.
+pub enum McpRuntimeState {
+    /// `AppConfig.mcp.enabled` was false at boot.
+    Disabled,
+    /// Bind succeeded; the server is serving requests.
+    Running(ServerHandle),
+    /// Enabled in config but bind / start failed at boot. Held so the
+    /// UI can surface the error inline rather than silently saying
+    /// "disabled".
+    Failed(String),
+}
+
+/// Serialisable view of `McpRuntimeState` returned to the frontend via
+/// the `mcp_status` Tauri command. Discriminated by `state` for the
+/// same TypeScript pattern the existing `AppError` discriminated union
+/// uses.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "state", rename_all = "lowercase")]
+pub enum McpStatus {
+    Disabled,
+    Running { bind_addr: String },
+    Failed { reason: String },
+}
+
+impl McpRuntimeState {
+    pub fn status(&self) -> McpStatus {
+        match self {
+            McpRuntimeState::Disabled => McpStatus::Disabled,
+            McpRuntimeState::Running(handle) => McpStatus::Running {
+                bind_addr: handle.bind_addr.to_string(),
+            },
+            McpRuntimeState::Failed(reason) => McpStatus::Failed {
+                reason: reason.clone(),
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -178,7 +230,13 @@ impl From<&AppConfig> for PublicConfig {
 /// increment) and `AppHandle` (Tauri's own internal Arc).
 #[derive(Clone)]
 pub struct NightowlMcp {
-    app: AppHandle,
+    /// Tauri app handle, used by the SCU tools to emit DICOM activity
+    /// events through `core::dimse::emit`. `Option` so the
+    /// `core::mcp::tests::end_to_end_initialize` integration test can
+    /// construct a handler without a Tauri runtime; production always
+    /// passes `Some`. SCU tool calls return an internal error if it is
+    /// `None`, which never happens in production.
+    app: Option<AppHandle>,
     config: AppConfig,
     index: Arc<Index>,
     peers: Arc<PeerStore>,
@@ -194,7 +252,7 @@ pub struct NightowlMcp {
 #[tool_router]
 impl NightowlMcp {
     pub fn new(
-        app: AppHandle,
+        app: Option<AppHandle>,
         config: AppConfig,
         index: Arc<Index>,
         peers: Arc<PeerStore>,
@@ -210,6 +268,20 @@ impl NightowlMcp {
             activity,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// Returns a cloned `AppHandle` for SCU tools that need to emit
+    /// activity events. Returns an internal error in the (test-only)
+    /// case where the handler was constructed without a handle.
+    fn require_app(&self) -> Result<AppHandle, McpError> {
+        self.app.clone().ok_or_else(|| {
+            McpError::internal_error(
+                "SCU tools require a Tauri app handle; this server was \
+                 constructed without one (test mode)."
+                    .to_string(),
+                None,
+            )
+        })
     }
 
     // ----- Read tools (10) -----
@@ -323,7 +395,7 @@ impl NightowlMcp {
     ) -> Result<CallToolResult, McpError> {
         let peer = resolve_peer(&self.peers, &params.peer_id).map_err(to_mcp_err)?;
         let local_ae = self.config.local_ae_title.clone();
-        let app = self.app.clone();
+        let app = self.require_app()?;
         let result = tauri::async_runtime::spawn_blocking(move || {
             dimse::scu_echo(&app, &local_ae, &peer)
         })
@@ -342,7 +414,7 @@ impl NightowlMcp {
     ) -> Result<CallToolResult, McpError> {
         let peer = resolve_peer(&self.peers, &params.peer_id).map_err(to_mcp_err)?;
         let local_ae = self.config.local_ae_title.clone();
-        let app = self.app.clone();
+        let app = self.require_app()?;
         let ScuFindParams {
             root, level, keys, ..
         } = params;
@@ -364,7 +436,7 @@ impl NightowlMcp {
     ) -> Result<CallToolResult, McpError> {
         let peer = resolve_peer(&self.peers, &params.peer_id).map_err(to_mcp_err)?;
         let local_ae = self.config.local_ae_title.clone();
-        let app = self.app.clone();
+        let app = self.require_app()?;
         let ScuMoveParams {
             root,
             level,
@@ -390,7 +462,7 @@ impl NightowlMcp {
     ) -> Result<CallToolResult, McpError> {
         let peer = resolve_peer(&self.peers, &params.peer_id).map_err(to_mcp_err)?;
         let local_ae = self.config.local_ae_title.clone();
-        let app = self.app.clone();
+        let app = self.require_app()?;
         let paths: Vec<PathBuf> = params.files.into_iter().map(PathBuf::from).collect();
         let outcomes = tauri::async_runtime::spawn_blocking(move || {
             dimse::scu_store(&app, &local_ae, &peer, &paths)
@@ -439,7 +511,7 @@ impl ServerHandler for NightowlMcp {
 /// rather than panicking — the caller in `lib.rs::setup` logs the error
 /// and continues, treating MCP as ancillary.
 pub async fn start_server(
-    app: AppHandle,
+    app: Option<AppHandle>,
     config: AppConfig,
     index: Arc<Index>,
     peers: Arc<PeerStore>,
@@ -465,8 +537,18 @@ pub async fn start_server(
         .map_err(|e| AppError::Internal(format!("mcp bind {addr} failed: {e}")))?;
     let bind_addr = listener.local_addr().unwrap_or(addr);
 
+    let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
     let serve_task = tokio::spawn(async move {
-        if let Err(err) = axum::serve(listener, router).await {
+        let outcome = axum::serve(listener, router)
+            .with_graceful_shutdown(async move {
+                // Treat sender-dropped as "exit anyway" — equivalent to
+                // an explicit shutdown signal. This avoids the serve
+                // loop outliving the ServerHandle if the handle gets
+                // dropped without an explicit shutdown call.
+                let _ = shutdown_rx.await;
+            })
+            .await;
+        if let Err(err) = outcome {
             tracing::error!(error = %err, "mcp serve loop exited with error");
         }
     });
@@ -475,7 +557,8 @@ pub async fn start_server(
 
     Ok(ServerHandle {
         bind_addr,
-        serve_task,
+        shutdown: std::sync::Mutex::new(Some(shutdown_tx)),
+        serve_task: std::sync::Mutex::new(Some(serve_task)),
     })
 }
 
@@ -592,5 +675,182 @@ mod tests {
         let json = serde_json::to_string(&public).unwrap();
         assert!(!json.contains("mcp"));
         assert!(json.contains("local_ae_title"));
+    }
+
+    /// Every tool advertised in the M24 plan must register through the
+    /// `#[tool]` macro expansion. This test catches accidental drops
+    /// (e.g. a macro typo that silently omits a method from the router)
+    /// without needing to boot the HTTP transport or mock an AppHandle.
+    /// The static `Self::tool_router()` constructor generated by
+    /// `#[tool_router]` returns a `ToolRouter<Self>` we can introspect.
+    #[test]
+    fn tool_router_registers_every_documented_tool() {
+        let router = NightowlMcp::tool_router();
+        let expected = [
+            "get_config",
+            "list_peers",
+            "list_studies",
+            "list_series_for_study",
+            "list_instances_for_series",
+            "count_instances",
+            "rescan_store",
+            "list_worklist",
+            "list_activity",
+            "count_activity",
+            "scu_echo",
+            "scu_find",
+            "scu_move",
+            "scu_store",
+        ];
+        for name in expected {
+            assert!(
+                router.has_route(name),
+                "MCP tool `{name}` is missing from the router — \
+                 the #[tool] macro likely failed to register it.",
+            );
+        }
+        // Reverse direction: catch tools that exist but are not
+        // documented. A new tool added without updating this list and
+        // the PLAN-NEXT.md M24 entry is a documentation drift bug.
+        let registered: Vec<String> = router
+            .list_all()
+            .into_iter()
+            .map(|t| t.name.to_string())
+            .collect();
+        assert_eq!(
+            registered.len(),
+            expected.len(),
+            "tool count drifted: expected {} ({:?}), router has {} ({:?})",
+            expected.len(),
+            expected,
+            registered.len(),
+            registered,
+        );
+    }
+
+    /// End-to-end smoke test: boot the real MCP server on a random
+    /// loopback port, POST a JSON-RPC `initialize` request via HTTP,
+    /// and assert the response contains `serverInfo`. Verifies the
+    /// entire rmcp + axum + JSON-RPC wiring without going through
+    /// Claude Code or any other external client.
+    ///
+    /// The handler is constructed with `None` for the Tauri app handle
+    /// (production always passes `Some`). All read tools work without
+    /// it; the four SCU tools would return an internal error if called,
+    /// which is fine — we only exercise the protocol envelope here.
+    #[tokio::test]
+    async fn end_to_end_initialize_returns_server_info() {
+        let tmp = std::env::temp_dir().join(format!(
+            "nightowl-mcp-e2e-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        let index = std::sync::Arc::new(
+            crate::core::store::Index::open(&tmp.join("store.sqlite")).expect("open index"),
+        );
+        let peers = std::sync::Arc::new(
+            crate::core::peers::PeerStore::open(&tmp.join("peers.json")).expect("open peers"),
+        );
+        let worklist = std::sync::Arc::new(
+            crate::core::worklist::WorklistStore::open(&tmp.join("worklist.sqlite"))
+                .expect("open worklist"),
+        );
+        let activity = std::sync::Arc::new(
+            crate::core::activity::ActivityLog::open(&tmp.join("activity.sqlite"))
+                .expect("open activity"),
+        );
+
+        // Port 0 → OS picks a free ephemeral port. The actual bound
+        // address comes back via `handle.bind_addr`.
+        let mut cfg = AppConfig::default_with_home(&tmp);
+        cfg.mcp = crate::core::config::McpConfig {
+            enabled: true,
+            port: 0,
+        };
+
+        let handle = start_server(None, cfg, index, peers, worklist, activity)
+            .await
+            .expect("start_server");
+        let bind = handle.bind_addr;
+
+        // JSON-RPC initialize. The protocol version is the original MCP
+        // spec version — broadly supported by rmcp 1.7. The
+        // Mcp-Protocol-Version header is required by rmcp's streamable
+        // HTTP transport for initialize requests.
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": { "name": "nightowl-test", "version": "0.0.0" }
+            }
+        });
+
+        let client = reqwest::Client::new();
+        let response = client
+            .post(format!("http://{bind}/mcp"))
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .json(&body)
+            .send()
+            .await
+            .expect("HTTP POST initialize");
+
+        assert!(
+            response.status().is_success(),
+            "initialize HTTP status: {}",
+            response.status(),
+        );
+        let body = response.text().await.expect("read body");
+        // The server may respond with plain JSON or with an SSE stream
+        // (`data: {...}\n\n`). Either way, a successful initialise
+        // result contains `serverInfo` — a substring match is enough
+        // to confirm the wiring without coupling to the exact wire
+        // format.
+        assert!(
+            body.contains("serverInfo"),
+            "initialize response missing serverInfo. Body was:\n{body}",
+        );
+
+        handle.shutdown().await;
+
+        // Best-effort cleanup; failure is harmless (temp).
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    /// Sanity-check the schemars-derived input schema for a tool that
+    /// takes a non-trivial structured input. If `JsonSchema` ever stops
+    /// being derived on `ScuQueryKeys` or its surrounding wrapper, the
+    /// rmcp macro will fall back to an `any` schema and clients lose
+    /// per-field hinting. We assert the schema mentions the field names
+    /// rather than depending on the exact JSON Schema spelling, which
+    /// can vary between schemars releases.
+    #[test]
+    fn scu_find_tool_input_schema_includes_query_fields() {
+        let router = NightowlMcp::tool_router();
+        let tool = router
+            .get("scu_find")
+            .expect("scu_find tool registered");
+        let schema = serde_json::to_string(&tool.input_schema)
+            .expect("serialise input schema");
+        for needle in [
+            "peer_id",
+            "root",
+            "level",
+            "keys",
+            "patient_id",
+            "study_instance_uid",
+        ] {
+            assert!(
+                schema.contains(needle),
+                "scu_find input schema is missing field `{needle}`: {schema}",
+            );
+        }
     }
 }

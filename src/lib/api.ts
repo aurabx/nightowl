@@ -95,6 +95,18 @@ export function saveConfig(cfg: AppConfig): Promise<AppConfig> {
   return invoke<AppConfig>("save_config", { cfg });
 }
 
+// --- MCP server (M24) ------------------------------------------------
+
+/** Discriminated union mirroring `core::mcp::McpStatus`. */
+export type McpStatus =
+  | { state: "disabled" }
+  | { state: "running"; bind_addr: string }
+  | { state: "failed"; reason: string };
+
+export function mcpStatus(): Promise<McpStatus> {
+  return invoke<McpStatus>("mcp_status");
+}
+
 export function ping(): Promise<string> {
   return invoke<string>("ping");
 }

@@ -214,10 +214,19 @@ pub struct ScpContext {
 }
 
 /// Handle to the running SCP listener. Holding this struct alive is
-/// what keeps the listener bound; dropping the inner `shutdown` flag
-/// causes the accept loop to exit on its next iteration.
+/// what keeps the listener bound; calling `shutdown()` stops the
+/// accept loop and joins its thread, releasing the port.
+///
+/// `bind_port` is stored so `shutdown` can connect to the listener
+/// to unblock its `accept()` call — the standard library's blocking
+/// TCP listener has no other portable interrupt mechanism. The join
+/// handle is wrapped in `Mutex<Option<...>>` so `shutdown` can take
+/// it through a `&self` receiver (idempotent: second call is a
+/// no-op).
 pub struct ListenerHandle {
     shutdown: Arc<AtomicBool>,
+    bind_port: u16,
+    join: std::sync::Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// The full set of Storage SOP Classes Phantom accepts as a C-STORE
@@ -236,12 +245,40 @@ const STORAGE_SOP_CLASSES: &[&str] = &[
 ];
 
 impl ListenerHandle {
-    /// Asks the accept loop to stop. Currently best-effort: the loop
-    /// only checks between `accept()` calls. Reserved for the M3+
-    /// follow-up where Settings rebinds the listener on port change.
-    #[allow(dead_code)]
+    /// Returns the TCP port the listener is currently bound to. Used by
+    /// `lib.rs::rebind_scp` to detect whether a config change actually
+    /// requires a port pre-validation step.
+    pub fn bind_port(&self) -> u16 {
+        self.bind_port
+    }
+
+    /// Asks the accept loop to stop and joins its thread.
+    ///
+    /// The accept loop only checks the shutdown flag between blocking
+    /// `accept()` calls, so we wake it by opening a one-shot TCP
+    /// connection to the bound port — the loop returns from `accept`,
+    /// sees the flag, and exits. The wake connection itself is treated
+    /// as a normal incoming association by the handler thread, which
+    /// will immediately fail negotiation; that is acceptable noise in
+    /// the activity log compared with the alternative of carrying
+    /// non-blocking polling.
+    ///
+    /// Idempotent: a second call is a no-op (the atomic swap returns
+    /// the previous true value).
     pub fn shutdown(&self) {
-        self.shutdown.store(true, Ordering::SeqCst);
+        if self.shutdown.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let wake_addr = SocketAddr::from(([127, 0, 0, 1], self.bind_port));
+        let _ = std::net::TcpStream::connect_timeout(
+            &wake_addr,
+            std::time::Duration::from_millis(500),
+        );
+        if let Ok(mut guard) = self.join.lock() {
+            if let Some(handle) = guard.take() {
+                let _ = handle.join();
+            }
+        }
     }
 }
 
@@ -275,7 +312,7 @@ pub fn start_listener(
     let ae_for_thread = local_ae_title.clone();
     let scp_for_thread = scp.clone();
 
-    std::thread::Builder::new()
+    let join = std::thread::Builder::new()
         .name("phantom-scp-accept".to_string())
         .spawn(move || {
             run_accept_loop(
@@ -302,7 +339,11 @@ pub fn start_listener(
         },
     );
 
-    Ok(ListenerHandle { shutdown })
+    Ok(ListenerHandle {
+        shutdown,
+        bind_port: bind_addr.port(),
+        join: std::sync::Mutex::new(Some(join)),
+    })
 }
 
 fn run_accept_loop(

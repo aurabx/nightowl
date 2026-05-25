@@ -2367,6 +2367,7 @@ dependencies = [
  "dicom-object",
  "dicom-transfer-syntax-registry",
  "dicom-ul",
+ "reqwest",
  "rmcp",
  "rusqlite",
  "schemars 1.2.1",

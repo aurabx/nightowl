@@ -71,3 +71,6 @@ codegen-units = 1
 lto = true
 opt-level = "s"
 strip = true
+
+[dev-dependencies]
+reqwest = { version = "0.13.3", default-features = false, features = ["json"] }

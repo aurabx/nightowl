@@ -26,7 +26,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 
 - [ ] M13: MPPS SCP (N-CREATE + N-SET handler over the existing dispatch loop). A modality can post a Performed Procedure Step and update its status.
 - [ ] M14: Storage Commitment SCP (N-ACTION request handler + N-EVENT-REPORT outbound). A peer can ask Phantom to confirm storage and gets a structured event back.
-- [ ] M15: Settings hot-reload — changing AE Title / port / store dir no longer requires restart. The SCP listener rebinds in place; the index re-opens against the new directory.
+- [x] (2026-05-25) M15: Settings hot-reload — changing AE Title / port / store dir / MCP enabled / MCP port applies on save without an app restart. `save_config` orchestrates SCP and MCP rebinds; SCP failure is fatal to the save (port pre-validated on port change), MCP failure transitions the runtime state to `Failed` and surfaces in the Settings status badge. The SQLite index path itself stays fixed (per the existing M15 decision).
 - [ ] M16: Filesystem watcher on the store directory. New `.dcm` files dropped into the directory get indexed within seconds without the user clicking "Rescan now".
 - [ ] M17: Native folder picker for the Settings store directory and the SCU C-STORE file list. Uses `tauri-plugin-dialog`.
 - [ ] M18: TLS associations. Phantom can serve and consume DICOM over TLS using `rustls`; per-peer TLS toggles and an optional CA file path in Settings.
@@ -396,9 +396,15 @@ End-to-end verification (still to do by the operator):
 5. Call `list_peers` → returns the configured peers JSON.
 6. Configure a peer pointing at a local DCMTK `storescp -d 11113 PHANTOM`; call `scu_echo` with that peer's id → returns `{ "success": true, "status": 0, ... }`. The Activity page shows the inbound/outbound association events.
 
+Follow-ups landed alongside M24 (2026-05-25):
+
+- `core::mcp::tests::tool_router_registers_every_documented_tool` — introspection test that catches accidental drops or additions to the 14-tool surface.
+- `core::mcp::tests::scu_find_tool_input_schema_includes_query_fields` — verifies schemars actually derives a real schema (not the fallback `any`) for the structured-input tool.
+- New `mcp_status` Tauri command + `McpStatusBadge` component — Settings now shows a live running/disabled/failed pill next to the section header, with the bound address.
+- Second copy button for the `claude mcp add` CLI one-liner alongside the JSON snippet, for Claude Code users who prefer the CLI over hand-editing `~/.claude.json`.
+
 Out of scope (deferred):
 
-- Hot-reload of the MCP server when Settings change — restart required for now. Waits for M15 (Settings hot-reload).
 - Multi-AE awareness — the MCP server sees the single-AE config only. Will follow M19.
 - Authentication and TLS on the MCP endpoint — loopback bind is the only barrier.
 - CRUD tools for peers and worklist — read + SCU only by explicit choice.
