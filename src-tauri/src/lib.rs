@@ -391,6 +391,14 @@ fn total_instance_count(state: State<'_, AppState>) -> Result<i64, AppError> {
     state.index.total_instance_count()
 }
 
+#[tauri::command]
+fn list_instance_files_for_studies(
+    state: State<'_, AppState>,
+    study_uids: Vec<String>,
+) -> Result<Vec<String>, AppError> {
+    state.index.list_instance_files_for_studies(&study_uids)
+}
+
 // --- Activity log (M9) -----------------------------------------------
 
 #[tauri::command]
@@ -707,6 +715,7 @@ pub fn run() {
             list_series_for_study,
             list_instances_for_series,
             total_instance_count,
+            list_instance_files_for_studies,
             list_activity,
             clear_activity,
             activity_count,

@@ -450,6 +450,35 @@ impl Index {
         Ok(n)
     }
 
+    /// Returns the file paths of every SOP Instance belonging to any of
+    /// the supplied study UIDs. Used by the SCU C-STORE flow so the UI
+    /// can select studies from the local store rather than typing
+    /// absolute paths. Order is deterministic (study, series, instance)
+    /// so retries replay the same sequence.
+    pub fn list_instance_files_for_studies(
+        &self,
+        study_uids: &[String],
+    ) -> Result<Vec<String>, AppError> {
+        if study_uids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders = vec!["?"; study_uids.len()].join(",");
+        let sql = format!(
+            "SELECT file_path
+             FROM sop_instances
+             WHERE study_instance_uid IN ({placeholders})
+             ORDER BY study_instance_uid, series_instance_uid, sop_instance_uid",
+        );
+        let conn = self.lock()?;
+        let mut stmt = conn.prepare(&sql)?;
+        let bound: Vec<&dyn rusqlite::ToSql> =
+            study_uids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows = stmt
+            .query_map(bound.as_slice(), |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Runs a DICOM C-FIND query against the SOP Instance index.
     ///
     /// The returned `Vec<FindRow>` has one entry per match at the

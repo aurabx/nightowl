@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Loader2, Send } from "lucide-react";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Loader2, RotateCw, Send } from "lucide-react";
 import {
   type Peer,
   type QrLevel,
@@ -10,8 +10,11 @@ import {
   type ScuMoveResult,
   type ScuQueryKeys,
   type ScuStoreOutcome,
+  type StudyRow,
   formatError,
+  listInstanceFilesForStudies,
   listPeers,
+  listStudies,
   scuEcho,
   scuFind,
   scuMove,
@@ -87,7 +90,38 @@ export function ScuPage() {
   const [storeResult, setStoreResult] = useState<ScuStoreOutcome[] | null>(null);
 
   const [form, setForm] = useState<QueryForm>(EMPTY_QUERY);
-  const [storeFiles, setStoreFiles] = useState<string>("");
+  const [storeStudies, setStoreStudies] = useState<StudyRow[]>([]);
+  const [storeStudiesLoading, setStoreStudiesLoading] = useState<boolean>(false);
+  const [selectedStudyUids, setSelectedStudyUids] = useState<Set<string>>(
+    () => new Set(),
+  );
+
+  const loadStudies = useCallback(async () => {
+    setStoreStudiesLoading(true);
+    try {
+      const rows = await listStudies();
+      setStoreStudies(rows);
+      setSelectedStudyUids((prev) => {
+        // Drop any selections that no longer exist (e.g. after a rescan).
+        const valid = new Set(rows.map((r) => r.study_instance_uid));
+        const next = new Set<string>();
+        prev.forEach((uid) => {
+          if (valid.has(uid)) next.add(uid);
+        });
+        return next;
+      });
+    } catch (err) {
+      setError(formatError(err));
+    } finally {
+      setStoreStudiesLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (op === "store") {
+      loadStudies();
+    }
+  }, [op, loadStudies]);
 
   useEffect(() => {
     listPeers()
@@ -130,12 +164,17 @@ export function ScuPage() {
           await scuMove(peerId, form.root, form.level, queryKeysFromForm(form), dest),
         );
       } else if (op === "store") {
-        const files = storeFiles
-          .split(/\r?\n/)
-          .map((f) => f.trim())
-          .filter(Boolean);
+        const studyUids = Array.from(selectedStudyUids);
+        if (studyUids.length === 0) {
+          setError("Select at least one study from the store.");
+          setRunning(false);
+          return;
+        }
+        const files = await listInstanceFilesForStudies(studyUids);
         if (files.length === 0) {
-          setError("Add at least one file path (one per line).");
+          setError(
+            "The selected studies have no indexed instances. Try rescanning the store.",
+          );
           setRunning(false);
           return;
         }
@@ -207,7 +246,13 @@ export function ScuPage() {
         {op === "echo" ? (
           <EchoForm />
         ) : op === "store" ? (
-          <StoreForm value={storeFiles} onChange={setStoreFiles} />
+          <StoreForm
+            studies={storeStudies}
+            loading={storeStudiesLoading}
+            selected={selectedStudyUids}
+            onSelectedChange={setSelectedStudyUids}
+            onRefresh={loadStudies}
+          />
         ) : (
           <QueryForm op={op} form={form} setForm={setForm} />
         )}
@@ -269,25 +314,142 @@ function EchoForm() {
   );
 }
 
+function formatDicomDate(d: string | null): string {
+  if (!d || d.length !== 8) return d ?? "";
+  return `${d.slice(0, 4)}-${d.slice(4, 6)}-${d.slice(6, 8)}`;
+}
+
 function StoreForm({
-  value,
-  onChange,
+  studies,
+  loading,
+  selected,
+  onSelectedChange,
+  onRefresh,
 }: {
-  value: string;
-  onChange: (v: string) => void;
+  studies: StudyRow[];
+  loading: boolean;
+  selected: Set<string>;
+  onSelectedChange: (next: Set<string>) => void;
+  onRefresh: () => void;
 }) {
+  const toggle = (uid: string) => {
+    const next = new Set(selected);
+    if (next.has(uid)) {
+      next.delete(uid);
+    } else {
+      next.add(uid);
+    }
+    onSelectedChange(next);
+  };
+  const allSelected = studies.length > 0 && selected.size === studies.length;
+  const toggleAll = () => {
+    if (allSelected) {
+      onSelectedChange(new Set());
+    } else {
+      onSelectedChange(new Set(studies.map((s) => s.study_instance_uid)));
+    }
+  };
+  const selectedInstanceCount = studies
+    .filter((s) => selected.has(s.study_instance_uid))
+    .reduce((sum, s) => sum + s.instance_count, 0);
+
   return (
     <Field
-      label="Files (absolute paths, one per line)"
-      hint="Each file is parsed once on the way out to determine its SOP Class for negotiation."
+      label="Studies to send"
+      hint="Pick one or more studies from the local store. Every SOP Instance under each selected study is sent."
     >
-      <textarea
-        className={INPUT_CLASS + " h-32 font-mono text-xs"}
-        spellCheck={false}
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        placeholder="/Users/you/dicom-samples/IM000001.dcm"
-      />
+      <div className="rounded border border-slate-700 bg-slate-900">
+        <div className="flex items-center justify-between gap-3 border-b border-slate-800 px-3 py-2 text-xs">
+          <div className="text-slate-400">
+            {loading ? (
+              "Loading studies…"
+            ) : studies.length === 0 ? (
+              "No studies in the local store."
+            ) : (
+              <>
+                <strong className="text-slate-200">{selected.size}</strong> of{" "}
+                {studies.length} studies selected
+                {selected.size > 0 && (
+                  <span className="ml-1 text-slate-500">
+                    · {selectedInstanceCount} instance
+                    {selectedInstanceCount === 1 ? "" : "s"}
+                  </span>
+                )}
+              </>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {studies.length > 0 && (
+              <button
+                type="button"
+                onClick={toggleAll}
+                className="rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-300 hover:border-slate-500"
+              >
+                {allSelected ? "Clear all" : "Select all"}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onRefresh}
+              disabled={loading}
+              className="flex items-center gap-1 rounded border border-slate-700 px-2 py-0.5 text-xs text-slate-300 hover:border-slate-500 disabled:opacity-50"
+              title="Refresh study list"
+            >
+              <RotateCw
+                className={"size-3" + (loading ? " animate-spin" : "")}
+              />
+              Refresh
+            </button>
+          </div>
+        </div>
+        {studies.length === 0 && !loading ? (
+          <p className="px-3 py-6 text-center text-xs text-slate-500">
+            Send a file via C-STORE or drop a <code>.dcm</code> into the store
+            directory, then click Refresh.
+          </p>
+        ) : (
+          <ul className="max-h-72 divide-y divide-slate-800/60 overflow-y-auto">
+            {studies.map((s) => {
+              const checked = selected.has(s.study_instance_uid);
+              return (
+                <li key={s.study_instance_uid}>
+                  <label
+                    className={
+                      "flex cursor-pointer items-start gap-3 px-3 py-2 text-sm hover:bg-slate-800/40 " +
+                      (checked ? "bg-slate-800/30" : "")
+                    }
+                  >
+                    <input
+                      type="checkbox"
+                      className="mt-1 size-3.5 shrink-0 accent-sky-500"
+                      checked={checked}
+                      onChange={() => toggle(s.study_instance_uid)}
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate text-slate-100">
+                        {s.patient_name || "(no patient name)"}
+                        <span className="ml-2 text-xs text-slate-500">
+                          {s.patient_id}
+                        </span>
+                      </div>
+                      <div className="truncate text-xs text-slate-500">
+                        {s.study_description || "(no description)"}
+                      </div>
+                    </div>
+                    <div className="shrink-0 text-right text-xs text-slate-500">
+                      <div>{formatDicomDate(s.study_date) || "—"}</div>
+                      <div>
+                        {s.modalities || "—"} · {s.instance_count} instance
+                        {s.instance_count === 1 ? "" : "s"}
+                      </div>
+                    </div>
+                  </label>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
     </Field>
   );
 }

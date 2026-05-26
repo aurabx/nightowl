@@ -137,6 +137,15 @@ export function totalInstanceCount(): Promise<number> {
   return invoke<number>("total_instance_count");
 }
 
+/** Expands a list of study UIDs into the absolute paths of every SOP
+ * Instance in those studies. Used by the SCU C-STORE form so users pick
+ * studies from the local store rather than typing paths. */
+export function listInstanceFilesForStudies(
+  studyUids: string[],
+): Promise<string[]> {
+  return invoke<string[]>("list_instance_files_for_studies", { studyUids });
+}
+
 // --- Activity log (M9) ------------------------------------------------
 
 export type ActivityDirection = "inbound" | "outbound" | "info";
