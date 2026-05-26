@@ -8,7 +8,9 @@ import {
   Send,
   Settings,
 } from "lucide-react";
+import { useEffect, useState } from "react";
 import type { ComponentType, SVGProps } from "react";
+import { getVersion } from "@tauri-apps/api/app";
 
 export type PageId =
   | "peers"
@@ -43,10 +45,31 @@ interface SidebarProps {
 }
 
 export function Sidebar({ currentPage, onSelect }: SidebarProps) {
+  const [version, setVersion] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    getVersion()
+      .then((v) => {
+        if (!cancelled) setVersion(v);
+      })
+      .catch((err) => {
+        console.error("failed to read app version", err);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   return (
     <aside className="w-56 shrink-0 border-r border-slate-800 bg-slate-900">
       <div className="px-5 py-5 border-b border-slate-800">
-        <div className="text-lg font-semibold">NightOwl</div>
+        <div className="flex items-baseline gap-2">
+          <div className="text-lg font-semibold">NightOwl</div>
+          {version && (
+            <div className="text-xs text-slate-500">v{version}</div>
+          )}
+        </div>
         <div className="text-xs text-slate-500">DICOM service tester</div>
       </div>
       <nav className="py-3">
