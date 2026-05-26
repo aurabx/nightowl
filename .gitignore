@@ -50,3 +50,13 @@ dicom-store/
 
 # Test fixtures
 /tmp-fixtures/
+
+# AI files
+/.mcp.json
+/.opencode
+/CLAUDE.md
+/opencode.json
+/.agents/
+/.automatic/
+/.claude/
+/.codex/
