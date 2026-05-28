@@ -566,6 +566,191 @@ fn delete_worklist_entry(
 // Entrypoint
 // ---------------------------------------------------------------------
 
+/// Runs every step of app boot, returning the first `AppError` rather
+/// than panicking. Split out from the `.setup()` closure so any failure
+/// can be reported visibly before the process exits — see the
+/// `setup` block in [`run`] and `report_setup_failure`.
+///
+/// In release this binary is built with `panic = "abort"` and
+/// `strip = true`. A bare `?` inside the setup closure therefore
+/// produces an unsymbolicated `SIGABRT` with nothing on stderr when the
+/// app is launched from Finder. Keeping this body as `Result<_, _>` is
+/// what makes the failure recoverable enough to surface to the user.
+fn try_setup(app: &mut tauri::App) -> Result<(), AppError> {
+    let handle = app.handle();
+    let cfg_path = config_path(handle)?;
+
+    if let Some(parent) = cfg_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let home = home_dir(handle)?;
+    let default = AppConfig::default_with_home(&home);
+    let cfg = load_or_default(&cfg_path, default)?;
+    tracing::info!(
+        config_path = %cfg_path.display(),
+        store_dir = %cfg.store_dir.display(),
+        ae_title = %cfg.local_ae_title,
+        port = cfg.listen_port,
+        "loaded config",
+    );
+    std::fs::create_dir_all(&cfg.store_dir)?;
+
+    // Open the SOP Instance index alongside the config.
+    let idx = Arc::new(Index::open(&index_path(handle)?)?);
+
+    // Open the persistent activity log. We use the same
+    // store.sqlite file but our own Connection so the activity
+    // mutex does not contend with the SOP-index mutex.
+    let activity = Arc::new(ActivityLog::open(&index_path(handle)?)?);
+    app.manage(activity.clone());
+
+    // Open the persistent peer list (peers.json next to
+    // config.json). Empty on first launch.
+    let peers_path = peers_path(handle)?;
+    let peers = Arc::new(PeerStore::open(&peers_path)?);
+    tracing::info!(
+        peers_path = %peers_path.display(),
+        peer_count = peers.list().map(|p| p.len()).unwrap_or(0),
+        "loaded peers",
+    );
+    app.manage(peers.clone());
+
+    // Open the worklist store (M11). Its own SQLite file so a
+    // user reset of the SOP index does not nuke their
+    // worklist data.
+    let worklist = Arc::new(WorklistStore::open(&worklist_path(handle)?)?);
+    tracing::info!(
+        worklist_count = worklist.count().unwrap_or(0),
+        "loaded worklist",
+    );
+    app.manage(worklist.clone());
+
+    // Start the SCP listener AFTER managing the activity log
+    // so its startup `SCP listening …` event is persisted.
+    // The ScpContext bundles the SOP index (queried by M4 and
+    // refreshed by M5) and the on-disk store directory (where
+    // M5 writes received SOP Instances).
+    let scp = Arc::new(ScpContext {
+        index: idx.clone(),
+        store_dir: cfg.store_dir.clone(),
+        peers: peers.clone(),
+        local_ae_title: cfg.local_ae_title.clone(),
+        worklist: worklist.clone(),
+    });
+    let listener = start_listener(
+        cfg.listen_port,
+        cfg.local_ae_title.clone(),
+        handle.clone(),
+        scp,
+    )?;
+
+    // M24: start the local MCP server when enabled. Treated as
+    // ancillary — bind failure logs an error and continues, so
+    // a busy port does not block app launch the way an SCP
+    // bind failure does.
+    let mcp_state = if cfg.mcp.enabled {
+        match tauri::async_runtime::block_on(mcp::start_server(
+            Some(handle.clone()),
+            cfg.clone(),
+            idx.clone(),
+            peers.clone(),
+            worklist.clone(),
+            activity.clone(),
+        )) {
+            Ok(h) => McpRuntimeState::Running(h),
+            Err(err) => {
+                let reason = err.to_string();
+                tracing::error!(error = %reason, port = cfg.mcp.port, "MCP server failed to start");
+                McpRuntimeState::Failed(reason)
+            }
+        }
+    } else {
+        McpRuntimeState::Disabled
+    };
+
+    app.manage(AppState {
+        config: Mutex::new(cfg.clone()),
+        index: idx.clone(),
+        listener: Mutex::new(Some(listener)),
+        mcp: Mutex::new(mcp_state),
+    });
+
+    // Initial background scan so the Store page is populated
+    // without the user having to click anything. Reports back
+    // via the `store/scan-completed` event when finished.
+    let store_dir = cfg.store_dir.clone();
+    let app_handle = handle.clone();
+    tauri::async_runtime::spawn_blocking(move || match idx.rescan_dir(&store_dir) {
+        Ok(report) => {
+            tracing::info!(
+                seen = report.files_seen,
+                inserted = report.files_inserted,
+                updated = report.files_updated,
+                skipped = report.files_skipped,
+                errored = report.files_errored,
+                elapsed_ms = report.elapsed_ms,
+                "initial scan completed"
+            );
+            let _ = app_handle.emit("store/scan-completed", &report);
+        }
+        Err(err) => {
+            tracing::error!(error = %err, "initial scan failed");
+        }
+    });
+
+    Ok(())
+}
+
+/// Surfaces a setup failure to the user before the process exits.
+///
+/// Three best-effort channels, in order of usefulness:
+/// 1. `tracing::error!` — visible on stderr if the app was launched
+///    from a terminal or with `RUST_LOG` set.
+/// 2. A `startup-error.log` file in the platform app-log directory
+///    (`~/Library/Logs/<bundle id>/` on macOS), with the temp dir as
+///    a fallback if the app log dir cannot be resolved.
+/// 3. On macOS, a native dialog via `osascript` pointing at the log
+///    path. This is the channel that actually reaches a user who
+///    double-clicked the `.app` from Finder.
+///
+/// Each step swallows its own error rather than propagating — a
+/// failure to report must not block the setup-failure error itself.
+fn report_setup_failure(handle: &AppHandle, err: &AppError) {
+    tracing::error!(error = %err, "setup failed");
+
+    let log_path: PathBuf = match handle.path().app_log_dir() {
+        Ok(dir) => {
+            let _ = std::fs::create_dir_all(&dir);
+            dir.join("startup-error.log")
+        }
+        Err(_) => std::env::temp_dir().join("nightowl-startup-error.log"),
+    };
+
+    let body = format!("NightOwl startup failed.\n\nError: {err}\n");
+    let _ = std::fs::write(&log_path, body);
+
+    #[cfg(target_os = "macos")]
+    {
+        // AppleScript dialog. The log path has no characters that
+        // require escaping under our path resolution (the bundle id
+        // and the OS app-log dir both produce only `[A-Za-z0-9./_-]`),
+        // so a straight format is safe. We deliberately keep the
+        // message body short and point at the log file rather than
+        // try to escape an arbitrary error string for AppleScript.
+        let script = format!(
+            "display dialog \"NightOwl failed to start.\" & return & return & \
+             \"See log file:\" & return & \"{}\" \
+             with title \"NightOwl\" with icon stop \
+             buttons {{\"OK\"}} default button \"OK\"",
+            log_path.display(),
+        );
+        let _ = std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .status();
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Best-effort tracing setup; honour RUST_LOG when present, default
@@ -580,128 +765,10 @@ pub fn run() {
 
     tauri::Builder::default()
         .setup(|app| {
-            let handle = app.handle();
-            let cfg_path = config_path(handle)?;
-
-            if let Some(parent) = cfg_path.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Err(err) = try_setup(app) {
+                report_setup_failure(app.handle(), &err);
+                return Err(err.into());
             }
-
-            let home = home_dir(handle)?;
-            let default = AppConfig::default_with_home(&home);
-            let cfg = load_or_default(&cfg_path, default)?;
-            tracing::info!(
-                config_path = %cfg_path.display(),
-                store_dir = %cfg.store_dir.display(),
-                ae_title = %cfg.local_ae_title,
-                port = cfg.listen_port,
-                "loaded config",
-            );
-            std::fs::create_dir_all(&cfg.store_dir)?;
-
-            // Open the SOP Instance index alongside the config.
-            let idx = Arc::new(Index::open(&index_path(handle)?)?);
-
-            // Open the persistent activity log. We use the same
-            // store.sqlite file but our own Connection so the activity
-            // mutex does not contend with the SOP-index mutex.
-            let activity = Arc::new(ActivityLog::open(&index_path(handle)?)?);
-            app.manage(activity.clone());
-
-            // Open the persistent peer list (peers.json next to
-            // config.json). Empty on first launch.
-            let peers_path = peers_path(handle)?;
-            let peers = Arc::new(PeerStore::open(&peers_path)?);
-            tracing::info!(
-                peers_path = %peers_path.display(),
-                peer_count = peers.list().map(|p| p.len()).unwrap_or(0),
-                "loaded peers",
-            );
-            app.manage(peers.clone());
-
-            // Open the worklist store (M11). Its own SQLite file so a
-            // user reset of the SOP index does not nuke their
-            // worklist data.
-            let worklist = Arc::new(WorklistStore::open(&worklist_path(handle)?)?);
-            tracing::info!(
-                worklist_count = worklist.count().unwrap_or(0),
-                "loaded worklist",
-            );
-            app.manage(worklist.clone());
-
-            // Start the SCP listener AFTER managing the activity log
-            // so its startup `SCP listening …` event is persisted.
-            // The ScpContext bundles the SOP index (queried by M4 and
-            // refreshed by M5) and the on-disk store directory (where
-            // M5 writes received SOP Instances).
-            let scp = Arc::new(ScpContext {
-                index: idx.clone(),
-                store_dir: cfg.store_dir.clone(),
-                peers: peers.clone(),
-                local_ae_title: cfg.local_ae_title.clone(),
-                worklist: worklist.clone(),
-            });
-            let listener = start_listener(
-                cfg.listen_port,
-                cfg.local_ae_title.clone(),
-                handle.clone(),
-                scp,
-            )?;
-
-            // M24: start the local MCP server when enabled. Treated as
-            // ancillary — bind failure logs an error and continues, so
-            // a busy port does not block app launch the way an SCP
-            // bind failure does.
-            let mcp_state = if cfg.mcp.enabled {
-                match tauri::async_runtime::block_on(mcp::start_server(
-                    Some(handle.clone()),
-                    cfg.clone(),
-                    idx.clone(),
-                    peers.clone(),
-                    worklist.clone(),
-                    activity.clone(),
-                )) {
-                    Ok(h) => McpRuntimeState::Running(h),
-                    Err(err) => {
-                        let reason = err.to_string();
-                        tracing::error!(error = %reason, port = cfg.mcp.port, "MCP server failed to start");
-                        McpRuntimeState::Failed(reason)
-                    }
-                }
-            } else {
-                McpRuntimeState::Disabled
-            };
-
-            app.manage(AppState {
-                config: Mutex::new(cfg.clone()),
-                index: idx.clone(),
-                listener: Mutex::new(Some(listener)),
-                mcp: Mutex::new(mcp_state),
-            });
-
-            // Initial background scan so the Store page is populated
-            // without the user having to click anything. Reports back
-            // via the `store/scan-completed` event when finished.
-            let store_dir = cfg.store_dir.clone();
-            let app_handle = handle.clone();
-            tauri::async_runtime::spawn_blocking(move || match idx.rescan_dir(&store_dir) {
-                Ok(report) => {
-                    tracing::info!(
-                        seen = report.files_seen,
-                        inserted = report.files_inserted,
-                        updated = report.files_updated,
-                        skipped = report.files_skipped,
-                        errored = report.files_errored,
-                        elapsed_ms = report.elapsed_ms,
-                        "initial scan completed"
-                    );
-                    let _ = app_handle.emit("store/scan-completed", &report);
-                }
-                Err(err) => {
-                    tracing::error!(error = %err, "initial scan failed");
-                }
-            });
-
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
