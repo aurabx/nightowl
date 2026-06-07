@@ -751,8 +751,91 @@ fn report_setup_failure(handle: &AppHandle, err: &AppError) {
     }
 }
 
+/// Bundle identifier from `tauri.conf.json`, repeated here so the early
+/// breadcrumb + panic hook can resolve a log directory before the Tauri
+/// path APIs are available. If the identifier changes, update both.
+const BUNDLE_ID: &str = "cloud.aurabox.nightowl";
+
+/// Resolves the log directory used by [`write_startup_breadcrumb`] and
+/// the panic hook. Mirrors Tauri's `app_log_dir()` per platform so the
+/// early diagnostic files land next to the ones `report_setup_failure`
+/// writes once Tauri is up — one folder to look in regardless of which
+/// channel produced the record. Falls back to the temp dir if the
+/// platform's standard env vars are missing.
+fn early_log_dir() -> PathBuf {
+    let dir = if cfg!(target_os = "windows") {
+        std::env::var_os("LOCALAPPDATA")
+            .map(|b| PathBuf::from(b).join(BUNDLE_ID).join("logs"))
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME")
+            .map(|h| PathBuf::from(h).join("Library/Logs").join(BUNDLE_ID))
+    } else {
+        std::env::var_os("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
+            })
+            .map(|b| b.join(BUNDLE_ID).join("logs"))
+    };
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(BUNDLE_ID));
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+/// Writes `startup-breadcrumb.log` at the very top of `run()`. The
+/// presence of this file confirms the binary executed past `main()` —
+/// useful when triaging silent crashes on Windows where `panic = "abort"`
+/// + `windows_subsystem = "windows"` swallows every other signal. If the
+/// breadcrumb is missing after a failed launch, the process never ran
+/// (antivirus, missing runtime DLL, blocked binary).
+fn write_startup_breadcrumb() {
+    let path = early_log_dir().join("startup-breadcrumb.log");
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().to_string())
+        .unwrap_or_else(|_| "unknown".to_string());
+    let body = format!("nightowl run() entered, unix_ts={ts}\n");
+    let _ = std::fs::write(&path, body);
+}
+
+/// Installs a `std::panic::set_hook` that writes the panic location and
+/// message to `early-panic.log`. The hook runs before `panic = "abort"`
+/// fast-fails the process, so the record survives the abort. Catches
+/// panics inside Tauri's window / webview construction — anywhere
+/// upstream of the `setup` closure — which `report_setup_failure`
+/// cannot reach.
+fn install_panic_hook() {
+    let log_path = early_log_dir().join("early-panic.log");
+    std::panic::set_hook(Box::new(move |info| {
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
+            .unwrap_or_else(|| "<unknown location>".to_string());
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| (*s).to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<non-string payload>".to_string());
+        let body = format!(
+            "NightOwl panicked before/during setup.\n\n\
+             Location: {location}\n\
+             Message: {payload}\n"
+        );
+        let _ = std::fs::write(&log_path, body);
+    }));
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Early-diagnostic instrumentation MUST run before anything else
+    // touches Tauri. The breadcrumb proves the binary executed; the
+    // panic hook captures any panic raised by Tauri's window / webview
+    // construction (which fires before the `setup` closure and is
+    // therefore invisible to `report_setup_failure`).
+    write_startup_breadcrumb();
+    install_panic_hook();
+
     // Best-effort tracing setup; honour RUST_LOG when present, default
     // to nightowl_lib=info,warn so we see scan summaries without drowning
     // in noise from upstream crates.
