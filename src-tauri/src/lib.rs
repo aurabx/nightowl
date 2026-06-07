@@ -4,8 +4,11 @@
 //! `#[tauri::command]` functions in this file are thin wrappers that
 //! resolve Tauri-specific values (paths, managed state) and call into
 //! `core`.
+//!
+//! `core` is `pub` so the sibling `nightowl-cli` binary can call into
+//! the same modules without going through Tauri's IPC layer.
 
-mod core;
+pub mod core;
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -19,9 +22,11 @@ use core::config::{AppConfig, load_or_default, save};
 use core::dimse::{
     scu_echo, scu_find, scu_move, scu_store, start_listener, ListenerHandle, QrRoot,
     ScpContext, ScuEchoResult, ScuFindResult, ScuMoveResult, ScuQueryKeys, ScuStoreOutcome,
+    TauriEmitter,
 };
 use core::error::AppError;
 use core::mcp::{self, McpRuntimeState, McpStatus};
+use core::paths::{self, DataPaths};
 use core::peers::{NewPeer, Peer, PeerStore, UpdatePeer};
 use core::store::{FindLevel, Index, InstanceRow, ScanReport, SeriesRow, StudyRow};
 use core::worklist::{NewWorklistEntry, WorklistEntry, WorklistStore};
@@ -62,24 +67,11 @@ struct AppState {
 // Tauri-aware path helpers
 // ---------------------------------------------------------------------
 
-/// Returns the path to `config.json` inside the platform-specific app
-/// config directory.
-fn config_path(app: &AppHandle) -> Result<PathBuf, AppError> {
-    Ok(app_config_dir(app)?.join("config.json"))
-}
-
-/// Returns the path to `store.sqlite` inside the platform-specific app
-/// config directory. The SOP Instance index lives next to `config.json`.
-fn index_path(app: &AppHandle) -> Result<PathBuf, AppError> {
-    Ok(app_config_dir(app)?.join("store.sqlite"))
-}
-
-fn peers_path(app: &AppHandle) -> Result<PathBuf, AppError> {
-    Ok(app_config_dir(app)?.join("peers.json"))
-}
-
-fn worklist_path(app: &AppHandle) -> Result<PathBuf, AppError> {
-    Ok(app_config_dir(app)?.join("worklist.sqlite"))
+/// Returns the four persistent file paths inside the platform-specific
+/// app config directory. The filename joins live in `core::paths` so
+/// the CLI binary resolves the same files.
+fn data_paths(app: &AppHandle) -> Result<DataPaths, AppError> {
+    Ok(paths::data_paths_from(&app_config_dir(app)?))
 }
 
 fn app_config_dir(app: &AppHandle) -> Result<PathBuf, AppError> {
@@ -155,7 +147,7 @@ fn save_config(
     state: State<'_, AppState>,
     cfg: AppConfig,
 ) -> Result<AppConfig, AppError> {
-    let path = config_path(&app)?;
+    let path = data_paths(&app)?.config;
     save(&path, &cfg)?;
 
     let old_cfg = {
@@ -469,9 +461,12 @@ async fn scu_echo_cmd(
 ) -> Result<ScuEchoResult, AppError> {
     let local_ae = read_config(&state)?.local_ae_title;
     let peer = resolve_peer(&peers, &peer_id)?;
-    tauri::async_runtime::spawn_blocking(move || scu_echo(&app, &local_ae, &peer))
-        .await
-        .map_err(|e| AppError::Internal(format!("scu_echo join: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter = TauriEmitter::new(app);
+        scu_echo(&emitter, &local_ae, &peer)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("scu_echo join: {e}")))?
 }
 
 #[tauri::command]
@@ -487,7 +482,8 @@ async fn scu_find_cmd(
     let local_ae = read_config(&state)?.local_ae_title;
     let peer = resolve_peer(&peers, &peer_id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        scu_find(&app, &local_ae, &peer, root, level, keys)
+        let emitter = TauriEmitter::new(app);
+        scu_find(&emitter, &local_ae, &peer, root, level, keys)
     })
     .await
     .map_err(|e| AppError::Internal(format!("scu_find join: {e}")))?
@@ -507,7 +503,8 @@ async fn scu_move_cmd(
     let local_ae = read_config(&state)?.local_ae_title;
     let peer = resolve_peer(&peers, &peer_id)?;
     tauri::async_runtime::spawn_blocking(move || {
-        scu_move(&app, &local_ae, &peer, root, level, keys, &destination_ae)
+        let emitter = TauriEmitter::new(app);
+        scu_move(&emitter, &local_ae, &peer, root, level, keys, &destination_ae)
     })
     .await
     .map_err(|e| AppError::Internal(format!("scu_move join: {e}")))?
@@ -524,9 +521,12 @@ async fn scu_store_cmd(
     let local_ae = read_config(&state)?.local_ae_title;
     let peer = resolve_peer(&peers, &peer_id)?;
     let paths: Vec<StdPathBuf> = files.into_iter().map(StdPathBuf::from).collect();
-    tauri::async_runtime::spawn_blocking(move || scu_store(&app, &local_ae, &peer, &paths))
-        .await
-        .map_err(|e| AppError::Internal(format!("scu_store join: {e}")))?
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter = TauriEmitter::new(app);
+        scu_store(&emitter, &local_ae, &peer, &paths)
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("scu_store join: {e}")))?
 }
 
 // --- Worklist (M11) --------------------------------------------------
@@ -578,17 +578,17 @@ fn delete_worklist_entry(
 /// what makes the failure recoverable enough to surface to the user.
 fn try_setup(app: &mut tauri::App) -> Result<(), AppError> {
     let handle = app.handle();
-    let cfg_path = config_path(handle)?;
+    let paths = data_paths(handle)?;
 
-    if let Some(parent) = cfg_path.parent() {
+    if let Some(parent) = paths.config.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
     let home = home_dir(handle)?;
     let default = AppConfig::default_with_home(&home);
-    let cfg = load_or_default(&cfg_path, default)?;
+    let cfg = load_or_default(&paths.config, default)?;
     tracing::info!(
-        config_path = %cfg_path.display(),
+        config_path = %paths.config.display(),
         store_dir = %cfg.store_dir.display(),
         ae_title = %cfg.local_ae_title,
         port = cfg.listen_port,
@@ -597,20 +597,19 @@ fn try_setup(app: &mut tauri::App) -> Result<(), AppError> {
     std::fs::create_dir_all(&cfg.store_dir)?;
 
     // Open the SOP Instance index alongside the config.
-    let idx = Arc::new(Index::open(&index_path(handle)?)?);
+    let idx = Arc::new(Index::open(&paths.index)?);
 
     // Open the persistent activity log. We use the same
     // store.sqlite file but our own Connection so the activity
     // mutex does not contend with the SOP-index mutex.
-    let activity = Arc::new(ActivityLog::open(&index_path(handle)?)?);
+    let activity = Arc::new(ActivityLog::open(&paths.index)?);
     app.manage(activity.clone());
 
     // Open the persistent peer list (peers.json next to
     // config.json). Empty on first launch.
-    let peers_path = peers_path(handle)?;
-    let peers = Arc::new(PeerStore::open(&peers_path)?);
+    let peers = Arc::new(PeerStore::open(&paths.peers)?);
     tracing::info!(
-        peers_path = %peers_path.display(),
+        peers_path = %paths.peers.display(),
         peer_count = peers.list().map(|p| p.len()).unwrap_or(0),
         "loaded peers",
     );
@@ -619,7 +618,7 @@ fn try_setup(app: &mut tauri::App) -> Result<(), AppError> {
     // Open the worklist store (M11). Its own SQLite file so a
     // user reset of the SOP index does not nuke their
     // worklist data.
-    let worklist = Arc::new(WorklistStore::open(&worklist_path(handle)?)?);
+    let worklist = Arc::new(WorklistStore::open(&paths.worklist)?);
     tracing::info!(
         worklist_count = worklist.count().unwrap_or(0),
         "loaded worklist",
@@ -751,33 +750,32 @@ fn report_setup_failure(handle: &AppHandle, err: &AppError) {
     }
 }
 
-/// Bundle identifier from `tauri.conf.json`, repeated here so the early
-/// breadcrumb + panic hook can resolve a log directory before the Tauri
-/// path APIs are available. If the identifier changes, update both.
-const BUNDLE_ID: &str = "cloud.aurabox.nightowl";
-
 /// Resolves the log directory used by [`write_startup_breadcrumb`] and
 /// the panic hook. Mirrors Tauri's `app_log_dir()` per platform so the
 /// early diagnostic files land next to the ones `report_setup_failure`
 /// writes once Tauri is up — one folder to look in regardless of which
 /// channel produced the record. Falls back to the temp dir if the
 /// platform's standard env vars are missing.
+///
+/// Uses the bundle identifier from [`core::paths::BUNDLE_ID`], which is
+/// pinned to the value in `tauri.conf.json` by a unit test in that
+/// module.
 fn early_log_dir() -> PathBuf {
     let dir = if cfg!(target_os = "windows") {
         std::env::var_os("LOCALAPPDATA")
-            .map(|b| PathBuf::from(b).join(BUNDLE_ID).join("logs"))
+            .map(|b| PathBuf::from(b).join(paths::BUNDLE_ID).join("logs"))
     } else if cfg!(target_os = "macos") {
         std::env::var_os("HOME")
-            .map(|h| PathBuf::from(h).join("Library/Logs").join(BUNDLE_ID))
+            .map(|h| PathBuf::from(h).join("Library/Logs").join(paths::BUNDLE_ID))
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
             .or_else(|| {
                 std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
             })
-            .map(|b| b.join(BUNDLE_ID).join("logs"))
+            .map(|b| b.join(paths::BUNDLE_ID).join("logs"))
     };
-    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(BUNDLE_ID));
+    let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(paths::BUNDLE_ID));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }

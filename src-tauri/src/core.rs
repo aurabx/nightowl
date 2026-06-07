@@ -24,6 +24,7 @@ pub mod config;
 pub mod dimse;
 pub mod error;
 pub mod mcp;
+pub mod paths;
 pub mod peers;
 pub mod store;
 pub mod worklist;

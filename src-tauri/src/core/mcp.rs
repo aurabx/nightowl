@@ -397,7 +397,8 @@ impl NightowlMcp {
         let local_ae = self.config.local_ae_title.clone();
         let app = self.require_app()?;
         let result = tauri::async_runtime::spawn_blocking(move || {
-            dimse::scu_echo(&app, &local_ae, &peer)
+            let emitter = dimse::TauriEmitter::new(app);
+            dimse::scu_echo(&emitter, &local_ae, &peer)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("scu_echo join: {e}"), None))?
@@ -419,7 +420,8 @@ impl NightowlMcp {
             root, level, keys, ..
         } = params;
         let result = tauri::async_runtime::spawn_blocking(move || {
-            dimse::scu_find(&app, &local_ae, &peer, root, level, keys)
+            let emitter = dimse::TauriEmitter::new(app);
+            dimse::scu_find(&emitter, &local_ae, &peer, root, level, keys)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("scu_find join: {e}"), None))?
@@ -445,7 +447,8 @@ impl NightowlMcp {
             ..
         } = params;
         let result = tauri::async_runtime::spawn_blocking(move || {
-            dimse::scu_move(&app, &local_ae, &peer, root, level, keys, &destination_ae)
+            let emitter = dimse::TauriEmitter::new(app);
+            dimse::scu_move(&emitter, &local_ae, &peer, root, level, keys, &destination_ae)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("scu_move join: {e}"), None))?
@@ -465,7 +468,8 @@ impl NightowlMcp {
         let app = self.require_app()?;
         let paths: Vec<PathBuf> = params.files.into_iter().map(PathBuf::from).collect();
         let outcomes = tauri::async_runtime::spawn_blocking(move || {
-            dimse::scu_store(&app, &local_ae, &peer, &paths)
+            let emitter = dimse::TauriEmitter::new(app);
+            dimse::scu_store(&emitter, &local_ae, &peer, &paths)
         })
         .await
         .map_err(|e| McpError::internal_error(format!("scu_store join: {e}"), None))?

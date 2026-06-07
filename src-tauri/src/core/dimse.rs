@@ -161,6 +161,73 @@ pub enum Status {
     Error,
 }
 
+/// Sink for activity events.
+///
+/// Two implementations exist:
+///
+/// - [`TauriEmitter`] — used by the desktop app. Persists each event to
+///   the `ActivityLog` held in Tauri-managed state and broadcasts it on
+///   the `activity` event channel so the Activity page can render it
+///   live.
+/// - [`LogEmitter`] — used by the CLI binary. Persists each event to
+///   the `ActivityLog` it owns directly. No broadcast (no webview is
+///   listening).
+///
+/// The trait exists so the four SCU functions and the per-association
+/// [`ScuCtx`] do not depend on `AppHandle`, which keeps them callable
+/// from the CLI. The SCP listener still uses [`emit`] (via a
+/// [`TauriEmitter`]) directly because it is always rooted in the Tauri
+/// runtime.
+pub trait ActivityEmitter: Send + Sync {
+    fn emit(&self, event: ActivityEvent);
+}
+
+/// Emitter that drives both persistence and webview broadcast through
+/// an `AppHandle`. Behaves exactly like the pre-trait `emit` helper.
+pub struct TauriEmitter {
+    app: AppHandle,
+}
+
+impl TauriEmitter {
+    pub fn new(app: AppHandle) -> Self {
+        Self { app }
+    }
+}
+
+impl ActivityEmitter for TauriEmitter {
+    fn emit(&self, event: ActivityEvent) {
+        emit(&self.app, event);
+    }
+}
+
+/// Emitter that only persists to an `ActivityLog`. Used by the CLI
+/// binary, where there is no webview to broadcast to.
+pub struct LogEmitter {
+    log: Arc<ActivityLog>,
+}
+
+impl LogEmitter {
+    pub fn new(log: Arc<ActivityLog>) -> Self {
+        Self { log }
+    }
+}
+
+impl ActivityEmitter for LogEmitter {
+    fn emit(&self, event: ActivityEvent) {
+        tracing::info!(
+            target: "phantom_lib::dimse",
+            direction = ?event.direction,
+            peer = ?event.peer_ae_title,
+            command = ?event.command,
+            message = %event.message,
+            "activity",
+        );
+        if let Err(err) = self.log.record(event) {
+            tracing::warn!(error = %err, "activity persist failed");
+        }
+    }
+}
+
 fn emit(app: &AppHandle, event: ActivityEvent) {
     tracing::info!(
         target: "phantom_lib::dimse",
@@ -2405,12 +2472,13 @@ fn encode_command_set(obj: &InMemDicomObject) -> Result<Vec<u8>, AppError> {
 // The Tauri commands in lib.rs are thin wrappers around these.
 // =====================================================================
 
-/// Context shared across one SCU operation. Carries the `AppHandle` so
-/// every emit goes through the same persisted + broadcast path the SCP
-/// side uses, and a stable `association_id` so the Activity page groups
-/// every event from the operation together.
+/// Context shared across one SCU operation. Carries an
+/// [`ActivityEmitter`] so every emit goes through the caller's chosen
+/// sink (Tauri broadcast + persist for the desktop app, persist-only
+/// for the CLI), and a stable `association_id` so the Activity page
+/// groups every event from the operation together.
 struct ScuCtx<'a> {
-    app: &'a AppHandle,
+    emitter: &'a dyn ActivityEmitter,
     association_id: String,
     peer_ae_title: String,
     /// `host:port` actually dialled. Carried alongside the AE title so
@@ -2419,9 +2487,9 @@ struct ScuCtx<'a> {
 }
 
 impl<'a> ScuCtx<'a> {
-    fn new(app: &'a AppHandle, peer: &Peer) -> Self {
+    fn new(emitter: &'a dyn ActivityEmitter, peer: &Peer) -> Self {
         Self {
-            app,
+            emitter,
             association_id: format!("s-{}", Uuid::new_v4().simple()),
             peer_ae_title: peer.ae_title.clone(),
             peer_host: format!("{}:{}", peer.host, peer.port),
@@ -2429,51 +2497,42 @@ impl<'a> ScuCtx<'a> {
     }
 
     fn emit_lifecycle(&self, status: Status, message: impl Into<String>) {
-        emit(
-            self.app,
-            ActivityEvent {
-                timestamp_ms: Utc::now().timestamp_millis(),
-                direction: Direction::Info,
-                peer_ae_title: Some(self.peer_ae_title.clone()),
-                peer_host: Some(self.peer_host.clone()),
-                command: None,
-                status,
-                message: message.into(),
-                association_id: self.association_id.clone(),
-            },
-        );
+        self.emitter.emit(ActivityEvent {
+            timestamp_ms: Utc::now().timestamp_millis(),
+            direction: Direction::Info,
+            peer_ae_title: Some(self.peer_ae_title.clone()),
+            peer_host: Some(self.peer_host.clone()),
+            command: None,
+            status,
+            message: message.into(),
+            association_id: self.association_id.clone(),
+        });
     }
 
     fn emit_outbound(&self, command: &str, message: impl Into<String>) {
-        emit(
-            self.app,
-            ActivityEvent {
-                timestamp_ms: Utc::now().timestamp_millis(),
-                direction: Direction::Outbound,
-                peer_ae_title: Some(self.peer_ae_title.clone()),
-                peer_host: Some(self.peer_host.clone()),
-                command: Some(command.to_string()),
-                status: Status::Info,
-                message: message.into(),
-                association_id: self.association_id.clone(),
-            },
-        );
+        self.emitter.emit(ActivityEvent {
+            timestamp_ms: Utc::now().timestamp_millis(),
+            direction: Direction::Outbound,
+            peer_ae_title: Some(self.peer_ae_title.clone()),
+            peer_host: Some(self.peer_host.clone()),
+            command: Some(command.to_string()),
+            status: Status::Info,
+            message: message.into(),
+            association_id: self.association_id.clone(),
+        });
     }
 
     fn emit_inbound(&self, status: Status, command: &str, message: impl Into<String>) {
-        emit(
-            self.app,
-            ActivityEvent {
-                timestamp_ms: Utc::now().timestamp_millis(),
-                direction: Direction::Inbound,
-                peer_ae_title: Some(self.peer_ae_title.clone()),
-                peer_host: Some(self.peer_host.clone()),
-                command: Some(command.to_string()),
-                status,
-                message: message.into(),
-                association_id: self.association_id.clone(),
-            },
-        );
+        self.emitter.emit(ActivityEvent {
+            timestamp_ms: Utc::now().timestamp_millis(),
+            direction: Direction::Inbound,
+            peer_ae_title: Some(self.peer_ae_title.clone()),
+            peer_host: Some(self.peer_host.clone()),
+            command: Some(command.to_string()),
+            status,
+            message: message.into(),
+            association_id: self.association_id.clone(),
+        });
     }
 }
 
@@ -2561,14 +2620,14 @@ pub struct ScuStoreOutcome {
 }
 
 /// Sends a C-ECHO-RQ to `peer` and reports whether the round-trip
-/// completed successfully.
+/// completed successfully. Activity events are routed to `emitter`.
 pub fn scu_echo(
-    app: &AppHandle,
+    emitter: &dyn ActivityEmitter,
     local_ae: &str,
     peer: &Peer,
 ) -> Result<ScuEchoResult, AppError> {
     let start = Instant::now();
-    let ctx = ScuCtx::new(app, peer);
+    let ctx = ScuCtx::new(emitter, peer);
 
     ctx.emit_lifecycle(
         Status::Info,
@@ -2678,9 +2737,10 @@ pub fn scu_echo(
 }
 
 /// Sends a C-FIND-RQ to `peer` and collects the Pending response
-/// identifiers as `ScuFindMatch` rows.
+/// identifiers as `ScuFindMatch` rows. Activity events are routed to
+/// `emitter`.
 pub fn scu_find(
-    app: &AppHandle,
+    emitter: &dyn ActivityEmitter,
     local_ae: &str,
     peer: &Peer,
     root: QrRoot,
@@ -2689,7 +2749,7 @@ pub fn scu_find(
 ) -> Result<ScuFindResult, AppError> {
     let start = Instant::now();
     let sop_class = root.find_uid();
-    let ctx = ScuCtx::new(app, peer);
+    let ctx = ScuCtx::new(emitter, peer);
 
     ctx.emit_lifecycle(
         Status::Info,
@@ -2863,8 +2923,9 @@ pub fn scu_find(
 
 /// Sends a C-MOVE-RQ to `peer` asking it to send matched instances to
 /// `destination_ae`. Returns the final completed/failed counts.
+/// Activity events are routed to `emitter`.
 pub fn scu_move(
-    app: &AppHandle,
+    emitter: &dyn ActivityEmitter,
     local_ae: &str,
     peer: &Peer,
     root: QrRoot,
@@ -2874,7 +2935,7 @@ pub fn scu_move(
 ) -> Result<ScuMoveResult, AppError> {
     let start = Instant::now();
     let sop_class = root.move_uid();
-    let ctx = ScuCtx::new(app, peer);
+    let ctx = ScuCtx::new(emitter, peer);
 
     ctx.emit_lifecycle(
         Status::Info,
@@ -3049,13 +3110,14 @@ pub fn scu_move(
 /// once on the SCU side to discover its SOP Class UID and SOP Instance
 /// UID; failures (file unreadable, peer refuses the SOP class, etc.)
 /// are recorded per-file rather than aborting the whole batch.
+/// Activity events are routed to `emitter`.
 pub fn scu_store(
-    app: &AppHandle,
+    emitter: &dyn ActivityEmitter,
     local_ae: &str,
     peer: &Peer,
     files: &[PathBuf],
 ) -> Result<Vec<ScuStoreOutcome>, AppError> {
-    let ctx = ScuCtx::new(app, peer);
+    let ctx = ScuCtx::new(emitter, peer);
 
     ctx.emit_lifecycle(
         Status::Info,
