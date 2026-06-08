@@ -5,19 +5,19 @@
 //! - `config`   — persistent application configuration and validators.
 //! - `error`    — the single error type returned across the IPC boundary.
 //! - `store`    — SQLite-backed SOP Instance index over the local store
-//!               directory.
+//!   directory.
 //! - `dimse`    — DIMSE SCP listener (C-ECHO at M3; C-FIND at M4;
-//!               C-STORE at M5; C-MOVE / C-GET in M6).
+//!   C-STORE at M5; C-MOVE / C-GET in M6).
 //! - `activity` — persistent activity log (M9) plus the typed
-//!               `PersistedActivityEvent` shape the UI lists.
+//!   `PersistedActivityEvent` shape the UI lists.
 //! - `peers`    — configured remote DICOM peers, persisted as
-//!               peers.json. M7 in the plan, but C-MOVE in M6 needs
-//!               it to resolve Move Destination AE Titles.
+//!   peers.json. M7 in the plan, but C-MOVE in M6 needs
+//!   it to resolve Move Destination AE Titles.
 //! - `worklist` — Modality Worklist (DMWL) entries — scheduled
-//!               procedure steps, M11. Served by M12's DMWL SCP.
+//!   procedure steps, M11. Served by M12's DMWL SCP.
 //! - `mcp`      — local Model Context Protocol server (M24) exposing
-//!               read + active SCU tools over Streamable HTTP on
-//!               127.0.0.1, disabled by default.
+//!   read + active SCU tools over Streamable HTTP on
+//!   127.0.0.1, disabled by default.
 
 pub mod activity;
 pub mod config;

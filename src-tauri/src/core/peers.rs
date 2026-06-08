@@ -104,7 +104,7 @@ impl PeerStore {
             port: new.port,
         };
         guard.push(peer.clone());
-        write_atomic(&self.path, &*guard)?;
+        write_atomic(&self.path, &guard)?;
         Ok(peer)
     }
 
@@ -133,7 +133,7 @@ impl PeerStore {
         target.host = update.host;
         target.port = update.port;
         let updated = target.clone();
-        write_atomic(&self.path, &*guard)?;
+        write_atomic(&self.path, &guard)?;
         Ok(updated)
     }
 
@@ -144,7 +144,7 @@ impl PeerStore {
         if guard.len() == before {
             return Err(AppError::validation("id", format!("no peer with id {id}")));
         }
-        write_atomic(&self.path, &*guard)?;
+        write_atomic(&self.path, &guard)?;
         Ok(())
     }
 

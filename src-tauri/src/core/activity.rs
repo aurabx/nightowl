@@ -332,18 +332,15 @@ fn token_to_status(token: &str) -> Status {
 mod tests {
     use super::*;
 
-    fn temp_log() -> (std::path::PathBuf, ActivityLog) {
-        let dir = std::env::temp_dir().join(format!(
-            "phantom-activity-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("activity.sqlite");
+    fn temp_log() -> (tempfile::TempDir, ActivityLog) {
+        // `tempfile::TempDir` guarantees a unique directory per call
+        // even when tests run in parallel — a previous nanos-based
+        // scheme could collide on the same nanosecond and leak rows
+        // between tests, breaking the count assertions.
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let path = dir.path().join("activity.sqlite");
         let log = ActivityLog::open(&path).expect("open");
-        (path, log)
+        (dir, log)
     }
 
     fn sample_event(message: &str) -> ActivityEvent {

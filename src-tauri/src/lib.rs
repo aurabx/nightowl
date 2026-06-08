@@ -490,6 +490,7 @@ async fn scu_find_cmd(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 async fn scu_move_cmd(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -781,11 +782,12 @@ fn early_log_dir() -> PathBuf {
 }
 
 /// Writes `startup-breadcrumb.log` at the very top of `run()`. The
-/// presence of this file confirms the binary executed past `main()` —
-/// useful when triaging silent crashes on Windows where `panic = "abort"`
-/// + `windows_subsystem = "windows"` swallows every other signal. If the
-/// breadcrumb is missing after a failed launch, the process never ran
-/// (antivirus, missing runtime DLL, blocked binary).
+/// presence of this file confirms the binary executed past `main()`,
+/// which is useful when triaging silent crashes on Windows where
+/// `panic = "abort"` + `windows_subsystem = "windows"` swallows every
+/// other signal. If the breadcrumb is missing after a failed launch,
+/// the process never ran (commonly antivirus, a missing runtime DLL,
+/// or a blocked binary).
 fn write_startup_breadcrumb() {
     let path = early_log_dir().join("startup-breadcrumb.log");
     let ts = std::time::SystemTime::now()

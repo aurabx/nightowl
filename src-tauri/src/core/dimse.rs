@@ -1067,10 +1067,9 @@ fn handle_dmwl_find(
 /// level keys come from the first item of the Scheduled Procedure
 /// Step Sequence.
 fn build_worklist_query(identifier: &InMemDicomObject) -> WorklistQuery {
-    let mut q = WorklistQuery::default();
-    q.patient_id = worklist_key_match(identifier, tags::PATIENT_ID, true);
-    q.patient_name = worklist_key_match(identifier, tags::PATIENT_NAME, true);
-    q.accession_number = worklist_key_match(identifier, tags::ACCESSION_NUMBER, false);
+    let mut modality = None;
+    let mut scheduled_station_ae_title = None;
+    let mut scheduled_start_date = None;
 
     // Drill into the first SPS sequence item (if any) for SPS-level
     // matching keys. A real worklist client typically sends exactly
@@ -1078,17 +1077,25 @@ fn build_worklist_query(identifier: &InMemDicomObject) -> WorklistQuery {
     if let Ok(sps_element) = identifier.element(tags::SCHEDULED_PROCEDURE_STEP_SEQUENCE) {
         if let Some(items) = sps_element.value().items() {
             if let Some(item) = items.first() {
-                q.modality = worklist_key_match(item, tags::MODALITY, false);
-                q.scheduled_station_ae_title =
+                modality = worklist_key_match(item, tags::MODALITY, false);
+                scheduled_station_ae_title =
                     worklist_key_match(item, tags::SCHEDULED_STATION_AE_TITLE, false);
-                q.scheduled_start_date = worklist_key_match_date(
+                scheduled_start_date = worklist_key_match_date(
                     item,
                     tags::SCHEDULED_PROCEDURE_STEP_START_DATE,
                 );
             }
         }
     }
-    q
+
+    WorklistQuery {
+        patient_id: worklist_key_match(identifier, tags::PATIENT_ID, true),
+        patient_name: worklist_key_match(identifier, tags::PATIENT_NAME, true),
+        accession_number: worklist_key_match(identifier, tags::ACCESSION_NUMBER, false),
+        modality,
+        scheduled_station_ae_title,
+        scheduled_start_date,
+    }
 }
 
 fn worklist_key_match(
@@ -2304,6 +2311,7 @@ fn send_move_pending(
     send_command_only(association, pc_id, &rsp)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_move_final(
     association: &mut ServerAssociation<TcpStream>,
     sop_class_uid: &str,
@@ -2345,6 +2353,7 @@ fn send_get_pending(
     send_command_only(association, pc_id, &rsp)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn send_get_final(
     association: &mut ServerAssociation<TcpStream>,
     sop_class_uid: &str,

@@ -56,7 +56,7 @@ dicom-store/
 /.opencode
 /CLAUDE.md
 /opencode.json
-/.agents/
-/.automatic/
-/.claude/
-/.codex/
+/.agents/**
+/.automatic/**
+/.claude/**
+/.codex/**

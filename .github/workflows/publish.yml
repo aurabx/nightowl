@@ -1,6 +1,6 @@
 name: "publish"
 
-# Builds + signs Phantom for macOS (arm64 + intel), Linux, and Windows
+# Builds + signs NightOwl for macOS (arm64 + intel), Linux, and Windows
 # whenever main moves, and uploads to a draft GitHub release named after
 # the version in src-tauri/tauri.conf.json.
 #
@@ -62,8 +62,8 @@ jobs:
 
           if [ -z "$RELEASE_ID" ]; then
             echo "Creating a new draft release for $TAG_NAME..."
-            BODY=$(jq -nc --arg tag "$TAG_NAME" --arg name "Phantom $TAG_NAME" \
-              '{tag_name:$tag, name:$name, body:"See the assets to download this version and install.", draft:true}')
+            BODY=$(jq -nc --arg tag "$TAG_NAME" \
+              '{tag_name:$tag, name:$tag, body:"See the assets to download this version and install.", draft:true}')
             RESPONSE=$(curl -s -X POST \
               -H "Authorization: token $GITHUB_TOKEN" \
               -H "Content-Type: application/json" \
@@ -191,7 +191,7 @@ jobs:
           APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
         with:
           tagName: ${{ needs.check-or-create-release.outputs.tag_name }}
-          releaseName: "Phantom v__VERSION__"
+          releaseName: "v__VERSION__"
           releaseId: ${{ needs.check-or-create-release.outputs.release_id }}
           releaseBody: "See the assets to download this version and install."
           releaseDraft: true
