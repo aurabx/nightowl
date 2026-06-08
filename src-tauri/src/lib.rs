@@ -8,6 +8,7 @@
 //! `core` is `pub` so the sibling `nightowl-cli` binary can call into
 //! the same modules without going through Tauri's IPC layer.
 
+pub mod cli;
 pub mod core;
 
 use std::path::PathBuf;
@@ -18,13 +19,13 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use std::path::PathBuf as StdPathBuf;
 
 use core::activity::{ActivityFilter, ActivityLog, ActivityPage};
-use core::config::{AppConfig, load_or_default, save};
+use core::config::{load_or_default, save, AppConfig};
 use core::dimse::{
-    scu_echo, scu_find, scu_move, scu_store, start_listener, ListenerHandle, QrRoot,
-    ScpContext, ScuEchoResult, ScuFindResult, ScuMoveResult, ScuQueryKeys, ScuStoreOutcome,
-    TauriEmitter,
+    scu_echo, scu_find, scu_move, scu_store, start_listener, ListenerHandle, QrRoot, ScpContext,
+    ScuEchoResult, ScuFindResult, ScuMoveResult, ScuQueryKeys, ScuStoreOutcome, TauriEmitter,
 };
 use core::error::AppError;
+use core::inspect::{read_dicom_properties, DicomFileProperties};
 use core::mcp::{self, McpRuntimeState, McpStatus};
 use core::paths::{self, DataPaths};
 use core::peers::{NewPeer, Peer, PeerStore, UpdatePeer};
@@ -342,10 +343,7 @@ fn try_test_bind(port: u16) -> Result<(), AppError> {
 /// `ScanReport` is also broadcast as a `store/scan-completed` event so
 /// the Store page can re-fetch without a polling loop.
 #[tauri::command]
-async fn rescan_store(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> Result<ScanReport, AppError> {
+async fn rescan_store(app: AppHandle, state: State<'_, AppState>) -> Result<ScanReport, AppError> {
     let idx = state.index.clone();
     let dir = read_config(&state)?.store_dir;
 
@@ -360,6 +358,21 @@ async fn rescan_store(
 #[tauri::command]
 fn list_studies(state: State<'_, AppState>) -> Result<Vec<StudyRow>, AppError> {
     state.index.list_studies()
+}
+
+/// Reads the full top-level element set of a single DICOM file. Backs
+/// the drag-and-drop inspector — `path` is an absolute path the OS hands
+/// us from a drop event, so no store-relative name validation applies.
+/// Parsing can touch the whole file (pixel data included), so it runs on
+/// the blocking pool rather than the async executor, matching
+/// `rescan_store`.
+#[tauri::command]
+async fn read_dicom_file(path: String) -> Result<DicomFileProperties, AppError> {
+    tauri::async_runtime::spawn_blocking(move || {
+        read_dicom_properties(StdPathBuf::from(path).as_path())
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("read_dicom_file join error: {e}")))?
 }
 
 #[tauri::command]
@@ -419,18 +432,12 @@ fn list_peers(peers: State<'_, Arc<PeerStore>>) -> Result<Vec<Peer>, AppError> {
 }
 
 #[tauri::command]
-fn create_peer(
-    peers: State<'_, Arc<PeerStore>>,
-    peer: NewPeer,
-) -> Result<Peer, AppError> {
+fn create_peer(peers: State<'_, Arc<PeerStore>>, peer: NewPeer) -> Result<Peer, AppError> {
     peers.create(peer)
 }
 
 #[tauri::command]
-fn update_peer(
-    peers: State<'_, Arc<PeerStore>>,
-    peer: UpdatePeer,
-) -> Result<Peer, AppError> {
+fn update_peer(peers: State<'_, Arc<PeerStore>>, peer: UpdatePeer) -> Result<Peer, AppError> {
     peers.update(peer)
 }
 
@@ -505,7 +512,15 @@ async fn scu_move_cmd(
     let peer = resolve_peer(&peers, &peer_id)?;
     tauri::async_runtime::spawn_blocking(move || {
         let emitter = TauriEmitter::new(app);
-        scu_move(&emitter, &local_ae, &peer, root, level, keys, &destination_ae)
+        scu_move(
+            &emitter,
+            &local_ae,
+            &peer,
+            root,
+            level,
+            keys,
+            &destination_ae,
+        )
     })
     .await
     .map_err(|e| AppError::Internal(format!("scu_move join: {e}")))?
@@ -533,9 +548,7 @@ async fn scu_store_cmd(
 // --- Worklist (M11) --------------------------------------------------
 
 #[tauri::command]
-fn list_worklist(
-    worklist: State<'_, Arc<WorklistStore>>,
-) -> Result<Vec<WorklistEntry>, AppError> {
+fn list_worklist(worklist: State<'_, Arc<WorklistStore>>) -> Result<Vec<WorklistEntry>, AppError> {
     worklist.list()
 }
 
@@ -561,6 +574,30 @@ fn delete_worklist_entry(
     id: String,
 ) -> Result<(), AppError> {
     worklist.delete(&id)
+}
+
+// --- CLI install (Settings → Command Line) ----------------------------
+//
+// These wrap `core::cli_install`, which installs a `nightowl-cli` entry
+// on `$PATH` resolving to this desktop binary (the binary doubles as the
+// CLI). They return `Result<_, String>` rather than `AppError` because
+// the install surface is OS-shaped (symlink / path / permission
+// failures), not domain-shaped, and the frontend only renders the
+// message text.
+
+#[tauri::command]
+fn cli_install_status() -> Result<core::cli_install::CliInstallStatus, String> {
+    core::cli_install::status()
+}
+
+#[tauri::command]
+fn cli_install_install() -> Result<String, String> {
+    core::cli_install::install()
+}
+
+#[tauri::command]
+fn cli_install_uninstall() -> Result<String, String> {
+    core::cli_install::uninstall()
 }
 
 // ---------------------------------------------------------------------
@@ -771,9 +808,7 @@ fn early_log_dir() -> PathBuf {
     } else {
         std::env::var_os("XDG_DATA_HOME")
             .map(PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share"))
-            })
+            .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/share")))
             .map(|b| b.join(paths::BUNDLE_ID).join("logs"))
     };
     let dir = dir.unwrap_or_else(|| std::env::temp_dir().join(paths::BUNDLE_ID));
@@ -861,6 +896,7 @@ pub fn run() {
             save_config,
             mcp_status,
             rescan_store,
+            read_dicom_file,
             list_studies,
             list_series_for_study,
             list_instances_for_series,
@@ -881,6 +917,9 @@ pub fn run() {
             create_worklist_entry,
             update_worklist_entry,
             delete_worklist_entry,
+            cli_install_status,
+            cli_install_install,
+            cli_install_uninstall,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

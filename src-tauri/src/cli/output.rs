@@ -6,7 +6,7 @@
 
 use std::io::{self, Write};
 
-use nightowl_lib::core::error::AppError;
+use crate::core::error::AppError;
 use serde::Serialize;
 
 #[derive(Debug, Clone, Copy)]

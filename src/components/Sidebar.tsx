@@ -2,11 +2,13 @@ import {
   Activity,
   ClipboardList,
   Database,
+  FileSearch,
   Info,
   Network,
   Plug,
   Send,
   Settings,
+  Terminal,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { ComponentType, SVGProps } from "react";
@@ -17,8 +19,10 @@ export type PageId =
   | "scu"
   | "activity"
   | "store"
+  | "inspect"
   | "worklist"
   | "mcp"
+  | "cli"
   | "settings"
   | "about";
 
@@ -33,8 +37,10 @@ const ITEMS: ReadonlyArray<SidebarItem> = [
   { id: "scu", label: "SCU", icon: Send },
   { id: "activity", label: "Activity", icon: Activity },
   { id: "store", label: "Store", icon: Database },
+  { id: "inspect", label: "Inspect", icon: FileSearch },
   { id: "worklist", label: "Worklist", icon: ClipboardList },
   { id: "mcp", label: "MCP", icon: Plug },
+  { id: "cli", label: "Command Line", icon: Terminal },
   { id: "settings", label: "Settings", icon: Settings },
   { id: "about", label: "About", icon: Info },
 ];

@@ -68,6 +68,31 @@ export interface InstanceRow {
   size_bytes: number;
 }
 
+// --- DICOM file inspector --------------------------------------------
+
+/** One top-level DICOM element, mirrors `core::inspect::DicomElement`. */
+export interface DicomElement {
+  tag: string;
+  group: number;
+  element: number;
+  name: string;
+  vr: string;
+  length: number | null;
+  value: string;
+}
+
+/** Mirrors `core::inspect::DicomFileProperties`. */
+export interface DicomFileProperties {
+  file_path: string;
+  file_name: string;
+  size_bytes: number;
+  transfer_syntax_uid: string;
+  media_storage_sop_class_uid: string;
+  media_storage_sop_instance_uid: string;
+  element_count: number;
+  elements: DicomElement[];
+}
+
 export function isAppError(err: unknown): err is AppError {
   return (
     typeof err === "object" &&
@@ -123,6 +148,12 @@ export function rescanStore(): Promise<ScanReport> {
 
 export function listStudies(): Promise<StudyRow[]> {
   return invoke<StudyRow[]>("list_studies");
+}
+
+/** Reads the full top-level element set of a single DICOM file. The
+ * `path` is an absolute filesystem path (from a drop event). */
+export function readDicomFile(path: string): Promise<DicomFileProperties> {
+  return invoke<DicomFileProperties>("read_dicom_file", { path });
 }
 
 export function listSeriesForStudy(studyUid: string): Promise<SeriesRow[]> {
@@ -369,4 +400,37 @@ export function updateWorklistEntry(entry: WorklistEntry): Promise<WorklistEntry
 
 export function deleteWorklistEntry(id: string): Promise<void> {
   return invoke<void>("delete_worklist_entry", { id });
+}
+
+// --- CLI install (Settings → Command Line) ----------------------------
+
+// Mirrors `core::cli_install::CliInstallStatus`. The desktop binary
+// doubles as the CLI; "installing" puts a `nightowl-cli` entry on $PATH
+// that resolves to it.
+export type CliInstallState =
+  | "installed"
+  | "stale"
+  | "not_installed"
+  | "unsupported";
+
+export interface CliInstallStatus {
+  platform: string;
+  binary_path: string;
+  install_path: string | null;
+  status: CliInstallState;
+  path_hint: string | null;
+}
+
+export function cliInstallStatus(): Promise<CliInstallStatus> {
+  return invoke<CliInstallStatus>("cli_install_status");
+}
+
+// Resolves to the path the CLI entry was created at.
+export function cliInstall(): Promise<string> {
+  return invoke<string>("cli_install_install");
+}
+
+// Resolves to a human-readable description of what was removed.
+export function cliUninstall(): Promise<string> {
+  return invoke<string>("cli_install_uninstall");
 }

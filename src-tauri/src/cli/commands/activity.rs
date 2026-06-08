@@ -3,11 +3,11 @@
 
 use clap::{Args, Subcommand};
 
-use nightowl_lib::core::activity::ActivityFilter;
-use nightowl_lib::core::error::AppError;
+use crate::core::activity::ActivityFilter;
+use crate::core::error::AppError;
 
-use crate::context::Context;
-use crate::output::{emit_json, emit_text, OutputFormat};
+use crate::cli::context::Context;
+use crate::cli::output::{emit_json, emit_text, OutputFormat};
 
 #[derive(Subcommand, Debug)]
 pub enum Action {
@@ -111,8 +111,8 @@ fn count(ctx: &Context, format: OutputFormat) -> Result<(), AppError> {
     }
 }
 
-fn direction_label(d: &nightowl_lib::core::dimse::Direction) -> &'static str {
-    use nightowl_lib::core::dimse::Direction;
+fn direction_label(d: &crate::core::dimse::Direction) -> &'static str {
+    use crate::core::dimse::Direction;
     match d {
         Direction::Inbound => "in",
         Direction::Outbound => "out",
@@ -120,8 +120,8 @@ fn direction_label(d: &nightowl_lib::core::dimse::Direction) -> &'static str {
     }
 }
 
-fn status_label(s: &nightowl_lib::core::dimse::Status) -> &'static str {
-    use nightowl_lib::core::dimse::Status;
+fn status_label(s: &crate::core::dimse::Status) -> &'static str {
+    use crate::core::dimse::Status;
     match s {
         Status::Info => "info",
         Status::Success => "success",

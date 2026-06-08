@@ -124,9 +124,7 @@ pub struct InstanceRow {
 /// Serialised in upper-case (`"PATIENT"`, `"STUDY"`, …) matching the
 /// DICOM `QueryRetrieveLevel` (0008,0052) values, so the SCU frontend
 /// can send the level over IPC using the same vocabulary.
-#[derive(
-    Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum FindLevel {
     Patient,
@@ -471,8 +469,10 @@ impl Index {
         );
         let conn = self.lock()?;
         let mut stmt = conn.prepare(&sql)?;
-        let bound: Vec<&dyn rusqlite::ToSql> =
-            study_uids.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let bound: Vec<&dyn rusqlite::ToSql> = study_uids
+            .iter()
+            .map(|s| s as &dyn rusqlite::ToSql)
+            .collect();
         let rows = stmt
             .query_map(bound.as_slice(), |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -497,12 +497,20 @@ impl Index {
     fn find_patients(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
         let mut where_parts: Vec<String> = Vec::new();
         let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
-        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
-
-        let mut sql = String::from(
-            "SELECT patient_id, MIN(patient_name) FROM sop_instances",
+        apply_match(
+            "patient_id",
+            q.patient_id.as_ref(),
+            &mut where_parts,
+            &mut bound,
         );
+        apply_match(
+            "patient_name",
+            q.patient_name.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+
+        let mut sql = String::from("SELECT patient_id, MIN(patient_name) FROM sop_instances");
         if !where_parts.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&where_parts.join(" AND "));
@@ -528,10 +536,30 @@ impl Index {
     fn find_studies_qr(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
         let mut where_parts: Vec<String> = Vec::new();
         let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
-        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
-        apply_match("study_instance_uid", q.study_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("study_date", q.study_date.as_ref(), &mut where_parts, &mut bound);
+        apply_match(
+            "patient_id",
+            q.patient_id.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "patient_name",
+            q.patient_name.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "study_instance_uid",
+            q.study_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "study_date",
+            q.study_date.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
 
         let mut sql = String::from(
             "SELECT
@@ -576,11 +604,36 @@ impl Index {
     fn find_series_qr(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
         let mut where_parts: Vec<String> = Vec::new();
         let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
-        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
-        apply_match("study_instance_uid", q.study_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("series_instance_uid", q.series_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("modality", q.modality.as_ref(), &mut where_parts, &mut bound);
+        apply_match(
+            "patient_id",
+            q.patient_id.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "patient_name",
+            q.patient_name.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "study_instance_uid",
+            q.study_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "series_instance_uid",
+            q.series_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "modality",
+            q.modality.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
 
         let mut sql = String::from(
             "SELECT
@@ -597,7 +650,9 @@ impl Index {
             sql.push_str(" WHERE ");
             sql.push_str(&where_parts.join(" AND "));
         }
-        sql.push_str(" GROUP BY series_instance_uid ORDER BY MIN(series_description), series_instance_uid");
+        sql.push_str(
+            " GROUP BY series_instance_uid ORDER BY MIN(series_description), series_instance_uid",
+        );
 
         let conn = self.lock()?;
         let mut stmt = conn.prepare(&sql)?;
@@ -629,20 +684,57 @@ impl Index {
     /// STUDY-level query for `PatientID=12345` returns every SOP
     /// Instance under every matching study. At IMAGE level the same
     /// keys filter individual instances.
-    pub fn resolve_for_retrieve(
-        &self,
-        q: &FindQuery,
-    ) -> Result<Vec<RetrieveInstance>, AppError> {
+    pub fn resolve_for_retrieve(&self, q: &FindQuery) -> Result<Vec<RetrieveInstance>, AppError> {
         let mut where_parts: Vec<String> = Vec::new();
         let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
-        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
-        apply_match("study_instance_uid", q.study_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("study_date", q.study_date.as_ref(), &mut where_parts, &mut bound);
-        apply_match("series_instance_uid", q.series_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("modality", q.modality.as_ref(), &mut where_parts, &mut bound);
-        apply_match("sop_instance_uid", q.sop_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("sop_class_uid", q.sop_class_uid.as_ref(), &mut where_parts, &mut bound);
+        apply_match(
+            "patient_id",
+            q.patient_id.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "patient_name",
+            q.patient_name.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "study_instance_uid",
+            q.study_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "study_date",
+            q.study_date.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "series_instance_uid",
+            q.series_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "modality",
+            q.modality.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "sop_instance_uid",
+            q.sop_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "sop_class_uid",
+            q.sop_class_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
 
         let mut sql = String::from(
             "SELECT sop_instance_uid, sop_class_uid, file_path
@@ -673,13 +765,48 @@ impl Index {
     fn find_instances_qr(&self, q: &FindQuery) -> Result<Vec<FindRow>, AppError> {
         let mut where_parts: Vec<String> = Vec::new();
         let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
-        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
-        apply_match("study_instance_uid", q.study_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("series_instance_uid", q.series_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("sop_instance_uid", q.sop_instance_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("sop_class_uid", q.sop_class_uid.as_ref(), &mut where_parts, &mut bound);
-        apply_match("modality", q.modality.as_ref(), &mut where_parts, &mut bound);
+        apply_match(
+            "patient_id",
+            q.patient_id.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "patient_name",
+            q.patient_name.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "study_instance_uid",
+            q.study_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "series_instance_uid",
+            q.series_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "sop_instance_uid",
+            q.sop_instance_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "sop_class_uid",
+            q.sop_class_uid.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "modality",
+            q.modality.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
 
         let mut sql = String::from(
             "SELECT
@@ -764,8 +891,7 @@ fn map_instance_row(row: &Row<'_>) -> rusqlite::Result<InstanceRow> {
 /// elsewhere; here we treat read failure as "not a DICOM file we can
 /// index" and move on.
 fn parse_dicom(path: &Path) -> Result<ParsedInstance, String> {
-    let metadata = std::fs::metadata(path)
-        .map_err(|e| format!("stat failed: {e}"))?;
+    let metadata = std::fs::metadata(path).map_err(|e| format!("stat failed: {e}"))?;
 
     let obj: DefaultDicomObject =
         open_file(path).map_err(|e| format!("not a parseable DICOM file: {e}"))?;

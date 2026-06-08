@@ -3,6 +3,7 @@
 
 pub mod activity;
 pub mod config;
+pub mod inspect;
 pub mod instances;
 pub mod peers;
 pub mod scu;

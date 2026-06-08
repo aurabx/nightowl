@@ -156,10 +156,7 @@ impl ActivityLog {
     pub fn list(&self, filter: ActivityFilter) -> Result<ActivityPage, AppError> {
         let conn = self.lock()?;
 
-        let limit = filter
-            .limit
-            .unwrap_or(DEFAULT_LIMIT)
-            .clamp(1, MAX_LIMIT);
+        let limit = filter.limit.unwrap_or(DEFAULT_LIMIT).clamp(1, MAX_LIMIT);
         let offset = filter.offset.unwrap_or(0).max(0);
 
         // Build the WHERE clause dynamically. Each clause appends to
@@ -251,7 +248,8 @@ impl ActivityLog {
     /// from `record` every `TRIM_INTERVAL` inserts.
     fn trim_if_needed(&self) -> Result<(), AppError> {
         let conn = self.lock()?;
-        let count: i64 = conn.query_row("SELECT COUNT(*) FROM activity_events", [], |r| r.get(0))?;
+        let count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM activity_events", [], |r| r.get(0))?;
         if count > CAP_ROWS {
             let to_delete = count - CAP_ROWS;
             // Delete the oldest `to_delete` rows.

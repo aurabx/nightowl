@@ -98,11 +98,13 @@ lint-rust: ## cargo clippy with warnings as errors, across the workspace.
 
 .PHONY: fmt
 fmt: ## Auto-format Rust source.
-	cargo fmt $(CARGO_WORKSPACE_ARGS)
+	# `cargo fmt` takes `--all` (every workspace member), not the
+	# `--workspace` flag the cargo subcommands above accept.
+	cargo fmt --all
 
 .PHONY: fmt-check
 fmt-check: ## Verify Rust formatting (no rewrite).
-	cargo fmt $(CARGO_WORKSPACE_ARGS) -- --check
+	cargo fmt --all -- --check
 
 
 # --- icons -------------------------------------------------------------

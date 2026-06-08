@@ -12,35 +12,28 @@ authors = ["Aurabox"]
 # `Contents/MacOS/`, which broke codesign on x86_64 when the CLI lived
 # inside `src-tauri` (the extra unsigned subcomponent caused
 # `codesign` to refuse to sign the parent binary on Intel runners).
-# Keeping the CLI as a sibling crate within the workspace gives it
-# access to `nightowl_lib` via a path dependency without being
-# treated as part of the desktop app's bundle surface.
+#
+# The command surface itself now lives in `nightowl_lib::cli`, shared
+# with the desktop binary (which doubles as the CLI when invoked under
+# the `nightowl-cli` symlink the app installs). This crate is a thin
+# shim that forwards to `nightowl_lib::cli::run` — it exists for the
+# Windows console-subsystem case and for `cargo run -p nightowl-cli`.
 
 [[bin]]
 name = "nightowl-cli"
 path = "src/main.rs"
 
 [dependencies]
-# Shares the same business logic the desktop app uses. The path dep
-# pulls in `nightowl_lib`'s rlib build; the staticlib/cdylib crate
-# types declared on `nightowl_lib` are not used here.
+# The CLI surface (argument parsing, dispatch, output formatting) lives
+# in the library; this shim only forwards `argv` to `cli::run`, so the
+# library path dependency is the only thing it needs.
 nightowl = { path = "../src-tauri" }
-
-clap = { version = "4", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# `context.rs` resolves the user's home directory directly via
-# `directories::BaseDirs`. The library types from `nightowl_lib::core::paths`
-# handle the data dir, but the home-dir fallback the CLI uses for log
-# paths comes through this crate.
-directories = "5"
 
 [dev-dependencies]
 # End-to-end tests for the `nightowl-cli` binary. `assert_cmd` builds
 # and invokes the binary by name; `tempfile` gives each test its own
-# isolated data directory so they cannot collide with the live one.
+# isolated data directory so they cannot collide with the live one;
+# `serde_json` parses the `--json` output the tests assert against.
 assert_cmd = "2"
 tempfile = "3"
+serde_json = "1.0"

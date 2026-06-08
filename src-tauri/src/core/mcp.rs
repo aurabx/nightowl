@@ -42,6 +42,7 @@ use super::activity::{ActivityFilter, ActivityLog};
 use super::config::AppConfig;
 use super::dimse::{self, QrRoot, ScuQueryKeys};
 use super::error::AppError;
+use super::inspect::read_dicom_properties;
 use super::peers::PeerStore;
 use super::store::{FindLevel, Index};
 use super::worklist::WorklistStore;
@@ -184,6 +185,12 @@ pub struct ScuStoreParams {
     pub files: Vec<String>,
 }
 
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ReadDicomFileParams {
+    /// Absolute filesystem path to a DICOM Part-10 file to inspect.
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize, schemars::JsonSchema)]
 #[serde(default)]
 pub struct ListActivityParams {
@@ -284,7 +291,7 @@ impl NightowlMcp {
         })
     }
 
-    // ----- Read tools (10) -----
+    // ----- Read tools (11) -----
 
     #[tool(
         description = "Return NightOwl's effective configuration: local AE Title, DICOM listen port, store directory. Does NOT include the MCP server's own settings."
@@ -354,6 +361,22 @@ impl NightowlMcp {
             .map_err(|e| McpError::internal_error(format!("rescan join: {e}"), None))?
             .map_err(to_mcp_err)?;
         ok_json(&report)
+    }
+
+    #[tool(
+        description = "Read a single DICOM Part-10 file from disk and return its full top-level element set: file meta (transfer syntax, media storage SOP class/instance UID), plus every data element with its tag, keyword, VR, length and a rendered value. Sequences report an item count and binary elements a byte length. `path` must be an absolute filesystem path."
+    )]
+    async fn read_dicom_file(
+        &self,
+        Parameters(params): Parameters<ReadDicomFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let props = tauri::async_runtime::spawn_blocking(move || {
+            read_dicom_properties(std::path::Path::new(&params.path))
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("read_dicom_file join: {e}"), None))?
+        .map_err(to_mcp_err)?;
+        ok_json(&props)
     }
 
     #[tool(description = "List every Modality Worklist (DMWL) scheduled procedure step entry.")]
@@ -448,7 +471,15 @@ impl NightowlMcp {
         } = params;
         let result = tauri::async_runtime::spawn_blocking(move || {
             let emitter = dimse::TauriEmitter::new(app);
-            dimse::scu_move(&emitter, &local_ae, &peer, root, level, keys, &destination_ae)
+            dimse::scu_move(
+                &emitter,
+                &local_ae,
+                &peer,
+                root,
+                level,
+                keys,
+                &destination_ae,
+            )
         })
         .await
         .map_err(|e| McpError::internal_error(format!("scu_move join: {e}"), None))?
@@ -587,9 +618,8 @@ fn resolve_peer(peers: &PeerStore, id: &str) -> Result<super::peers::Peer, AppEr
 /// primary consumer is an LLM and the slightly larger payload is offset
 /// by improved readability inside the model's context.
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
-    let body = serde_json::to_string_pretty(value).map_err(|e| {
-        McpError::internal_error(format!("serialise tool result: {e}"), None)
-    })?;
+    let body = serde_json::to_string_pretty(value)
+        .map_err(|e| McpError::internal_error(format!("serialise tool result: {e}"), None))?;
     Ok(CallToolResult::success(vec![Content::text(body)]))
 }
 
@@ -663,8 +693,7 @@ mod tests {
             .and_then(|v| v.as_str())
             .expect("text content present");
 
-        let parsed: serde_json::Value =
-            serde_json::from_str(text).expect("body is valid JSON");
+        let parsed: serde_json::Value = serde_json::from_str(text).expect("body is valid JSON");
         assert_eq!(parsed["name"], "hi");
         assert_eq!(parsed["count"], 7);
         // Pretty-printed: contains a newline between fields. A regression
@@ -698,6 +727,7 @@ mod tests {
             "list_instances_for_series",
             "count_instances",
             "rescan_store",
+            "read_dicom_file",
             "list_worklist",
             "list_activity",
             "count_activity",
@@ -838,11 +868,8 @@ mod tests {
     #[test]
     fn scu_find_tool_input_schema_includes_query_fields() {
         let router = NightowlMcp::tool_router();
-        let tool = router
-            .get("scu_find")
-            .expect("scu_find tool registered");
-        let schema = serde_json::to_string(&tool.input_schema)
-            .expect("serialise input schema");
+        let tool = router.get("scu_find").expect("scu_find tool registered");
+        let schema = serde_json::to_string(&tool.input_schema).expect("serialise input schema");
         for needle in [
             "peer_id",
             "root",

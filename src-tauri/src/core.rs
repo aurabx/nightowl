@@ -6,6 +6,9 @@
 //! - `error`    — the single error type returned across the IPC boundary.
 //! - `store`    — SQLite-backed SOP Instance index over the local store
 //!   directory.
+//! - `inspect`  — single-file DICOM property reader backing the UI
+//!   drag-and-drop inspector, the `read_dicom_file` MCP tool and the
+//!   `inspect` CLI subcommand.
 //! - `dimse`    — DIMSE SCP listener (C-ECHO at M3; C-FIND at M4;
 //!   C-STORE at M5; C-MOVE / C-GET in M6).
 //! - `activity` — persistent activity log (M9) plus the typed
@@ -20,9 +23,11 @@
 //!   127.0.0.1, disabled by default.
 
 pub mod activity;
+pub mod cli_install;
 pub mod config;
 pub mod dimse;
 pub mod error;
+pub mod inspect;
 pub mod mcp;
 pub mod paths;
 pub mod peers;

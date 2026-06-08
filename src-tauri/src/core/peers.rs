@@ -93,7 +93,10 @@ impl PeerStore {
         if guard.iter().any(|p| p.ae_title == new.ae_title) {
             return Err(AppError::validation(
                 "ae_title",
-                format!("AE Title {} is already in use by another peer", new.ae_title),
+                format!(
+                    "AE Title {} is already in use by another peer",
+                    new.ae_title
+                ),
             ));
         }
         let peer = Peer {
@@ -119,15 +122,16 @@ impl PeerStore {
         {
             return Err(AppError::validation(
                 "ae_title",
-                format!("AE Title {} is already in use by another peer", update.ae_title),
+                format!(
+                    "AE Title {} is already in use by another peer",
+                    update.ae_title
+                ),
             ));
         }
         let target = guard
             .iter_mut()
             .find(|p| p.id == update.id)
-            .ok_or_else(|| {
-                AppError::validation("id", format!("no peer with id {}", update.id))
-            })?;
+            .ok_or_else(|| AppError::validation("id", format!("no peer with id {}", update.id)))?;
         target.name = update.name;
         target.ae_title = update.ae_title;
         target.host = update.host;
