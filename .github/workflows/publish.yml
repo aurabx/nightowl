@@ -101,7 +101,11 @@ jobs:
           - platform: "ubuntu-22.04"
             target: ""
             name: "linux"
-          - platform: "windows-latest"
+          # Pin Windows explicitly — `windows-latest` is being redirected
+          # to the `windows-2025` image as `windows-2022` is retired.
+          # Pinning keeps the runner image deterministic and avoids
+          # surprise behaviour changes when GitHub flips the alias.
+          - platform: "windows-2025"
             target: ""
             name: "windows"
 
