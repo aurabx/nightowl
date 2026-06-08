@@ -1,0 +1,46 @@
+[package]
+name = "nightowl-cli"
+version = "0.3.1"
+edition = "2021"
+rust-version = "1.77"
+description = "Command-line driver for NightOwl, mirroring the MCP tool surface."
+authors = ["Aurabox"]
+
+# Standalone crate so the binary is not pulled into the Tauri `.app`
+# bundle alongside the desktop app. Tauri 2's macOS bundler copies
+# every `[[bin]]` from the package it builds into
+# `Contents/MacOS/`, which broke codesign on x86_64 when the CLI lived
+# inside `src-tauri` (the extra unsigned subcomponent caused
+# `codesign` to refuse to sign the parent binary on Intel runners).
+# Keeping the CLI as a sibling crate within the workspace gives it
+# access to `nightowl_lib` via a path dependency without being
+# treated as part of the desktop app's bundle surface.
+
+[[bin]]
+name = "nightowl-cli"
+path = "src/main.rs"
+
+[dependencies]
+# Shares the same business logic the desktop app uses. The path dep
+# pulls in `nightowl_lib`'s rlib build; the staticlib/cdylib crate
+# types declared on `nightowl_lib` are not used here.
+nightowl = { path = "../src-tauri" }
+
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# `context.rs` resolves the user's home directory directly via
+# `directories::BaseDirs`. The library types from `nightowl_lib::core::paths`
+# handle the data dir, but the home-dir fallback the CLI uses for log
+# paths comes through this crate.
+directories = "5"
+
+[dev-dependencies]
+# End-to-end tests for the `nightowl-cli` binary. `assert_cmd` builds
+# and invokes the binary by name; `tempfile` gives each test its own
+# isolated data directory so they cannot collide with the live one.
+assert_cmd = "2"
+tempfile = "3"

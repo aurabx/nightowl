@@ -38,7 +38,10 @@ Thumbs.db
 *.sw?
 
 # Rust / Tauri
-# Cargo.lock IS committed for binaries (phantom is a binary), so do not ignore it.
+# Cargo.lock IS committed for binaries (NightOwl is a binary), so do not ignore it.
+# The workspace target directory lives at the repo root; src-tauri/target is
+# left over from the pre-0.3.1 single-crate layout and never reappears.
+/target/
 src-tauri/target/
 src-tauri/gen/
 

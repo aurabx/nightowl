@@ -1,0 +1,17 @@
+[workspace]
+resolver = "2"
+members = [
+    "src-tauri",
+    "nightowl-cli",
+]
+
+# Workspace-wide release profile. The desktop app and the CLI share the
+# same optimisation settings so binaries shipped together behave the
+# same. `panic = "abort"` matches the Tauri requirement for Windows
+# (its `windows_subsystem = "windows"` swallows panic unwinds).
+[profile.release]
+panic = "abort"
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

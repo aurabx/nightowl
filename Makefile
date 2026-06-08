@@ -9,7 +9,10 @@ SHELL := /bin/bash
 
 # --- paths -------------------------------------------------------------
 
-CARGO_MANIFEST := src-tauri/Cargo.toml
+# Cargo workspace root. Members: `src-tauri` (Tauri desktop app) and
+# `nightowl-cli` (standalone CLI). `--workspace` runs the action across
+# both members in one invocation.
+CARGO_WORKSPACE_ARGS := --workspace
 
 # Default source image for icon regeneration; override with
 #   make icons ICON_SRC=path/to/source.png
@@ -72,8 +75,8 @@ build-web: node_modules ## Type-check + bundle the frontend only.
 check: check-rust check-web ## Compile-check both halves.
 
 .PHONY: check-rust
-check-rust: ## cargo check the Rust backend.
-	cargo check --manifest-path $(CARGO_MANIFEST)
+check-rust: ## cargo check across the workspace.
+	cargo check $(CARGO_WORKSPACE_ARGS)
 
 .PHONY: check-web
 check-web: node_modules ## tsc + vite type-check (no emit).
@@ -83,23 +86,23 @@ check-web: node_modules ## tsc + vite type-check (no emit).
 test: test-rust ## Run all tests.
 
 .PHONY: test-rust
-test-rust: ## Run Rust unit + doc tests.
-	cargo test --manifest-path $(CARGO_MANIFEST)
+test-rust: ## Run Rust unit + doc + CLI integration tests.
+	cargo test $(CARGO_WORKSPACE_ARGS)
 
 .PHONY: lint
 lint: lint-rust ## Run linters.
 
 .PHONY: lint-rust
-lint-rust: ## cargo clippy with warnings as errors.
-	cargo clippy --manifest-path $(CARGO_MANIFEST) --all-targets -- -D warnings
+lint-rust: ## cargo clippy with warnings as errors, across the workspace.
+	cargo clippy $(CARGO_WORKSPACE_ARGS) --all-targets -- -D warnings
 
 .PHONY: fmt
 fmt: ## Auto-format Rust source.
-	cargo fmt --manifest-path $(CARGO_MANIFEST)
+	cargo fmt $(CARGO_WORKSPACE_ARGS)
 
 .PHONY: fmt-check
 fmt-check: ## Verify Rust formatting (no rewrite).
-	cargo fmt --manifest-path $(CARGO_MANIFEST) -- --check
+	cargo fmt $(CARGO_WORKSPACE_ARGS) -- --check
 
 
 # --- icons -------------------------------------------------------------
@@ -183,7 +186,7 @@ kill-dev: ## Force-kill any lingering dev processes and free relevant ports.
 
 .PHONY: clean
 clean: ## Remove build artifacts (target/, dist/) but keep node_modules.
-	rm -rf src-tauri/target dist src-tauri/gen
+	rm -rf target dist src-tauri/gen src-tauri/target
 
 .PHONY: distclean
 distclean: clean ## clean + also drop node_modules and lockfile-cached state.

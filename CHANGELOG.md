@@ -5,6 +5,34 @@ All notable changes to NightOwl are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-06-09
+
+### Fixed
+- macOS x86_64 release builds no longer fail at codesign. In 0.3.0,
+  `nightowl-cli` was a second `[[bin]]` in the `nightowl` package, so
+  Tauri's bundler copied both binaries into `NightOwl.app/Contents/MacOS/`.
+  On Intel runners, `codesign` rejected the parent binary because the
+  inner `nightowl-cli` subcomponent had no signature yet ("code object
+  is not signed at all"). arm64 happened to win the signing-order race
+  but Intel did not.
+- Promoted the repo to a Cargo workspace with two members: `src-tauri`
+  (the Tauri desktop crate) and `nightowl-cli` (the standalone CLI
+  crate). The `.app` bundle now contains only the desktop binary; the
+  CLI is built into the workspace `target/` and is no longer pulled
+  into the macOS app bundle.
+
+### Changed
+- `make check` / `make test` / `make lint` now run across both
+  workspace members via `cargo --workspace`.
+- `Cargo.lock` lives at the workspace root; the old
+  `src-tauri/Cargo.lock` has been removed.
+
+### Known follow-up
+- `nightowl-cli` is not yet uploaded as a release artifact. The macOS
+  `.app` and Windows / Linux installers are unaffected. Tracking a
+  separate workflow change to ship the CLI binaries alongside the
+  desktop bundle.
+
 ## [0.3.0] — 2026-06-08
 
 ### Added
@@ -55,6 +83,7 @@ management, Modality Worklist (M11) with DMWL SCP (M12), persistent
 activity log, and an opt-in local MCP server exposing read + SCU
 tools (M24).
 
+[0.3.1]: https://github.com/aurabx/nightowl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/aurabx/nightowl/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/aurabx/nightowl/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/aurabx/nightowl/releases/tag/v0.1.0

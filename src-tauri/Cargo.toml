@@ -1,38 +1,16 @@
 [package]
 name = "nightowl"
-version = "0.3.0"
+version = "0.3.1"
 description = "NightOwl — Tauri desktop app for testing DICOM services"
 authors = ["Aurabox"]
 edition = "2021"
 rust-version = "1.77"
-# The desktop app is the default binary. Required now that the crate
-# has a second `[[bin]]` (`nightowl-cli`) — Tauri's bundler and bare
-# `cargo run` both need to know which binary they should pick.
-default-run = "nightowl"
-# Disable Cargo's auto-discovery of `src/bin/*` so the CLI directory
-# layout (`src/bin/cli/main.rs`) is not also exposed as a phantom
-# binary called `cli`, which Tauri's bundler would then try to copy.
-# Both binaries are declared explicitly below.
-autobins = false
 
 # The library crate exposes `run()` for both the desktop binary (main.rs)
 # and any future mobile entrypoints. Keep main.rs thin per CLAUDE.md.
 [lib]
 name = "nightowl_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
-
-# Desktop app entry point. Explicit because `autobins = false` turned
-# off Cargo's auto-discovery of `src/main.rs`.
-[[bin]]
-name = "nightowl"
-path = "src/main.rs"
-
-# The CLI binary mirrors the MCP tool surface. It opens the same SQLite
-# stores and config files the desktop app uses (SQLite is in WAL mode so
-# concurrent access is safe) and calls the same `core` functions.
-[[bin]]
-name = "nightowl-cli"
-path = "src/bin/nightowl-cli/main.rs"
 
 [build-dependencies]
 tauri-build = { version = "2.6", features = [] }
@@ -77,9 +55,6 @@ uuid = { version = "1.23", features = ["v4", "serde"] }
 # location without depending on Tauri.
 directories = "5"
 
-# CLI argument parser for the `nightowl-cli` binary.
-clap = { version = "4", features = ["derive"] }
-
 # Wall-clock timestamps for the activity stream.
 chrono = { version = "0.4", features = ["serde"] }
 
@@ -95,17 +70,8 @@ axum = "0.8"
 tower = "0.5"
 schemars = "1.2"
 
-[profile.release]
-panic = "abort"
-codegen-units = 1
-lto = true
-opt-level = "s"
-strip = true
-
 [dev-dependencies]
 reqwest = { version = "0.13.3", default-features = false, features = ["json"] }
-# End-to-end tests for the `nightowl-cli` binary. `assert_cmd` builds
-# and invokes the binary by name; `tempfile` gives each test its own
-# isolated data directory so they cannot collide with the live one.
-assert_cmd = "2"
+# `tempfile` is used by activity-log unit tests to give each test an
+# isolated SQLite file even under cargo's parallel test execution.
 tempfile = "3"
