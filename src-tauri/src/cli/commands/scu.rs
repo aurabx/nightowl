@@ -5,15 +5,13 @@ use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
 
-use nightowl_lib::core::dimse::{
-    scu_echo, scu_find, scu_move, scu_store, QrRoot, ScuQueryKeys,
-};
-use nightowl_lib::core::error::AppError;
-use nightowl_lib::core::peers::{Peer, PeerStore};
-use nightowl_lib::core::store::FindLevel;
+use crate::core::dimse::{scu_echo, scu_find, scu_move, scu_store, QrRoot, ScuQueryKeys};
+use crate::core::error::AppError;
+use crate::core::peers::{Peer, PeerStore};
+use crate::core::store::FindLevel;
 
-use crate::context::Context;
-use crate::output::{emit_json, emit_text, OutputFormat};
+use crate::cli::context::Context;
+use crate::cli::output::{emit_json, emit_text, OutputFormat};
 
 #[derive(Subcommand, Debug)]
 pub enum Action {

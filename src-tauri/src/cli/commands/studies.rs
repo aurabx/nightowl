@@ -3,10 +3,10 @@
 
 use clap::Subcommand;
 
-use nightowl_lib::core::error::AppError;
+use crate::core::error::AppError;
 
-use crate::context::Context;
-use crate::output::{emit_json, emit_text, OutputFormat};
+use crate::cli::context::Context;
+use crate::cli::output::{emit_json, emit_text, OutputFormat};
 
 #[derive(Subcommand, Debug)]
 pub enum Action {

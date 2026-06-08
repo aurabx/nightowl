@@ -12,14 +12,14 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use nightowl_lib::core::activity::ActivityLog;
-use nightowl_lib::core::config::{load_or_default, AppConfig};
-use nightowl_lib::core::dimse::LogEmitter;
-use nightowl_lib::core::error::AppError;
-use nightowl_lib::core::paths::{self, DataPaths};
-use nightowl_lib::core::peers::PeerStore;
-use nightowl_lib::core::store::Index;
-use nightowl_lib::core::worklist::WorklistStore;
+use crate::core::activity::ActivityLog;
+use crate::core::config::{load_or_default, AppConfig};
+use crate::core::dimse::LogEmitter;
+use crate::core::error::AppError;
+use crate::core::paths::{self, DataPaths};
+use crate::core::peers::PeerStore;
+use crate::core::store::Index;
+use crate::core::worklist::WorklistStore;
 
 /// Opened-once handles every CLI subcommand needs.
 pub struct Context {

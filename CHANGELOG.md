@@ -5,6 +5,38 @@ All notable changes to NightOwl are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Install the CLI from the app. A new **Command Line** tab installs a
+  `nightowl-cli` command on your `PATH` with one click, and shows live
+  install status (installed / stale / not installed) plus the binary and
+  install paths. On macOS and Linux it symlinks `/usr/local/bin/nightowl-cli`
+  (or `~/.local/bin/nightowl-cli` when the former is not writable) to the
+  app binary; **Uninstall** removes only an entry that points back at
+  NightOwl. Windows is reported as not-yet-supported in the tab rather
+  than installing something that would not work.
+- DICOM file inspector. A new **Inspect** page lets you drag a DICOM
+  Part-10 file onto a dropzone to read its file-meta header (transfer
+  syntax, media storage SOP class / instance UID) and a filterable
+  table of every top-level data element (tag, keyword, VR, length,
+  value). The same capability is exposed as the `read_dicom_file` MCP
+  tool and the `nightowl-cli inspect file <path>` subcommand. Sequences
+  report an item count and binary elements a byte length; long text
+  values are truncated for display.
+
+### Changed
+- The desktop binary now doubles as the CLI. The command surface moved
+  out of the `nightowl-cli` crate into `nightowl_lib::cli`; the desktop
+  binary dispatches to it when invoked under the `nightowl-cli` name (or
+  with a CLI verb), and the `nightowl-cli` crate is now a thin shim that
+  forwards to the same entrypoint. This is what lets the Command Line tab
+  install the CLI by symlinking the already-signed app binary, and it
+  resolves the 0.3.1 "Known follow-up": the CLI now ships *inside* the
+  desktop app rather than needing a separate release artifact, so no
+  extra binary is bundled into the macOS `.app` and the x86_64 codesign
+  path is unaffected.
+
 ## [0.3.1] — 2026-06-09
 
 ### Fixed

@@ -334,8 +334,8 @@ mod tests {
 
         save(&cfg_path, &cfg).expect("save ok");
 
-        let loaded = load_or_default(&cfg_path, AppConfig::default_with_home(&tmp_dir))
-            .expect("load ok");
+        let loaded =
+            load_or_default(&cfg_path, AppConfig::default_with_home(&tmp_dir)).expect("load ok");
         assert_eq!(loaded, cfg);
 
         let _ = std::fs::remove_dir_all(&tmp_dir);

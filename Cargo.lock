@@ -2531,6 +2531,7 @@ version = "0.3.1"
 dependencies = [
  "axum",
  "chrono",
+ "clap",
  "dicom-core",
  "dicom-dictionary-std",
  "dicom-encoding",
@@ -2561,14 +2562,9 @@ name = "nightowl-cli"
 version = "0.3.1"
 dependencies = [
  "assert_cmd",
- "clap",
- "directories",
  "nightowl",
- "serde",
  "serde_json",
  "tempfile",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

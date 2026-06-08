@@ -51,8 +51,8 @@ pub fn data_paths_from(dir: &Path) -> DataPaths {
 ///   (typically `~/.config/cloud.aurabox.nightowl/`)
 /// - Windows: `%APPDATA%\cloud.aurabox.nightowl\`
 pub fn default_data_dir() -> Result<PathBuf, AppError> {
-    let base = BaseDirs::new()
-        .ok_or_else(|| AppError::Io("no home directory available".to_string()))?;
+    let base =
+        BaseDirs::new().ok_or_else(|| AppError::Io("no home directory available".to_string()))?;
     Ok(base.config_dir().join(BUNDLE_ID))
 }
 
@@ -67,8 +67,7 @@ mod tests {
     #[test]
     fn bundle_id_matches_tauri_conf() {
         let conf = include_str!("../../tauri.conf.json");
-        let parsed: serde_json::Value =
-            serde_json::from_str(conf).expect("parse tauri.conf.json");
+        let parsed: serde_json::Value = serde_json::from_str(conf).expect("parse tauri.conf.json");
         let identifier = parsed["identifier"]
             .as_str()
             .expect("tauri.conf.json missing string `identifier`");

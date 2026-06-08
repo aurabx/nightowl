@@ -179,7 +179,9 @@ impl WorklistStore {
                 .scheduled_procedure_step_id
                 .filter(|s| !s.trim().is_empty())
                 .unwrap_or_else(|| format!("SPS-{}", Uuid::new_v4().simple())),
-            scheduled_procedure_step_description: optional(new.scheduled_procedure_step_description),
+            scheduled_procedure_step_description: optional(
+                new.scheduled_procedure_step_description,
+            ),
             modality: new.modality,
         };
         let conn = self.lock()?;
@@ -282,8 +284,7 @@ impl WorklistStore {
 
     pub fn count(&self) -> Result<i64, AppError> {
         let conn = self.lock()?;
-        let n: i64 =
-            conn.query_row("SELECT COUNT(*) FROM worklist_entries", [], |r| r.get(0))?;
+        let n: i64 = conn.query_row("SELECT COUNT(*) FROM worklist_entries", [], |r| r.get(0))?;
         Ok(n)
     }
 
@@ -295,10 +296,30 @@ impl WorklistStore {
         let mut where_parts: Vec<String> = Vec::new();
         let mut bound: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
-        apply_match("patient_id", q.patient_id.as_ref(), &mut where_parts, &mut bound);
-        apply_match("patient_name", q.patient_name.as_ref(), &mut where_parts, &mut bound);
-        apply_match("accession_number", q.accession_number.as_ref(), &mut where_parts, &mut bound);
-        apply_match("modality", q.modality.as_ref(), &mut where_parts, &mut bound);
+        apply_match(
+            "patient_id",
+            q.patient_id.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "patient_name",
+            q.patient_name.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "accession_number",
+            q.accession_number.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
+        apply_match(
+            "modality",
+            q.modality.as_ref(),
+            &mut where_parts,
+            &mut bound,
+        );
         apply_match(
             "scheduled_station_ae_title",
             q.scheduled_station_ae_title.as_ref(),
@@ -374,7 +395,10 @@ fn validate(
         ));
     }
     if patient_id.trim().is_empty() {
-        return Err(AppError::validation("patient_id", "Patient ID is required."));
+        return Err(AppError::validation(
+            "patient_id",
+            "Patient ID is required.",
+        ));
     }
     if patient_name.trim().is_empty() {
         return Err(AppError::validation(

@@ -153,6 +153,31 @@ uses (SQLite runs in WAL mode, so concurrent access from the app and
 the CLI is safe) and calls the same business-logic functions
 in-process. There is no IPC step.
 
+The desktop binary *is* the CLI: when it is invoked under the name
+`nightowl-cli` it dispatches to the command surface instead of opening a
+window. There is no separate download — installing NightOwl installs the
+CLI too.
+
+### Installing the CLI
+
+Open NightOwl and go to the **Command Line** tab in the sidebar, then
+click **Install**. This is the only step.
+
+- **macOS / Linux** — NightOwl creates a `nightowl-cli` symlink in
+  `/usr/local/bin` (when writable) or `~/.local/bin`, pointing at the
+  app binary. If it lands in `~/.local/bin` and that directory is not on
+  your `PATH`, the tab tells you the one line to add to your shell
+  profile. Open a new terminal and run `nightowl-cli --help` to confirm.
+- **Windows** — installing the CLI from the app is not supported yet, and
+  the Command Line tab says so directly. The desktop binary is a
+  windows-subsystem app and cannot write to the invoking shell, so a
+  Windows CLI needs the standalone `nightowl-cli.exe` console binary to
+  be shipped in the installer — packaging work that is not done yet.
+
+To remove the command, click **Uninstall** on the same tab. It only
+removes a `nightowl-cli` entry that points at the NightOwl binary; a
+`nightowl-cli` that resolves elsewhere is left untouched.
+
 ### Global flags
 
 - `--data-dir <path>` — Override the data directory. Defaults to the

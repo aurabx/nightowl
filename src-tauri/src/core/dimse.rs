@@ -33,10 +33,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use dicom_core::{dicom_value, DataElement, Tag, VR};
-use dicom_dictionary_std::tags;
 use dicom_core::value::{DataSetSequence, Value};
 use dicom_core::Length;
+use dicom_core::{dicom_value, DataElement, Tag, VR};
+use dicom_dictionary_std::tags;
 use dicom_dictionary_std::uids::{
     COMPUTED_RADIOGRAPHY_IMAGE_STORAGE, CT_IMAGE_STORAGE,
     DIGITAL_X_RAY_IMAGE_STORAGE_FOR_PRESENTATION, ENCAPSULATED_PDF_STORAGE,
@@ -44,21 +44,20 @@ use dicom_dictionary_std::uids::{
     MODALITY_WORKLIST_INFORMATION_MODEL_FIND, MR_IMAGE_STORAGE,
     PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
     PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET,
-    PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE,
-    SECONDARY_CAPTURE_IMAGE_STORAGE, STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
+    PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE, SECONDARY_CAPTURE_IMAGE_STORAGE,
+    STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_FIND,
     STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET,
-    STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE, ULTRASOUND_IMAGE_STORAGE,
-    VERIFICATION,
+    STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE, ULTRASOUND_IMAGE_STORAGE, VERIFICATION,
 };
-use dicom_object::{open_file, FileMetaTableBuilder};
-use dicom_ul::association::client::ClientAssociationOptions;
-use dicom_ul::association::ClientAssociation;
-use dicom_ul::pdu::PresentationContextResultReason;
 use dicom_encoding::transfer_syntax::{TransferSyntax, TransferSyntaxIndex};
 use dicom_object::InMemDicomObject;
+use dicom_object::{open_file, FileMetaTableBuilder};
 use dicom_transfer_syntax_registry::TransferSyntaxRegistry;
+use dicom_ul::association::client::ClientAssociationOptions;
 use dicom_ul::association::server::{ServerAssociation, ServerAssociationOptions};
 use dicom_ul::association::Association;
+use dicom_ul::association::ClientAssociation;
+use dicom_ul::pdu::PresentationContextResultReason;
 use dicom_ul::pdu::{PDataValue, PDataValueType, Pdu};
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, Manager};
@@ -68,9 +67,7 @@ use super::activity::{ActivityLog, PersistedActivityEvent};
 use super::error::AppError;
 use super::peers::{Peer, PeerStore};
 use super::store::{FindLevel, FindQuery, FindRow, Index, KeyMatch, RetrieveInstance};
-use super::worklist::{
-    KeyMatch as WlKeyMatch, WorklistEntry, WorklistQuery, WorklistStore,
-};
+use super::worklist::{KeyMatch as WlKeyMatch, WorklistEntry, WorklistQuery, WorklistStore};
 
 // DIMSE Command Field values (PS3.7 Table 7.1-1). Listed even when
 // unused at M3 so the table is in one place for M4/M5/M6.
@@ -337,10 +334,8 @@ impl ListenerHandle {
             return;
         }
         let wake_addr = SocketAddr::from(([127, 0, 0, 1], self.bind_port));
-        let _ = std::net::TcpStream::connect_timeout(
-            &wake_addr,
-            std::time::Duration::from_millis(500),
-        );
+        let _ =
+            std::net::TcpStream::connect_timeout(&wake_addr, std::time::Duration::from_millis(500));
         if let Ok(mut guard) = self.join.lock() {
             if let Some(handle) = guard.take() {
                 let _ = handle.join();
@@ -443,14 +438,7 @@ fn run_accept_loop(
         if let Err(err) = std::thread::Builder::new()
             .name(format!("phantom-scp-{}", local_seq))
             .spawn(move || {
-                handle_association(
-                    stream,
-                    peer,
-                    ae_clone,
-                    app_clone,
-                    scp_clone,
-                    association_id,
-                );
+                handle_association(stream, peer, ae_clone, app_clone, scp_clone, association_id);
             })
         {
             tracing::error!(error = %err, "spawn association thread failed");
@@ -584,10 +572,7 @@ fn handle_association(
                             break;
                         }
                         Err(err) => {
-                            ctx.emit_lifecycle(
-                                Status::Error,
-                                format!("dispatch failed: {err}"),
-                            );
+                            ctx.emit_lifecycle(Status::Error, format!("dispatch failed: {err}"));
                             let _ = association.inner_stream().shutdown(Shutdown::Both);
                             return;
                         }
@@ -643,8 +628,7 @@ fn handle_pdv(
         PDataValueType::Command => {
             let command = parse_command_set(&pdv.data)?;
             let data_expected =
-                read_u16(&command, tags::COMMAND_DATA_SET_TYPE).unwrap_or(NO_DATASET)
-                    != NO_DATASET;
+                read_u16(&command, tags::COMMAND_DATA_SET_TYPE).unwrap_or(NO_DATASET) != NO_DATASET;
             if data_expected {
                 *in_flight = Some(InFlightCommand {
                     command,
@@ -1050,7 +1034,14 @@ fn handle_dmwl_find(
         }
     }
 
-    send_c_find_final(association, ctx, &sop_class_uid, message_id, pc_id, STATUS_SUCCESS)?;
+    send_c_find_final(
+        association,
+        ctx,
+        &sop_class_uid,
+        message_id,
+        pc_id,
+        STATUS_SUCCESS,
+    )?;
     ctx.emit_outbound(
         "C-FIND-RSP",
         format!(
@@ -1080,10 +1071,8 @@ fn build_worklist_query(identifier: &InMemDicomObject) -> WorklistQuery {
                 modality = worklist_key_match(item, tags::MODALITY, false);
                 scheduled_station_ae_title =
                     worklist_key_match(item, tags::SCHEDULED_STATION_AE_TITLE, false);
-                scheduled_start_date = worklist_key_match_date(
-                    item,
-                    tags::SCHEDULED_PROCEDURE_STEP_START_DATE,
-                );
+                scheduled_start_date =
+                    worklist_key_match_date(item, tags::SCHEDULED_PROCEDURE_STEP_START_DATE);
             }
         }
     }
@@ -1174,7 +1163,10 @@ fn build_dmwl_response(entry: &WorklistEntry) -> InMemDicomObject {
     rsp.put_element(DataElement::new(
         tags::REQUESTED_PROCEDURE_DESCRIPTION,
         VR::LO,
-        entry.requested_procedure_description.clone().unwrap_or_default(),
+        entry
+            .requested_procedure_description
+            .clone()
+            .unwrap_or_default(),
     ));
 
     // Scheduled Procedure Step Sequence — one item with the SPS-level
@@ -1195,7 +1187,10 @@ fn build_dmwl_response(entry: &WorklistEntry) -> InMemDicomObject {
     sps_item.put_element(DataElement::new(
         tags::SCHEDULED_PROCEDURE_STEP_START_TIME,
         VR::TM,
-        entry.scheduled_procedure_step_start_time.clone().unwrap_or_default(),
+        entry
+            .scheduled_procedure_step_start_time
+            .clone()
+            .unwrap_or_default(),
     ));
     sps_item.put_element(DataElement::new(
         tags::MODALITY,
@@ -1210,7 +1205,10 @@ fn build_dmwl_response(entry: &WorklistEntry) -> InMemDicomObject {
     sps_item.put_element(DataElement::new(
         tags::SCHEDULED_PROCEDURE_STEP_DESCRIPTION,
         VR::LO,
-        entry.scheduled_procedure_step_description.clone().unwrap_or_default(),
+        entry
+            .scheduled_procedure_step_description
+            .clone()
+            .unwrap_or_default(),
     ));
 
     let seq = DataSetSequence::new(vec![sps_item], Length::UNDEFINED);
@@ -1419,7 +1417,14 @@ fn handle_c_store(
     // Anything below this point is a peer-data failure rather than a
     // protocol failure: we want to send back a C-STORE-RSP with a
     // failure status so the SCU sees the problem, then move on.
-    let status = match ingest_c_store(scp, &sop_class_uid, &sop_instance_uid, data, pc_id, association) {
+    let status = match ingest_c_store(
+        scp,
+        &sop_class_uid,
+        &sop_instance_uid,
+        data,
+        pc_id,
+        association,
+    ) {
         Ok(path) => {
             ctx.emit_lifecycle(
                 Status::Success,
@@ -1428,10 +1433,7 @@ fn handle_c_store(
             STATUS_SUCCESS
         }
         Err(err) => {
-            ctx.emit_lifecycle(
-                Status::Error,
-                format!("C-STORE ingest failed: {err}"),
-            );
+            ctx.emit_lifecycle(Status::Error, format!("C-STORE ingest failed: {err}"));
             // Treat decode / validation failures as "processing
             // failure" and disk/IO failures as "out of resources".
             match err {
@@ -1690,12 +1692,21 @@ fn handle_c_move(
     // Open an SCU association to the destination negotiating every
     // SOP Class we know we'll need (and a few extras — over-offering
     // is cheap and saves a reconnect if there's a mix of modalities).
-    let mut scu = match open_storage_scu(&scp.local_ae_title, &destination.ae_title, &destination.host, destination.port, &instances) {
+    let mut scu = match open_storage_scu(
+        &scp.local_ae_title,
+        &destination.ae_title,
+        &destination.host,
+        destination.port,
+        &instances,
+    ) {
         Ok(s) => s,
         Err(err) => {
             ctx.emit_lifecycle(
                 Status::Error,
-                format!("could not open SCU association to {}: {err}", destination.ae_title),
+                format!(
+                    "could not open SCU association to {}: {err}",
+                    destination.ae_title
+                ),
             );
             send_move_final(
                 association,
@@ -1908,10 +1919,8 @@ fn open_storage_scu(
     port: u16,
     instances: &[RetrieveInstance],
 ) -> Result<ClientAssociation<TcpStream>, AppError> {
-    let mut distinct_sop_classes: Vec<&str> = instances
-        .iter()
-        .map(|i| i.sop_class_uid.as_str())
-        .collect();
+    let mut distinct_sop_classes: Vec<&str> =
+        instances.iter().map(|i| i.sop_class_uid.as_str()).collect();
     distinct_sop_classes.sort();
     distinct_sop_classes.dedup();
 
@@ -2417,10 +2426,7 @@ fn lookup_ts(uid: &str) -> Result<&'static TransferSyntax, AppError> {
         .ok_or_else(|| AppError::Internal(format!("transfer syntax not in registry: {uid}")))
 }
 
-fn encode_identifier(
-    obj: &InMemDicomObject,
-    ts: &TransferSyntax,
-) -> Result<Vec<u8>, AppError> {
+fn encode_identifier(obj: &InMemDicomObject, ts: &TransferSyntax) -> Result<Vec<u8>, AppError> {
     let mut bytes: Vec<u8> = Vec::with_capacity(1024);
     obj.write_dataset_with_ts(&mut bytes, ts)
         .map_err(|e| AppError::Internal(format!("identifier encode: {e}")))?;
@@ -2662,13 +2668,9 @@ pub fn scu_echo(
 
     ctx.emit_lifecycle(Status::Info, "association established".to_string());
 
-    let pc = match association
-        .presentation_contexts()
-        .iter()
-        .find(|p| {
-            p.reason == PresentationContextResultReason::Acceptance
-                && p.abstract_syntax == VERIFICATION
-        }) {
+    let pc = match association.presentation_contexts().iter().find(|p| {
+        p.reason == PresentationContextResultReason::Acceptance && p.abstract_syntax == VERIFICATION
+    }) {
         Some(p) => p,
         None => {
             ctx.emit_lifecycle(
@@ -2870,7 +2872,10 @@ pub fn scu_find(
                                     "association released".to_string(),
                                 );
                                 let elapsed_ms = start.elapsed().as_millis() as u64;
-                                return Ok(ScuFindResult { matches, elapsed_ms });
+                                return Ok(ScuFindResult {
+                                    matches,
+                                    elapsed_ms,
+                                });
                             } else {
                                 ctx.emit_inbound(
                                     Status::Error,
@@ -2989,11 +2994,7 @@ pub fn scu_move(
             VR::US,
             dicom_value!(U16, [DATASET_PRESENT]),
         ),
-        DataElement::new(
-            tags::MOVE_DESTINATION,
-            VR::AE,
-            destination_ae.to_string(),
-        ),
+        DataElement::new(tags::MOVE_DESTINATION, VR::AE, destination_ae.to_string()),
     ]);
     let cmd_bytes = encode_command_set(&cmd)?;
 
@@ -3178,26 +3179,27 @@ pub fn scu_store(
     }
 
     // Open one association, negotiating every SOP class present.
-    let just_instances: Vec<RetrieveInstance> =
-        instances.iter().map(|(_, i)| i.clone()).collect();
-    let mut association =
-        match open_storage_scu(local_ae, &peer.ae_title, &peer.host, peer.port, &just_instances) {
-            Ok(a) => a,
-            Err(err) => {
-                ctx.emit_lifecycle(Status::Error, format!("establish failed: {err}"));
-                // Whole batch fails if we can't even open.
-                for (idx, _) in &instances {
-                    outcomes[*idx].message = format!("could not open SCU association: {err}");
-                }
-                return Ok(outcomes);
+    let just_instances: Vec<RetrieveInstance> = instances.iter().map(|(_, i)| i.clone()).collect();
+    let mut association = match open_storage_scu(
+        local_ae,
+        &peer.ae_title,
+        &peer.host,
+        peer.port,
+        &just_instances,
+    ) {
+        Ok(a) => a,
+        Err(err) => {
+            ctx.emit_lifecycle(Status::Error, format!("establish failed: {err}"));
+            // Whole batch fails if we can't even open.
+            for (idx, _) in &instances {
+                outcomes[*idx].message = format!("could not open SCU association: {err}");
             }
-        };
+            return Ok(outcomes);
+        }
+    };
 
     for (idx, inst) in &instances {
-        ctx.emit_outbound(
-            "C-STORE-RQ",
-            format!("sop {}", inst.sop_instance_uid),
-        );
+        ctx.emit_outbound("C-STORE-RQ", format!("sop {}", inst.sop_instance_uid));
         match forward_via_c_store(&mut association, inst, None) {
             Ok(_) => {
                 outcomes[*idx].success = true;
@@ -3290,15 +3292,30 @@ fn build_scu_identifier(level: FindLevel, keys: &ScuQueryKeys) -> InMemDicomObje
         level_str.to_string(),
     ));
 
-    put_query_value(&mut obj, tags::PATIENT_ID, VR::LO, keys.patient_id.as_deref());
-    put_query_value(&mut obj, tags::PATIENT_NAME, VR::PN, keys.patient_name.as_deref());
+    put_query_value(
+        &mut obj,
+        tags::PATIENT_ID,
+        VR::LO,
+        keys.patient_id.as_deref(),
+    );
+    put_query_value(
+        &mut obj,
+        tags::PATIENT_NAME,
+        VR::PN,
+        keys.patient_name.as_deref(),
+    );
     put_query_value(
         &mut obj,
         tags::STUDY_INSTANCE_UID,
         VR::UI,
         keys.study_instance_uid.as_deref(),
     );
-    put_query_value(&mut obj, tags::STUDY_DATE, VR::DA, keys.study_date.as_deref());
+    put_query_value(
+        &mut obj,
+        tags::STUDY_DATE,
+        VR::DA,
+        keys.study_date.as_deref(),
+    );
     put_query_value(&mut obj, tags::MODALITY, VR::CS, keys.modality.as_deref());
     put_query_value(
         &mut obj,

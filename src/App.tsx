@@ -5,8 +5,10 @@ import { PeersPage } from "./pages/Peers";
 import { ScuPage } from "./pages/Scu";
 import { ActivityPage } from "./pages/Activity";
 import { StorePage } from "./pages/Store";
+import { InspectPage } from "./pages/Inspect";
 import { WorklistPage } from "./pages/Worklist";
 import { McpPage } from "./pages/Mcp";
+import { CommandLinePage } from "./pages/CommandLine";
 import { SettingsPage } from "./pages/Settings";
 import { AboutPage } from "./pages/About";
 
@@ -32,8 +34,10 @@ function App() {
           {currentPage === "scu" && <ScuPage />}
           {currentPage === "activity" && <ActivityPage />}
           {currentPage === "store" && <StorePage />}
+          {currentPage === "inspect" && <InspectPage />}
           {currentPage === "worklist" && <WorklistPage />}
           {currentPage === "mcp" && <McpPage />}
+          {currentPage === "cli" && <CommandLinePage />}
           {currentPage === "settings" && <SettingsPage />}
           {currentPage === "about" && <AboutPage />}
         </div>
