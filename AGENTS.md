@@ -145,6 +145,8 @@ Location: `../../_active/cloud-lib-gcp`
 Location: `../../_active/gcp-pub-sub`
 **scanfinder**
 Location: `../../_active/scanfinder`
+**meridian**
+Location: `../meridian`
 
 <!-- automatic:groups:end -->
 
