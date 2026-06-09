@@ -1,22 +1,22 @@
 //! Single-file DICOM property reader.
 //!
 //! Unlike `store`, which parses a file only to extract the handful of
-//! tags it indexes, this module dumps the full top-level element set of
-//! a DICOM Part-10 file so the operator (or an MCP client) can inspect
-//! exactly what a file contains. It is the backend for the UI's
-//! drag-and-drop inspector, the `read_dicom_file` MCP tool, and the
-//! `nightowl-cli inspect` subcommand.
+//! tags it indexes, this module dumps the full element set of a DICOM
+//! Part-10 file so the operator (or an MCP client) can inspect exactly
+//! what a file contains. It is the backend for the UI's drag-and-drop
+//! inspector, the `read_dicom_file` MCP tool, and the `nightowl-cli
+//! inspect` subcommand.
 //!
 //! Scope decisions:
 //!
-//! - **Top-level elements only.** Sequence (`SQ`) elements are reported
-//!   with their item count rather than recursed into. A full recursive
-//!   dump is a larger feature; the flat view answers "what is in this
-//!   file" for the common case without unbounded output.
+//! - **Sequences are recursed.** A sequence (`SQ`) element carries its
+//!   nested items, each a set of elements that may contain further
+//!   sequences. The output is a tree the UI can drill into.
 //! - **Values are summarised, not dumped raw.** Binary VRs (pixel data,
-//!   other-byte/word/float) report their byte length; long text values
-//!   are truncated. The goal is a human- and LLM-readable header view,
-//!   not a byte-exact export.
+//!   other-byte/word/float) report their byte length and are never read
+//!   into a value — so the output stays small even for large images;
+//!   long text values are truncated. The goal is a human- and
+//!   LLM-readable header view, not a byte-exact export.
 //! - **Any path the caller names is read.** The path comes from an OS
 //!   drag-drop, an MCP argument, or a CLI argument — the caller is
 //!   explicitly choosing the file, so `is_valid_name` (which guards
@@ -39,7 +39,8 @@ use super::error::AppError;
 /// identifier, description and UID values in full.
 const MAX_VALUE_CHARS: usize = 256;
 
-/// One top-level DICOM data element, flattened for display.
+/// One DICOM data element. Sequence (`SQ`) elements carry their nested
+/// items in `items`; every other element is a leaf.
 #[derive(Debug, Clone, Serialize)]
 pub struct DicomElement {
     /// Canonical `(gggg,eeee)` rendering, uppercase hex.
@@ -60,6 +61,19 @@ pub struct DicomElement {
     /// Display rendering of the value: text for string VRs, an item
     /// count for sequences, a byte-length summary for binary VRs.
     pub value: String,
+    /// For sequence (`SQ`) elements, the nested items. Absent (and
+    /// omitted from the JSON) for every other element so leaf elements
+    /// stay compact on the wire.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<Vec<DicomItem>>,
+}
+
+/// One item within a sequence: an ordered set of nested elements.
+#[derive(Debug, Clone, Serialize)]
+pub struct DicomItem {
+    /// The item's data elements, in ascending tag order. May themselves
+    /// contain further sequences.
+    pub elements: Vec<DicomElement>,
 }
 
 /// Everything the inspector reports for a single dropped file.
@@ -118,10 +132,28 @@ pub fn read_dicom_properties(path: &Path) -> Result<DicomFileProperties, AppErro
     })
 }
 
-/// Projects one in-memory element to its display view.
+/// Projects one in-memory element to its display view, recursing into
+/// sequence items so the full nested structure is preserved.
+///
+/// Recursion descends only into `SQ` elements. Binary elements — pixel
+/// data included — are never read into a value; they are summarised by
+/// byte length, so the output stays small regardless of image size.
 fn element_to_view(elem: &InMemElement<StandardDataDictionary>) -> DicomElement {
     let header = elem.header();
     let tag = header.tag;
+
+    let items = if header.vr == VR::SQ {
+        elem.items().map(|items| {
+            items
+                .iter()
+                .map(|item| DicomItem {
+                    elements: item.iter().map(element_to_view).collect(),
+                })
+                .collect()
+        })
+    } else {
+        None
+    };
 
     DicomElement {
         tag: format!("({:04X},{:04X})", tag.group(), tag.element()),
@@ -131,6 +163,7 @@ fn element_to_view(elem: &InMemElement<StandardDataDictionary>) -> DicomElement 
         vr: header.vr.to_string().to_owned(),
         length: header.len.get(),
         value: render_value(elem),
+        items,
     }
 }
 
@@ -276,6 +309,74 @@ mod tests {
         assert_eq!(patient_name.tag, "(0010,0010)");
         assert_eq!(patient_name.vr, "PN");
         assert_eq!(patient_name.value, "Doe^Jane");
+
+        // A leaf element must not carry the nested `items` field.
+        assert!(
+            patient_name.items.is_none(),
+            "non-sequence element should have no items"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn recurses_into_sequence_items() {
+        use dicom_core::value::DataSetSequence;
+
+        let dir = temp_dir("seq");
+
+        let item = InMemDicomObject::from_element_iter([
+            DataElement::new(tags::CODE_VALUE, VR::SH, PrimitiveValue::from("CODE1")),
+            DataElement::new(
+                tags::CODING_SCHEME_DESIGNATOR,
+                VR::SH,
+                PrimitiveValue::from("DCM"),
+            ),
+        ]);
+
+        let mut obj = InMemDicomObject::new_empty();
+        obj.put(DataElement::new(
+            tags::SOP_CLASS_UID,
+            VR::UI,
+            PrimitiveValue::from("1.2.840.10008.5.1.4.1.1.7"),
+        ));
+        obj.put(DataElement::new(
+            tags::SOP_INSTANCE_UID,
+            VR::UI,
+            PrimitiveValue::from("1.2.3.4.5"),
+        ));
+        obj.put(DataElement::new(
+            tags::PROCEDURE_CODE_SEQUENCE,
+            VR::SQ,
+            DataSetSequence::from(vec![item]),
+        ));
+
+        let path = dir.join("seq.dcm");
+        obj.with_meta(
+            dicom_object::FileMetaTableBuilder::new().transfer_syntax("1.2.840.10008.1.2.1"),
+        )
+        .expect("attach meta")
+        .write_to_file(&path)
+        .expect("write seq dcm");
+
+        let props = read_dicom_properties(&path).expect("read properties");
+
+        let seq = props
+            .elements
+            .iter()
+            .find(|e| e.vr == "SQ")
+            .expect("sequence element present");
+        assert_eq!(seq.name, "ProcedureCodeSequence");
+
+        let items = seq.items.as_ref().expect("sequence carries items");
+        assert_eq!(items.len(), 1, "one item expected");
+
+        let nested = &items[0].elements;
+        let code_value = nested
+            .iter()
+            .find(|e| e.name == "CodeValue")
+            .expect("nested CodeValue present");
+        assert_eq!(code_value.value, "CODE1");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

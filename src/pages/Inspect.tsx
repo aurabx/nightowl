@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { FileSearch, Loader2, UploadCloud } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronRight,
+  FileSearch,
+  Loader2,
+  UploadCloud,
+} from "lucide-react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
+  type DicomElement,
   type DicomFileProperties,
   formatError,
   readDicomFile,
@@ -15,6 +22,47 @@ function humanBytes(n: number): string {
   if (n >= MB) return `${(n / MB).toFixed(1)} MB`;
   if (n >= KB) return `${(n / KB).toFixed(0)} KB`;
   return `${n} B`;
+}
+
+/** Counts an element subtree, including nested sequence items. */
+function countElements(elements: DicomElement[]): number {
+  return elements.reduce(
+    (sum, el) =>
+      sum +
+      1 +
+      (el.items
+        ? el.items.reduce((m, item) => m + countElements(item.elements), 0)
+        : 0),
+    0,
+  );
+}
+
+/** Returns a copy of `el` if it (or any descendant) matches `needle`,
+ * otherwise null. A matching sequence keeps all of its items; a sequence
+ * kept only because a descendant matched is pruned to the matches. */
+function filterElement(el: DicomElement, needle: string): DicomElement | null {
+  const selfMatch =
+    el.tag.toLowerCase().includes(needle) ||
+    el.name.toLowerCase().includes(needle) ||
+    el.value.toLowerCase().includes(needle);
+
+  if (!el.items) {
+    return selfMatch ? el : null;
+  }
+
+  if (selfMatch) {
+    return el;
+  }
+
+  const items = el.items
+    .map((item) => ({
+      elements: item.elements
+        .map((child) => filterElement(child, needle))
+        .filter((x): x is DicomElement => x !== null),
+    }))
+    .filter((item) => item.elements.length > 0);
+
+  return items.length > 0 ? { ...el, items } : null;
 }
 
 export function InspectPage() {
@@ -78,17 +126,18 @@ export function InspectPage() {
     }
   }
 
+  const needle = filter.trim().toLowerCase();
+
   const visibleElements = useMemo(() => {
     if (!props) return [];
-    const needle = filter.trim().toLowerCase();
     if (!needle) return props.elements;
-    return props.elements.filter(
-      (el) =>
-        el.tag.toLowerCase().includes(needle) ||
-        el.name.toLowerCase().includes(needle) ||
-        el.value.toLowerCase().includes(needle),
-    );
-  }, [props, filter]);
+    return props.elements
+      .map((el) => filterElement(el, needle))
+      .filter((x): x is DicomElement => x !== null);
+  }, [props, needle]);
+
+  const totalCount = props ? countElements(props.elements) : 0;
+  const visibleCount = countElements(visibleElements);
 
   return (
     <div className="space-y-6">
@@ -165,7 +214,7 @@ export function InspectPage() {
               className="w-full max-w-sm rounded-md border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-500 focus:outline-none"
             />
             <span className="shrink-0 text-xs text-slate-500">
-              {visibleElements.length} of {props.elements.length} elements
+              {visibleCount} of {totalCount} elements
             </span>
           </div>
 
@@ -181,25 +230,14 @@ export function InspectPage() {
                 </tr>
               </thead>
               <tbody>
-                {visibleElements.map((el) => (
-                  <tr
-                    key={el.tag}
-                    className="border-t border-slate-800 align-top hover:bg-slate-900/40"
-                  >
-                    <td className="whitespace-nowrap px-3 py-1.5 font-mono text-xs text-slate-400">
-                      {el.tag}
-                    </td>
-                    <td className="px-3 py-1.5 text-slate-200">{el.name}</td>
-                    <td className="px-3 py-1.5 font-mono text-xs text-slate-400">
-                      {el.vr}
-                    </td>
-                    <td className="px-3 py-1.5 text-right font-mono text-xs text-slate-500">
-                      {el.length ?? "—"}
-                    </td>
-                    <td className="px-3 py-1.5 font-mono text-xs text-slate-300 break-all">
-                      {el.value}
-                    </td>
-                  </tr>
+                {visibleElements.map((el, i) => (
+                  <ElementRows
+                    key={`${el.tag}-${i}`}
+                    element={el}
+                    depth={0}
+                    rowKey={`${el.tag}-${i}`}
+                    expandAll={needle.length > 0}
+                  />
                 ))}
               </tbody>
             </table>
@@ -207,6 +245,117 @@ export function InspectPage() {
         </div>
       )}
     </div>
+  );
+}
+
+/** Renders one element row and, for an expanded sequence, its nested
+ * item and child rows. Each sequence row toggles its own open state;
+ * when `expandAll` is set (an active filter) every row is forced open. */
+function ElementRows({
+  element,
+  depth,
+  rowKey,
+  expandAll,
+}: {
+  element: DicomElement;
+  depth: number;
+  rowKey: string;
+  expandAll: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const isSequence = !!element.items;
+  const expanded = expandAll || open;
+  // 1rem of indent per level, applied as left padding on the Name cell.
+  const indent = { paddingLeft: `${depth * 1 + 0.75}rem` };
+
+  return (
+    <>
+      <tr className="border-t border-slate-800 align-top hover:bg-slate-900/40">
+        <td className="whitespace-nowrap px-3 py-1.5 font-mono text-xs text-slate-400">
+          {element.tag}
+        </td>
+        <td className="py-1.5 pr-3 text-slate-200" style={indent}>
+          {isSequence ? (
+            <button
+              type="button"
+              onClick={() => setOpen((v) => !v)}
+              disabled={expandAll}
+              className="flex items-center gap-1 text-left hover:text-white disabled:cursor-default"
+            >
+              {expanded ? (
+                <ChevronDown className="size-3.5 shrink-0 text-slate-500" />
+              ) : (
+                <ChevronRight className="size-3.5 shrink-0 text-slate-500" />
+              )}
+              {element.name}
+            </button>
+          ) : (
+            element.name
+          )}
+        </td>
+        <td className="px-3 py-1.5 font-mono text-xs text-slate-400">
+          {element.vr}
+        </td>
+        <td className="px-3 py-1.5 text-right font-mono text-xs text-slate-500">
+          {element.length ?? "—"}
+        </td>
+        <td className="px-3 py-1.5 font-mono text-xs text-slate-300 break-all">
+          {element.value}
+        </td>
+      </tr>
+
+      {isSequence &&
+        expanded &&
+        element.items!.map((item, itemIndex) => (
+          <ItemRows
+            key={`${rowKey}-item${itemIndex}`}
+            item={item}
+            itemIndex={itemIndex}
+            depth={depth}
+            rowKey={`${rowKey}-item${itemIndex}`}
+            expandAll={expandAll}
+          />
+        ))}
+    </>
+  );
+}
+
+/** Renders a sequence item's label row followed by its element rows. */
+function ItemRows({
+  item,
+  itemIndex,
+  depth,
+  rowKey,
+  expandAll,
+}: {
+  item: { elements: DicomElement[] };
+  itemIndex: number;
+  depth: number;
+  rowKey: string;
+  expandAll: boolean;
+}) {
+  return (
+    <>
+      <tr className="border-t border-slate-800/60 bg-slate-900/30">
+        <td className="px-3 py-1 text-xs text-slate-600" />
+        <td
+          className="py-1 pr-3 text-xs uppercase tracking-wide text-slate-500"
+          style={{ paddingLeft: `${(depth + 1) * 1 + 0.75}rem` }}
+          colSpan={4}
+        >
+          Item {itemIndex + 1}
+        </td>
+      </tr>
+      {item.elements.map((child, i) => (
+        <ElementRows
+          key={`${rowKey}-${child.tag}-${i}`}
+          element={child}
+          depth={depth + 2}
+          rowKey={`${rowKey}-${child.tag}-${i}`}
+          expandAll={expandAll}
+        />
+      ))}
+    </>
   );
 }
 

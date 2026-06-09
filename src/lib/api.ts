@@ -70,7 +70,13 @@ export interface InstanceRow {
 
 // --- DICOM file inspector --------------------------------------------
 
-/** One top-level DICOM element, mirrors `core::inspect::DicomElement`. */
+/** One item within a sequence, mirrors `core::inspect::DicomItem`. */
+export interface DicomItem {
+  elements: DicomElement[];
+}
+
+/** One DICOM element, mirrors `core::inspect::DicomElement`. Sequence
+ * (`SQ`) elements carry their nested items; leaves omit `items`. */
 export interface DicomElement {
   tag: string;
   group: number;
@@ -79,6 +85,7 @@ export interface DicomElement {
   vr: string;
   length: number | null;
   value: string;
+  items?: DicomItem[];
 }
 
 /** Mirrors `core::inspect::DicomFileProperties`. */
