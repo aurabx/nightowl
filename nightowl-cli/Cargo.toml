@@ -1,6 +1,6 @@
 [package]
 name = "nightowl-cli"
-version = "0.3.1"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.77"
 description = "Command-line driver for NightOwl, mirroring the MCP tool surface."

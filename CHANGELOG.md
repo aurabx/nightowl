@@ -7,39 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-06-09
+
 ### Added
-- Install the CLI from the app. A new **Command Line** tab installs a
-  `nightowl-cli` command on your `PATH` with one click, and shows live
-  install status (installed / stale / not installed) plus the binary and
-  install paths. On macOS and Linux it symlinks `/usr/local/bin/nightowl-cli`
-  (or `~/.local/bin/nightowl-cli` when the former is not writable) to the
-  app binary. On Windows it copies the bundled `nightowl-cli.exe` into
-  `%LOCALAPPDATA%\Programs\NightOwl\bin\` and prepends that directory to
-  the per-user `PATH` (`HKCU\Environment\Path`), broadcasting the change so
-  running shells can pick it up. **Uninstall** removes only an entry that
-  points back at NightOwl.
-- DICOM file inspector. A new **Inspect** page lets you drag a DICOM
-  Part-10 file onto a dropzone to read its file-meta header (transfer
-  syntax, media storage SOP class / instance UID) and a filterable
-  tree of every data element (tag, keyword, VR, length, value).
-  Sequences are recursive — expand a sequence to drill into its items
-  and nested elements. The same capability is exposed as the
-  `read_dicom_file` MCP tool and the `nightowl-cli inspect file <path>`
-  subcommand. Binary elements (pixel data included) report a byte
-  length and are never read into a value, so the output stays small
-  regardless of image size; long text values are truncated for display.
+- Install the CLI from the app. A new **Command Line** tab installs a `nightowl-cli` command on your `PATH` with one click, and shows live install status (installed / stale / not installed) plus the binary and install paths. On macOS and Linux it symlinks `/usr/local/bin/nightowl-cli` (or `~/.local/bin/nightowl-cli` when the former is not writable) to the app binary. On Windows it copies the bundled `nightowl-cli.exe` into `%LOCALAPPDATA%\Programs\NightOwl\bin\` and prepends that directory to the per-user `PATH` (`HKCU\Environment\Path`), broadcasting the change so running shells can pick it up. **Uninstall** removes only an entry that points back at NightOwl.
+- DICOM file inspector. A new **Inspect** page lets you drag a DICOM Part-10 file onto a dropzone to read its file-meta header (transfer syntax, media storage SOP class / instance UID) and a filterable tree of every data element (tag, keyword, VR, length, value). Sequences are recursive — expand a sequence to drill into its items and nested elements. The same capability is exposed as the `read_dicom_file` MCP tool and the `nightowl-cli inspect file <path>` subcommand. Binary elements (pixel data included) report a byte length and are never read into a value, so the output stays small regardless of image size; long text values are truncated for display.
 
 ### Changed
-- The desktop binary now doubles as the CLI. The command surface moved
-  out of the `nightowl-cli` crate into `nightowl_lib::cli`; the desktop
-  binary dispatches to it when invoked under the `nightowl-cli` name (or
-  with a CLI verb), and the `nightowl-cli` crate is now a thin shim that
-  forwards to the same entrypoint. This is what lets the Command Line tab
-  install the CLI by symlinking the already-signed app binary, and it
-  resolves the 0.3.1 "Known follow-up": the CLI now ships *inside* the
-  desktop app rather than needing a separate release artifact, so no
-  extra binary is bundled into the macOS `.app` and the x86_64 codesign
-  path is unaffected.
+- The desktop binary now doubles as the CLI. The command surface moved out of the `nightowl-cli` crate into `nightowl_lib::cli`; the desktop binary dispatches to it when invoked under the `nightowl-cli` name (or with a CLI verb), and the `nightowl-cli` crate is now a thin shim that forwards to the same entrypoint. This is what lets the Command Line tab install the CLI by symlinking the already-signed app binary, and it resolves the 0.3.1 "Known follow-up": the CLI now ships *inside* the desktop app rather than needing a separate release artifact, so no extra binary is bundled into the macOS `.app` and the x86_64 codesign path is unaffected.
 
 ## [0.3.1] — 2026-06-09
 
@@ -119,6 +94,7 @@ management, Modality Worklist (M11) with DMWL SCP (M12), persistent
 activity log, and an opt-in local MCP server exposing read + SCU
 tools (M24).
 
+[0.4.0]: https://github.com/aurabx/nightowl/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/aurabx/nightowl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/aurabx/nightowl/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/aurabx/nightowl/compare/v0.1.0...v0.2.0
