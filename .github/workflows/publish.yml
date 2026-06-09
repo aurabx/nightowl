@@ -156,6 +156,33 @@ jobs:
         # the repo is what CI builds.
         run: npm ci
 
+      # Build the console-subsystem `nightowl-cli` and stage it where
+      # `src-tauri/tauri.windows.conf.json`'s `externalBin` entry expects
+      # it. Tauri's externalBin convention requires the target-triple
+      # suffix on the filename.
+      #
+      # The placeholder `touch` is required because building `nightowl-cli`
+      # transitively builds the `nightowl` crate, whose `tauri-build`
+      # script validates that every `externalBin` path exists — and on
+      # Windows the merged `tauri.windows.conf.json` adds that entry.
+      # Without the placeholder the build script fails before `nightowl-cli`
+      # has produced the real file. We overwrite the placeholder with the
+      # real binary; the subsequent `tauri build` (in "Build the app")
+      # then bundles it next to the desktop binary inside the installer.
+      #
+      # `target/` is the workspace target at the repo root (the workspace
+      # is rooted here, not under `src-tauri/`), so the built binary lands
+      # at `target/release/nightowl-cli.exe`.
+      - name: Build and stage nightowl-cli (Windows)
+        if: matrix.name == 'windows'
+        shell: bash
+        run: |
+          mkdir -p src-tauri/binaries
+          touch src-tauri/binaries/nightowl-cli-x86_64-pc-windows-msvc.exe
+          cargo build --release -p nightowl-cli
+          cp target/release/nightowl-cli.exe \
+             src-tauri/binaries/nightowl-cli-x86_64-pc-windows-msvc.exe
+
       - name: Import Apple Developer Certificate
         if: matrix.platform == 'macos-latest'
         env:

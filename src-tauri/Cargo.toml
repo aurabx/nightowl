@@ -76,6 +76,18 @@ axum = "0.8"
 tower = "0.5"
 schemars = "1.2"
 
+# Windows-only: the CLI install path (`core::cli_install`) copies the
+# bundled `nightowl-cli.exe` onto `$PATH` by editing
+# `HKCU\Environment\Path` (winreg) and broadcasting the change so running
+# shells pick it up (windows-sys). Gated to Windows so the macOS / Linux
+# builds never pull these in.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+] }
+winreg = "0.55"
+
 [dev-dependencies]
 reqwest = { version = "0.13.3", default-features = false, features = ["json"] }
 # `tempfile` is used by activity-log unit tests to give each test an
