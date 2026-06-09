@@ -13,13 +13,13 @@
 //!   desktop binary when that directory is writable without elevation,
 //!   otherwise `~/.local/bin/nightowl-cli`. One file, no registry
 //!   mutation.
-//! - **Windows**: not yet supported. The desktop binary is a
-//!   windows-subsystem app and cannot write to the invoking shell, so a
-//!   Windows CLI needs the separate `nightowl-cli.exe` console binary to
-//!   be bundled into the installer and copied onto `%PATH%` — bundling
-//!   work that does not exist yet. Rather than install something that
-//!   would not work, `status()` reports `"unsupported"` and `install()`
-//!   returns an explanatory error.
+//! - **Windows**: copy the bundled `nightowl-cli.exe` console binary into
+//!   `%LOCALAPPDATA%\Programs\NightOwl\bin\` and prepend that directory to
+//!   `HKCU\Environment\Path`. The desktop binary is a windows-subsystem
+//!   app and cannot write to the invoking shell, so Windows needs the
+//!   separate console binary; it ships next to the desktop binary via the
+//!   `externalBin` entry in `tauri.windows.conf.json`. No admin rights and
+//!   no symlinks (which need developer mode on Windows) are required.
 //!
 //! All operations are idempotent: installing twice is a no-op; uninstalling
 //! a missing entry is a no-op.
@@ -31,6 +31,18 @@ use crate::core::error::AppError;
 
 #[cfg(unix)]
 const UNIX_LINK_NAME: &str = "nightowl-cli";
+
+// Per-user install directory name under `%LOCALAPPDATA%\Programs\`, the
+// installed command name, and the bundled source binary's name. Source
+// and installed names match — the `externalBin` sidecar lands next to the
+// desktop binary as `nightowl-cli.exe` (Tauri strips the target-triple
+// suffix), and that is exactly the command we want on `$PATH`.
+#[cfg(windows)]
+const WINDOWS_BIN_DIR_NAME: &str = "NightOwl";
+#[cfg(windows)]
+const WINDOWS_CLI_EXE_NAME: &str = "nightowl-cli.exe";
+#[cfg(windows)]
+const WINDOWS_SOURCE_CLI_NAME: &str = "nightowl-cli.exe";
 
 /// Snapshot of the CLI install state, returned to the Command Line page.
 #[derive(Debug, Serialize)]
@@ -61,7 +73,11 @@ pub fn status() -> Result<CliInstallStatus, String> {
     {
         unix::status_impl()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::status_impl()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Ok(unsupported_status())
     }
@@ -74,7 +90,11 @@ pub fn install() -> Result<String, String> {
     {
         unix::install_impl()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::install_impl()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err(UNSUPPORTED_MESSAGE.to_string())
     }
@@ -88,7 +108,11 @@ pub fn uninstall() -> Result<String, String> {
     {
         unix::uninstall_impl()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::uninstall_impl()
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         Err(UNSUPPORTED_MESSAGE.to_string())
     }
@@ -96,9 +120,9 @@ pub fn uninstall() -> Result<String, String> {
 
 // ── Shared helpers ──────────────────────────────────────────────────────────
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 const UNSUPPORTED_MESSAGE: &str =
-    "Installing the nightowl-cli command from the app is not yet supported on this platform. \
+    "Installing the nightowl-cli command from the app is not supported on this platform. \
      Use the standalone nightowl-cli binary instead.";
 
 fn current_binary_path() -> Result<PathBuf, String> {
@@ -119,7 +143,7 @@ fn platform_name() -> &'static str {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn unsupported_status() -> CliInstallStatus {
     let binary_path = current_binary_path().unwrap_or_default();
     CliInstallStatus {
@@ -267,6 +291,235 @@ mod unix {
         } else {
             None
         }
+    }
+}
+
+// ── Windows: copy the bundled CLI binary + per-user PATH update ──────────────
+
+#[cfg(windows)]
+mod windows {
+    use super::*;
+
+    pub(super) fn status_impl() -> Result<CliInstallStatus, String> {
+        let binary_path = current_binary_path()?;
+        let bin_dir = bin_dir()?;
+        let install_path = bin_dir.join(WINDOWS_CLI_EXE_NAME);
+
+        let file_present = install_path.is_file();
+        let on_path = user_path_contains(&bin_dir).unwrap_or(false);
+        let status = match (file_present, on_path) {
+            (true, true) => "installed",
+            (false, false) => "not_installed",
+            // Half-installed (file but no PATH entry, or vice versa).
+            // Surfacing it lets the user reinstall to repair without us
+            // silently mutating either side.
+            _ => "stale",
+        };
+
+        let path_hint = if status == "installed" {
+            Some(
+                "Open a new terminal to pick up the updated PATH — shells that were \
+                 already running use the value they started with."
+                    .to_string(),
+            )
+        } else {
+            None
+        };
+
+        Ok(CliInstallStatus {
+            platform: platform_name().to_string(),
+            binary_path: binary_path.display().to_string(),
+            install_path: Some(install_path.display().to_string()),
+            status: status.to_string(),
+            path_hint,
+        })
+    }
+
+    pub(super) fn install_impl() -> Result<String, String> {
+        let bin_dir = bin_dir()?;
+        let install_path = bin_dir.join(WINDOWS_CLI_EXE_NAME);
+        let source = source_cli_binary()?;
+
+        std::fs::create_dir_all(&bin_dir)
+            .map_err(|e| format!("Failed to create {}: {e}", bin_dir.display()))?;
+
+        // Overwrite is fine — the source is the binary that shipped with
+        // this install of NightOwl, so reinstalling refreshes it.
+        std::fs::copy(&source, &install_path).map_err(|e| {
+            format!(
+                "Failed to copy {} → {}: {e}",
+                source.display(),
+                install_path.display()
+            )
+        })?;
+
+        add_to_user_path(&bin_dir)?;
+        Ok(install_path.display().to_string())
+    }
+
+    pub(super) fn uninstall_impl() -> Result<String, String> {
+        let bin_dir = bin_dir()?;
+        let install_path = bin_dir.join(WINDOWS_CLI_EXE_NAME);
+
+        let mut steps: Vec<String> = Vec::new();
+        if install_path.exists() {
+            std::fs::remove_file(&install_path)
+                .map_err(|e| format!("Failed to remove {}: {e}", install_path.display()))?;
+            steps.push(format!("Removed {}", install_path.display()));
+        }
+
+        if user_path_contains(&bin_dir).unwrap_or(false) {
+            remove_from_user_path(&bin_dir)?;
+            steps.push(format!("Removed {} from PATH", bin_dir.display()));
+        }
+
+        // Best-effort: drop the now-empty bin dir. Ignore failure (e.g. it
+        // still holds something the user put there).
+        let _ = std::fs::remove_dir(&bin_dir);
+
+        if steps.is_empty() {
+            Ok(format!("{} was not installed", install_path.display()))
+        } else {
+            Ok(steps.join("; "))
+        }
+    }
+
+    /// Per-user install root: `%LOCALAPPDATA%\Programs\NightOwl\bin\`.
+    ///
+    /// `%LOCALAPPDATA%` is writable by the current user without admin and
+    /// is the standard location for per-user app installs on Windows.
+    fn bin_dir() -> Result<PathBuf, String> {
+        let local = std::env::var_os("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .ok_or_else(|| "%LOCALAPPDATA% is not set".to_string())?;
+        Ok(local
+            .join("Programs")
+            .join(WINDOWS_BIN_DIR_NAME)
+            .join("bin"))
+    }
+
+    /// Locate the bundled `nightowl-cli.exe`. The `externalBin` entry in
+    /// `tauri.windows.conf.json` makes Tauri place it next to the desktop
+    /// binary, so the source is `<dir-of-current_exe>\nightowl-cli.exe`.
+    /// During `cargo run` of the desktop binary the workspace build emits
+    /// both binaries side by side in `target\<profile>\`, so the same
+    /// lookup works without any bundle wiring.
+    fn source_cli_binary() -> Result<PathBuf, String> {
+        let exe = current_binary_path()?;
+        let dir = exe
+            .parent()
+            .ok_or_else(|| "Failed to resolve the install directory".to_string())?;
+        let cli = dir.join(WINDOWS_SOURCE_CLI_NAME);
+        if !cli.exists() {
+            return Err(format!(
+                "CLI binary not found at {} — was NightOwl installed with the CLI bundle?",
+                cli.display()
+            ));
+        }
+        Ok(cli)
+    }
+
+    /// Read `HKCU\Environment\Path` and return true if `dir` is present in
+    /// any of the `;`-separated entries (case-insensitive, canonicalised).
+    fn user_path_contains(dir: &Path) -> Result<bool, String> {
+        let target = canonical_lossy(dir);
+        Ok(read_user_path_entries()?
+            .into_iter()
+            .any(|entry| canonical_lossy(&PathBuf::from(entry)) == target))
+    }
+
+    fn add_to_user_path(dir: &Path) -> Result<(), String> {
+        let mut entries = read_user_path_entries()?;
+        let target = canonical_lossy(dir);
+        if entries
+            .iter()
+            .any(|entry| canonical_lossy(&PathBuf::from(entry)) == target)
+        {
+            return Ok(());
+        }
+        entries.insert(0, dir.display().to_string());
+        write_user_path_entries(&entries)?;
+        broadcast_environment_change();
+        Ok(())
+    }
+
+    fn remove_from_user_path(dir: &Path) -> Result<(), String> {
+        let target = canonical_lossy(dir);
+        let mut changed = false;
+        let kept: Vec<String> = read_user_path_entries()?
+            .into_iter()
+            .filter(|entry| {
+                let drop = canonical_lossy(&PathBuf::from(entry)) == target;
+                changed |= drop;
+                !drop
+            })
+            .collect();
+        if !changed {
+            return Ok(());
+        }
+        write_user_path_entries(&kept)?;
+        broadcast_environment_change();
+        Ok(())
+    }
+
+    fn read_user_path_entries() -> Result<Vec<String>, String> {
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+        use winreg::RegKey;
+        let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+        let env = hkcu
+            .open_subkey_with_flags("Environment", KEY_READ)
+            .map_err(|e| format!("Failed to open HKCU\\Environment: {e}"))?;
+        // A user with no `Path` value yet is normal, not an error.
+        let raw: String = env.get_value("Path").unwrap_or_default();
+        Ok(raw
+            .split(';')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect())
+    }
+
+    fn write_user_path_entries(entries: &[String]) -> Result<(), String> {
+        use winreg::RegKey;
+        let hkcu = RegKey::predef(winreg::enums::HKEY_CURRENT_USER);
+        let (env, _) = hkcu
+            .create_subkey("Environment")
+            .map_err(|e| format!("Failed to open HKCU\\Environment: {e}"))?;
+        env.set_value("Path", &entries.join(";"))
+            .map_err(|e| format!("Failed to write HKCU\\Environment\\Path: {e}"))
+    }
+
+    /// Broadcast `WM_SETTINGCHANGE("Environment")` so already-running
+    /// shells and Explorer pick up the new PATH without a logout. Failures
+    /// are silent — the registry write is the source of truth; the
+    /// broadcast is only a courtesy.
+    fn broadcast_environment_change() {
+        use windows_sys::Win32::Foundation::{LPARAM, WPARAM};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+        };
+        let param: Vec<u16> = "Environment\0".encode_utf16().collect();
+        let mut result: usize = 0;
+        // Safety: `param` is a valid null-terminated UTF-16 buffer that
+        // outlives the call; `result` is a valid out-pointer.
+        unsafe {
+            SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0 as WPARAM,
+                param.as_ptr() as LPARAM,
+                SMTO_ABORTIFHUNG,
+                5000,
+                &mut result as *mut usize,
+            );
+        }
+    }
+
+    /// Lower-cased, trailing-separator-trimmed form used for the
+    /// case-insensitive PATH comparison. Windows paths are
+    /// case-insensitive, but the registry preserves the user's casing, so
+    /// we normalise for comparison without rewriting the stored entry.
+    fn canonical_lossy(path: &Path) -> String {
+        path.to_string_lossy().trim_end_matches('\\').to_lowercase()
     }
 }
 

@@ -168,11 +168,11 @@ click **Install**. This is the only step.
   app binary. If it lands in `~/.local/bin` and that directory is not on
   your `PATH`, the tab tells you the one line to add to your shell
   profile. Open a new terminal and run `nightowl-cli --help` to confirm.
-- **Windows** — installing the CLI from the app is not supported yet, and
-  the Command Line tab says so directly. The desktop binary is a
-  windows-subsystem app and cannot write to the invoking shell, so a
-  Windows CLI needs the standalone `nightowl-cli.exe` console binary to
-  be shipped in the installer — packaging work that is not done yet.
+- **Windows** — NightOwl ships a console `nightowl-cli.exe` next to the
+  desktop binary. **Install** copies it into
+  `%LOCALAPPDATA%\Programs\NightOwl\bin\` and prepends that directory to
+  your user `PATH` (no admin rights needed). Open a *new* terminal
+  afterwards — already-open shells keep the `PATH` they started with.
 
 To remove the command, click **Uninstall** on the same tab. It only
 removes a `nightowl-cli` entry that points at the NightOwl binary; a

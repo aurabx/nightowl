@@ -45,6 +45,11 @@ Thumbs.db
 src-tauri/target/
 src-tauri/gen/
 
+# Windows-only sidecar staging dir. CI builds `nightowl-cli.exe` into
+# `src-tauri/binaries/` for the `externalBin` bundle step; the binaries
+# are build artifacts and must never be committed.
+src-tauri/binaries/
+
 # Local DICOM store and other runtime data
 # (the default store directory configured at M1 lives outside the repo, but
 # users sometimes point it inside; ignore the common ones)
