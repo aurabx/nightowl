@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use clap::Subcommand;
 
 use crate::core::error::AppError;
-use crate::core::inspect::read_dicom_properties;
+use crate::core::inspect::{read_dicom_properties, DicomElement};
 
 use crate::cli::output::{emit_json, emit_text, OutputFormat};
 
@@ -47,12 +47,26 @@ fn file(format: OutputFormat, path: &std::path::Path) -> Result<(), AppError> {
             ));
             text.push_str(&format!("elements:         {}\n\n", props.element_count));
             for el in &props.elements {
-                text.push_str(&format!(
-                    "{} {:<32} {} {}\n",
-                    el.tag, el.name, el.vr, el.value
-                ));
+                write_element(&mut text, el, 0);
             }
             emit_text(&text)
+        }
+    }
+}
+
+/// Appends one element (and, for sequences, its nested items) to `out`,
+/// indenting two spaces per level so the tree structure is visible.
+fn write_element(out: &mut String, el: &DicomElement, depth: usize) {
+    let indent = "  ".repeat(depth);
+    let name = format!("{indent}{}", el.name);
+    out.push_str(&format!("{} {:<32} {} {}\n", el.tag, name, el.vr, el.value));
+
+    if let Some(items) = &el.items {
+        for (index, item) in items.iter().enumerate() {
+            out.push_str(&format!("{}  - item {}\n", indent, index + 1));
+            for child in &item.elements {
+                write_element(out, child, depth + 2);
+            }
         }
     }
 }

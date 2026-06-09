@@ -364,7 +364,7 @@ impl NightowlMcp {
     }
 
     #[tool(
-        description = "Read a single DICOM Part-10 file from disk and return its full top-level element set: file meta (transfer syntax, media storage SOP class/instance UID), plus every data element with its tag, keyword, VR, length and a rendered value. Sequences report an item count and binary elements a byte length. `path` must be an absolute filesystem path."
+        description = "Read a single DICOM Part-10 file from disk and return its full element set: file meta (transfer syntax, media storage SOP class/instance UID), plus every data element with its tag, keyword, VR, length and a rendered value. Sequence (SQ) elements are recursed — each carries a nested `items` array of its sub-elements. Binary elements (pixel data included) report a byte length and are never read into a value. `path` must be an absolute filesystem path."
     )]
     async fn read_dicom_file(
         &self,

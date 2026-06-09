@@ -360,12 +360,12 @@ fn list_studies(state: State<'_, AppState>) -> Result<Vec<StudyRow>, AppError> {
     state.index.list_studies()
 }
 
-/// Reads the full top-level element set of a single DICOM file. Backs
-/// the drag-and-drop inspector — `path` is an absolute path the OS hands
-/// us from a drop event, so no store-relative name validation applies.
-/// Parsing can touch the whole file (pixel data included), so it runs on
-/// the blocking pool rather than the async executor, matching
-/// `rescan_store`.
+/// Reads the full element set of a single DICOM file, recursing into
+/// sequences. Backs the drag-and-drop inspector — `path` is an absolute
+/// path the OS hands us from a drop event, so no store-relative name
+/// validation applies. Parsing can touch the whole file (pixel data
+/// included), so it runs on the blocking pool rather than the async
+/// executor, matching `rescan_store`.
 #[tauri::command]
 async fn read_dicom_file(path: String) -> Result<DicomFileProperties, AppError> {
     tauri::async_runtime::spawn_blocking(move || {
