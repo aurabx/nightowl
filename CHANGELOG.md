@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-07-19
+
 ### Added
 - Peer management via MCP. Three new MCP tools — `create_peer`, `update_peer`, `delete_peer` — let an external MCP client create, edit and remove configured DICOM peers, alongside the existing read-only `list_peers`. Validation (non-empty name, valid AE Title, non-empty host, non-zero port, duplicate AE Title rejection) is identical to the Peers page and the Tauri commands of the same name — both call the same `PeerStore`.
 
@@ -97,6 +99,7 @@ management, Modality Worklist (M11) with DMWL SCP (M12), persistent
 activity log, and an opt-in local MCP server exposing read + SCU
 tools (M24).
 
+[0.5.0]: https://github.com/aurabx/nightowl/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/aurabx/nightowl/compare/v0.3.1...v0.4.0
 [0.3.1]: https://github.com/aurabx/nightowl/compare/v0.3.0...v0.3.1
 [0.3.0]: https://github.com/aurabx/nightowl/compare/v0.2.0...v0.3.0

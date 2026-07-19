@@ -1,6 +1,6 @@
 [package]
 name = "nightowl"
-version = "0.4.0"
+version = "0.5.0"
 description = "NightOwl — Tauri desktop app for testing DICOM services"
 authors = ["Aurabox"]
 edition = "2021"
