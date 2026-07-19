@@ -129,9 +129,18 @@ Read tools:
 | `list_instances_for_series` | SOP Instances within a series.                  |
 | `count_instances`           | Instance count across the store.                |
 | `rescan_store`              | Trigger a background rescan of the store dir.   |
+| `read_dicom_file`           | Read a DICOM Part-10 file's full element set.   |
 | `list_worklist`             | Scheduled procedure step entries.               |
 | `list_activity`             | Filterable, paginated activity log.             |
 | `count_activity`            | Activity row count.                             |
+
+Peer management tools:
+
+| Tool           | Purpose                                               |
+|----------------|--------------------------------------------------------|
+| `create_peer`  | Add a new configured remote DICOM peer.                |
+| `update_peer`  | Edit an existing peer's name, AE Title, host or port.  |
+| `delete_peer`  | Remove a configured peer.                              |
 
 Active SCU tools:
 

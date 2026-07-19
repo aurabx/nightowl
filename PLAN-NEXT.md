@@ -35,7 +35,7 @@ Use a list with checkboxes to summarize granular steps. Every stopping point mus
 - [ ] M21: C-GET SCU with explicit SCP-role presentation contexts. The SCU page gets a C-GET button that actually works.
 - [ ] M22: Live C-MOVE progress in the SCU page. Sub-operation counts stream in as the operation runs rather than landing all at once on completion.
 - [ ] M23: Drag-and-drop file picker for the SCU C-STORE form. Replaces the textarea with a real drop zone.
-- [x] (2026-05-25) M24: Local MCP server. NightOwl binds an rmcp Streamable-HTTP server on 127.0.0.1:&lt;mcp.port&gt; (default 7300, disabled by default) and exposes 14 tools covering read + active SCU surface for LLM clients (Claude Code, etc.).
+- [x] (2026-05-25) M24: Local MCP server. NightOwl binds an rmcp Streamable-HTTP server on 127.0.0.1:&lt;mcp.port&gt; (default 7300, disabled by default) and exposes 18 tools covering read, peer-management and active SCU surface for LLM clients (Claude Code, etc.).
 
 Use timestamps in completed entries to measure rates of progress, like:
 
@@ -402,12 +402,13 @@ Follow-ups landed alongside M24 (2026-05-25):
 - `core::mcp::tests::scu_find_tool_input_schema_includes_query_fields` — verifies schemars actually derives a real schema (not the fallback `any`) for the structured-input tool.
 - New `mcp_status` Tauri command + `McpStatusBadge` component — Settings now shows a live running/disabled/failed pill next to the section header, with the bound address.
 - Second copy button for the `claude mcp add` CLI one-liner alongside the JSON snippet, for Claude Code users who prefer the CLI over hand-editing `~/.claude.json`.
+- (2026-07-19) `create_peer`, `update_peer`, `delete_peer` MCP tools added (peer management, 3 tools). Total tool count: 18 (11 read + 4 SCU + 3 peer-mutation). See CHANGELOG [Unreleased].
 
 Out of scope (deferred):
 
 - Multi-AE awareness — the MCP server sees the single-AE config only. Will follow M19.
 - Authentication and TLS on the MCP endpoint — loopback bind is the only barrier.
-- CRUD tools for peers and worklist — read + SCU only by explicit choice.
+- CRUD tools for the worklist — read + SCU only by explicit choice. (Peer CRUD was added 2026-07-19; see Follow-ups above.)
 - MCP resources and prompts — v1 exposes tools only.
 
 ## Concrete Steps

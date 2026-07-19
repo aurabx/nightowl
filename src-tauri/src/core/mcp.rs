@@ -1,9 +1,10 @@
 //! Local MCP (Model Context Protocol) server (M24).
 //!
 //! Exposes a curated subset of NightOwl's capabilities — read-only views
-//! of the SOP index, peers, worklist and activity log, plus the four
-//! active SCU operations (C-ECHO, C-FIND, C-MOVE, C-STORE) — as MCP
-//! tools that external LLM clients can call.
+//! of the SOP index, worklist and activity log; full CRUD over the
+//! configured peer list; and the four active SCU operations (C-ECHO,
+//! C-FIND, C-MOVE, C-STORE) — as MCP tools that external LLM clients
+//! can call.
 //!
 //! The server runs inside the existing Tauri tokio runtime via an axum
 //! router that nests `rmcp::transport::StreamableHttpService` at `/mcp`.
@@ -43,7 +44,7 @@ use super::config::AppConfig;
 use super::dimse::{self, QrRoot, ScuQueryKeys};
 use super::error::AppError;
 use super::inspect::read_dicom_properties;
-use super::peers::PeerStore;
+use super::peers::{NewPeer, PeerStore, UpdatePeer};
 use super::store::{FindLevel, Index};
 use super::worklist::WorklistStore;
 
@@ -150,6 +151,55 @@ pub struct PeerIdParams {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct CreatePeerParams {
+    /// Display name for the peer, shown in NightOwl's peer list.
+    pub name: String,
+    /// DICOM Application Entity Title of the peer: 1-16 printable ASCII characters, no leading or trailing whitespace.
+    pub ae_title: String,
+    /// Hostname or IP address the peer listens on.
+    pub host: String,
+    /// TCP port the peer listens on (1-65535).
+    pub port: u16,
+}
+
+impl From<CreatePeerParams> for NewPeer {
+    fn from(p: CreatePeerParams) -> Self {
+        NewPeer {
+            name: p.name,
+            ae_title: p.ae_title,
+            host: p.host,
+            port: p.port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct UpdatePeerParams {
+    /// NightOwl-assigned peer UUID to update (from `list_peers`).
+    pub peer_id: String,
+    /// Display name for the peer.
+    pub name: String,
+    /// DICOM Application Entity Title of the peer: 1-16 printable ASCII characters, no leading or trailing whitespace.
+    pub ae_title: String,
+    /// Hostname or IP address the peer listens on.
+    pub host: String,
+    /// TCP port the peer listens on (1-65535).
+    pub port: u16,
+}
+
+impl From<UpdatePeerParams> for UpdatePeer {
+    fn from(p: UpdatePeerParams) -> Self {
+        UpdatePeer {
+            id: p.peer_id,
+            name: p.name,
+            ae_title: p.ae_title,
+            host: p.host,
+            port: p.port,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct ScuFindParams {
     /// NightOwl-assigned peer UUID (from `list_peers`).
     pub peer_id: String,
@@ -196,6 +246,16 @@ pub struct ReadDicomFileParams {
 pub struct ListActivityParams {
     /// Filter applied to the activity log. Every field is optional.
     pub filter: Option<ActivityFilter>,
+}
+
+/// Confirmation payload returned by the `delete_peer` tool.
+/// `PeerStore::delete` returns `()` on success; this wraps the deleted
+/// id so an LLM client gets a concrete confirmation object instead of
+/// an empty result.
+#[derive(Debug, Clone, Serialize)]
+pub struct DeletePeerResult {
+    pub id: String,
+    pub deleted: bool,
 }
 
 // ---------------------------------------------------------------------
@@ -407,6 +467,42 @@ impl NightowlMcp {
         ok_json(&page)
     }
 
+    // ----- Peer mutation tools (3) -----
+
+    #[tool(
+        description = "Create a new configured remote DICOM peer (Application Entity): name, AE Title, host and port. Rejects a duplicate AE Title. Returns the created peer including its assigned id."
+    )]
+    fn create_peer(
+        &self,
+        Parameters(params): Parameters<CreatePeerParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let peer = self.peers.create(params.into()).map_err(to_mcp_err)?;
+        ok_json(&peer)
+    }
+
+    #[tool(
+        description = "Update an existing configured remote DICOM peer's name, AE Title, host and port. This is a full replace of those four fields, not a partial patch. Returns the updated peer."
+    )]
+    fn update_peer(
+        &self,
+        Parameters(params): Parameters<UpdatePeerParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let peer = self.peers.update(params.into()).map_err(to_mcp_err)?;
+        ok_json(&peer)
+    }
+
+    #[tool(description = "Delete a configured remote DICOM peer by id. This cannot be undone.")]
+    fn delete_peer(
+        &self,
+        Parameters(params): Parameters<PeerIdParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.peers.delete(&params.peer_id).map_err(to_mcp_err)?;
+        ok_json(&DeletePeerResult {
+            id: params.peer_id,
+            deleted: true,
+        })
+    }
+
     // ----- Active SCU tools (4) -----
 
     #[tool(
@@ -523,10 +619,12 @@ impl ServerHandler for NightowlMcp {
         info.instructions = Some(
             "NightOwl MCP server. Use the read tools to inspect peers, studies, \
              series, instances, the modality worklist and the activity log. Use \
-             the scu_* tools to actively send C-ECHO / C-FIND / C-MOVE / C-STORE \
-             to a configured peer (peer_id values come from `list_peers`). \
-             NightOwl is a developer tool — do not use it against production PACS \
-             without explicit operator approval."
+             create_peer / update_peer / delete_peer to manage the configured \
+             peer list — these mutate NightOwl's local peers.json only, not any \
+             remote system. Use the scu_* tools to actively send C-ECHO / C-FIND \
+             / C-MOVE / C-STORE to a configured peer (peer_id values come from \
+             `list_peers`). NightOwl is a developer tool — do not use it against \
+             production PACS without explicit operator approval."
                 .to_string(),
         );
         info
@@ -710,6 +808,176 @@ mod tests {
         assert!(json.contains("local_ae_title"));
     }
 
+    /// Builds a `NightowlMcp` backed by fresh, isolated stores in a temp
+    /// directory, for tests that call tool methods directly without
+    /// booting the HTTP transport or an AppHandle. The returned
+    /// `TempDir` must be kept alive for the test's duration (it deletes
+    /// the directory on drop).
+    fn test_handler() -> (tempfile::TempDir, NightowlMcp) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let index = std::sync::Arc::new(
+            crate::core::store::Index::open(&dir.path().join("store.sqlite")).expect("open index"),
+        );
+        let peers = std::sync::Arc::new(
+            crate::core::peers::PeerStore::open(&dir.path().join("peers.json"))
+                .expect("open peers"),
+        );
+        let worklist = std::sync::Arc::new(
+            crate::core::worklist::WorklistStore::open(&dir.path().join("worklist.sqlite"))
+                .expect("open worklist"),
+        );
+        let activity = std::sync::Arc::new(
+            crate::core::activity::ActivityLog::open(&dir.path().join("activity.sqlite"))
+                .expect("open activity"),
+        );
+        let cfg = AppConfig::default_with_home(dir.path());
+        let mcp = NightowlMcp::new(None, cfg, index, peers, worklist, activity);
+        (dir, mcp)
+    }
+
+    /// Extracts and parses the JSON text body of a successful tool call
+    /// result, mirroring the approach `ok_json_round_trips_through_call_tool_result`
+    /// uses to avoid depending on `CallToolResult`'s internal Debug shape.
+    fn tool_result_json(result: &CallToolResult) -> serde_json::Value {
+        let envelope = serde_json::to_value(result).expect("serialise result");
+        let text = envelope
+            .pointer("/content/0/text")
+            .and_then(|v| v.as_str())
+            .expect("text content present");
+        serde_json::from_str(text).expect("body is valid JSON")
+    }
+
+    #[test]
+    fn create_peer_tool_then_list_peers_shows_it() {
+        let (_dir, mcp) = test_handler();
+        let created = mcp
+            .create_peer(Parameters(CreatePeerParams {
+                name: "Test SCP".to_string(),
+                ae_title: "TESTSCP".to_string(),
+                host: "localhost".to_string(),
+                port: 11113,
+            }))
+            .expect("create_peer succeeds");
+        let created = tool_result_json(&created);
+        assert_eq!(created["ae_title"], "TESTSCP");
+        assert!(created["id"].as_str().is_some_and(|id| !id.is_empty()));
+
+        let listed = mcp.list_peers().expect("list_peers succeeds");
+        let listed = tool_result_json(&listed);
+        assert_eq!(listed.as_array().expect("array").len(), 1);
+    }
+
+    #[test]
+    fn create_peer_tool_duplicate_ae_title_returns_invalid_params() {
+        let (_dir, mcp) = test_handler();
+        mcp.create_peer(Parameters(CreatePeerParams {
+            name: "First".to_string(),
+            ae_title: "DUP".to_string(),
+            host: "localhost".to_string(),
+            port: 11113,
+        }))
+        .expect("first create_peer succeeds");
+
+        let err = mcp
+            .create_peer(Parameters(CreatePeerParams {
+                name: "Second".to_string(),
+                ae_title: "DUP".to_string(),
+                host: "localhost".to_string(),
+                port: 11114,
+            }))
+            .expect_err("duplicate AE title should fail");
+        assert!(format!("{err:?}").contains("ae_title"));
+    }
+
+    #[test]
+    fn update_peer_tool_changes_fields() {
+        let (_dir, mcp) = test_handler();
+        let created = mcp
+            .create_peer(Parameters(CreatePeerParams {
+                name: "Original".to_string(),
+                ae_title: "ORIG".to_string(),
+                host: "localhost".to_string(),
+                port: 11113,
+            }))
+            .expect("create_peer succeeds");
+        let id = tool_result_json(&created)["id"]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        let updated = mcp
+            .update_peer(Parameters(UpdatePeerParams {
+                peer_id: id.clone(),
+                name: "Renamed".to_string(),
+                ae_title: "RENAMED".to_string(),
+                host: "192.168.1.5".to_string(),
+                port: 4242,
+            }))
+            .expect("update_peer succeeds");
+        let updated = tool_result_json(&updated);
+        assert_eq!(updated["id"], id);
+        assert_eq!(updated["name"], "Renamed");
+        assert_eq!(updated["ae_title"], "RENAMED");
+        assert_eq!(updated["port"], 4242);
+    }
+
+    #[test]
+    fn delete_peer_tool_removes_peer_then_second_delete_errors() {
+        let (_dir, mcp) = test_handler();
+        let created = mcp
+            .create_peer(Parameters(CreatePeerParams {
+                name: "To delete".to_string(),
+                ae_title: "DEL".to_string(),
+                host: "localhost".to_string(),
+                port: 11113,
+            }))
+            .expect("create_peer succeeds");
+        let id = tool_result_json(&created)["id"]
+            .as_str()
+            .expect("id present")
+            .to_string();
+
+        let deleted = mcp
+            .delete_peer(Parameters(PeerIdParams {
+                peer_id: id.clone(),
+            }))
+            .expect("delete_peer succeeds");
+        let deleted = tool_result_json(&deleted);
+        assert_eq!(deleted["id"], id);
+        assert_eq!(deleted["deleted"], true);
+
+        let err = mcp
+            .delete_peer(Parameters(PeerIdParams { peer_id: id }))
+            .expect_err("second delete of the same id should fail");
+        assert!(format!("{err:?}").contains("id"));
+    }
+
+    #[test]
+    fn create_peer_and_update_peer_tool_input_schemas_include_expected_fields() {
+        let router = NightowlMcp::tool_router();
+        for (tool_name, needles) in [
+            (
+                "create_peer",
+                ["name", "ae_title", "host", "port"].as_slice(),
+            ),
+            (
+                "update_peer",
+                ["peer_id", "name", "ae_title", "host", "port"].as_slice(),
+            ),
+        ] {
+            let tool = router
+                .get(tool_name)
+                .unwrap_or_else(|| panic!("{tool_name} tool registered"));
+            let schema = serde_json::to_string(&tool.input_schema).expect("serialise input schema");
+            for needle in needles {
+                assert!(
+                    schema.contains(needle),
+                    "{tool_name} input schema is missing field `{needle}`: {schema}",
+                );
+            }
+        }
+    }
+
     /// Every tool advertised in the M24 plan must register through the
     /// `#[tool]` macro expansion. This test catches accidental drops
     /// (e.g. a macro typo that silently omits a method from the router)
@@ -722,6 +990,9 @@ mod tests {
         let expected = [
             "get_config",
             "list_peers",
+            "create_peer",
+            "update_peer",
+            "delete_peer",
             "list_studies",
             "list_series_for_study",
             "list_instances_for_series",

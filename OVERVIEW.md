@@ -176,7 +176,7 @@ local environment).
 
 ### Tools exposed
 
-Read tools (10):
+Read tools (11):
 
 - `get_config` — local AE Title, listen port, store directory.
 - `list_peers`
@@ -185,9 +185,16 @@ Read tools (10):
 - `list_instances_for_series`
 - `count_instances`
 - `rescan_store`
+- `read_dicom_file`
 - `list_worklist`
 - `list_activity` (filterable, paginated)
 - `count_activity`
+
+Peer management tools (3):
+
+- `create_peer`
+- `update_peer`
+- `delete_peer`
 
 Active SCU tools (4):
 
