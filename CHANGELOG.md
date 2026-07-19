@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Peer management via MCP. Three new MCP tools — `create_peer`, `update_peer`, `delete_peer` — let an external MCP client create, edit and remove configured DICOM peers, alongside the existing read-only `list_peers`. Validation (non-empty name, valid AE Title, non-empty host, non-zero port, duplicate AE Title rejection) is identical to the Peers page and the Tauri commands of the same name — both call the same `PeerStore`.
+
 ## [0.4.0] — 2026-06-09
 
 ### Added
