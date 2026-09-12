@@ -228,6 +228,16 @@ pub struct ScuMoveParams {
 }
 
 #[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct ScuGetParams {
+    /// NightOwl-assigned peer UUID (from `list_peers`).
+    pub peer_id: String,
+    pub root: QrRoot,
+    pub level: FindLevel,
+    #[serde(default)]
+    pub keys: ScuQueryKeys,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
 pub struct ScuStoreParams {
     /// NightOwl-assigned peer UUID (from `list_peers`).
     pub peer_id: String,
@@ -584,6 +594,33 @@ impl NightowlMcp {
     }
 
     #[tool(
+        description = "Send a DICOM C-GET request to the given peer, pulling matching SOP Instances back over the SAME association and ingesting them into NightOwl's local store (they become searchable via list_studies / list_series). Returns completed / failed sub-operation counts, the final status, and the list of SOP Instance UIDs received."
+    )]
+    async fn scu_get(
+        &self,
+        Parameters(params): Parameters<ScuGetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let peer = resolve_peer(&self.peers, &params.peer_id).map_err(to_mcp_err)?;
+        let local_ae = self.config.local_ae_title.clone();
+        let store_dir = self.config.store_dir.clone();
+        let index = self.index.clone();
+        let app = self.require_app()?;
+        let ScuGetParams {
+            root, level, keys, ..
+        } = params;
+        let result = tauri::async_runtime::spawn_blocking(move || {
+            let emitter = dimse::TauriEmitter::new(app);
+            dimse::scu_get(
+                &emitter, &index, &store_dir, &local_ae, &peer, root, level, keys,
+            )
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("scu_get join: {e}"), None))?
+        .map_err(to_mcp_err)?;
+        ok_json(&result)
+    }
+
+    #[tool(
         description = "Send DICOM C-STORE for each given file to the given peer. Returns per-file outcome (success / failure / extracted SOP Instance UID / message)."
     )]
     async fn scu_store(
@@ -622,8 +659,11 @@ impl ServerHandler for NightowlMcp {
              create_peer / update_peer / delete_peer to manage the configured \
              peer list — these mutate NightOwl's local peers.json only, not any \
              remote system. Use the scu_* tools to actively send C-ECHO / C-FIND \
-             / C-MOVE / C-STORE to a configured peer (peer_id values come from \
-             `list_peers`). NightOwl is a developer tool — do not use it against \
+             / C-MOVE / C-GET / C-STORE to a configured peer (peer_id values come \
+             from `list_peers`). C-GET pulls SOP Instances directly into the local \
+             store and returns their UIDs; C-MOVE routes them to a named third-party \
+             destination and never touches the local store. NightOwl is a developer \
+             tool — do not use it against \
              production PACS without explicit operator approval."
                 .to_string(),
         );
@@ -1005,6 +1045,7 @@ mod tests {
             "scu_echo",
             "scu_find",
             "scu_move",
+            "scu_get",
             "scu_store",
         ];
         for name in expected {

@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- SCU-side C-GET. NightOwl can now initiate a C-GET against a configured peer and pull matching SOP Instances back into the local store over the same association. The SCU page has a new **C-GET** operation next to C-MOVE; a matching `scu_get` MCP tool and `nightowl-cli scu get` subcommand are exposed for automation. Received instances are ingested via the same code path as the SCP-side C-STORE, so they become searchable in the local store immediately. The result reports completed / failed sub-operation counts and the list of received SOP Instance UIDs (which C-MOVE cannot give you). Verified end-to-end against DCMTK's `dcmqrscp`.
+
+### Changed
+- Bumped the `dicom-rs` crate ecosystem (dicom-object / dicom-core / dicom-dictionary-std / dicom-encoding / dicom-ul / dicom-transfer-syntax-registry) from 0.9 to 0.10. Needed for `ClientAssociationOptions::with_role_selection`, which the SCU-side C-GET uses to advertise SCP-role Storage presentation contexts. The 0.10 API surface was source-compatible with NightOwl's use — no other changes required.
+
 ## [0.5.0] — 2026-07-19
 
 ### Added

@@ -1,11 +1,13 @@
-//! `nightowl-cli scu ...` — mirrors `scu_echo`, `scu_find`, `scu_move`
-//! and `scu_store`.
+//! `nightowl-cli scu ...` — mirrors `scu_echo`, `scu_find`, `scu_get`,
+//! `scu_move` and `scu_store`.
 
 use std::path::PathBuf;
 
 use clap::{Args, Subcommand, ValueEnum};
 
-use crate::core::dimse::{scu_echo, scu_find, scu_move, scu_store, QrRoot, ScuQueryKeys};
+use crate::core::dimse::{
+    scu_echo, scu_find, scu_get, scu_move, scu_store, QrRoot, ScuQueryKeys,
+};
 use crate::core::error::AppError;
 use crate::core::peers::{Peer, PeerStore};
 use crate::core::store::FindLevel;
@@ -25,6 +27,9 @@ pub enum Action {
     /// Send a DICOM C-MOVE request, asking a peer to transfer matched
     /// instances to the named destination AE.
     Move(MoveFlags),
+    /// Send a DICOM C-GET request, pulling matched instances back over
+    /// the same association and ingesting them into the local store.
+    Get(GetFlags),
     /// Send each given file to a peer via DICOM C-STORE.
     Store(StoreFlags),
 }
@@ -51,6 +56,20 @@ pub struct MoveFlags {
     /// sent to.
     #[arg(long)]
     pub destination_ae: String,
+    /// Query/Retrieve information model root.
+    #[arg(long, value_enum, default_value_t = QrRootArg::Study)]
+    pub root: QrRootArg,
+    /// Query/Retrieve level.
+    #[arg(long, value_enum, default_value_t = FindLevelArg::Study)]
+    pub level: FindLevelArg,
+    #[command(flatten)]
+    pub keys: QueryKeyFlags,
+}
+
+#[derive(Args, Debug)]
+pub struct GetFlags {
+    /// Peer id (UUID) from `nightowl-cli peers list`.
+    pub peer_id: String,
     /// Query/Retrieve information model root.
     #[arg(long, value_enum, default_value_t = QrRootArg::Study)]
     pub root: QrRootArg,
@@ -149,6 +168,7 @@ pub fn run(ctx: &Context, format: OutputFormat, action: Action) -> Result<(), Ap
         Action::Echo { peer_id } => echo(ctx, format, &peer_id),
         Action::Find(flags) => find(ctx, format, flags),
         Action::Move(flags) => mv(ctx, format, flags),
+        Action::Get(flags) => get(ctx, format, flags),
         Action::Store(flags) => store(ctx, format, flags),
     }
 }
@@ -207,6 +227,33 @@ fn mv(ctx: &Context, format: OutputFormat, flags: MoveFlags) -> Result<(), AppEr
         OutputFormat::Human => emit_text(&format!(
             "status=0x{:04X} ({}) completed={} failed={} elapsed={}ms",
             result.status, result.status_label, result.completed, result.failed, result.elapsed_ms,
+        )),
+    }
+}
+
+fn get(ctx: &Context, format: OutputFormat, flags: GetFlags) -> Result<(), AppError> {
+    let peer = resolve_peer(&ctx.peers, &flags.peer_id)?;
+    let emitter = ctx.emitter();
+    let result = scu_get(
+        &emitter,
+        &ctx.index,
+        &ctx.config.store_dir,
+        &ctx.config.local_ae_title,
+        &peer,
+        flags.root.into(),
+        flags.level.into(),
+        flags.keys.into(),
+    )?;
+    match format {
+        OutputFormat::Json => emit_json(&result),
+        OutputFormat::Human => emit_text(&format!(
+            "status=0x{:04X} ({}) completed={} failed={} received={} elapsed={}ms",
+            result.status,
+            result.status_label,
+            result.completed,
+            result.failed,
+            result.received_sop_instance_uids.len(),
+            result.elapsed_ms,
         )),
     }
 }

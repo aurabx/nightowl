@@ -273,6 +273,9 @@ Record every decision in the format below.
   Rationale: From the SCU side, C-GET needs the client to offer SCP-role presentation contexts for every Storage SOP Class it expects back. `dicom-ul`'s `ClientAssociationOptions` does not (as of 0.9.1) expose a SCP/SCU role-selection negotiation knob, so a hand-built A-ASSOCIATE-RQ would be needed. The use case is also narrow: C-GET only makes sense over the same association as the query, and our M6 SCP-side C-GET already lets external tools (getscu) pull from us. Document and skip.
   Date/Author: 2026-05-23 / M8 implementer.
 
+- Decision (post-M8, 2026-09-13): The M8 C-GET-SCU deferral is retracted. `dicom-ul` 0.10 exposes `ClientAssociationOptions::with_role_selection(sop_class, scu_role, scp_role)`, which supplies the SCP-role Storage presentation contexts we needed. `scu_get` mirrors the request half of `scu_move`, negotiates SCP-role for every entry in `STORAGE_SOP_CLASSES`, and receives inbound C-STORE-RQ sub-ops on those contexts — feeding them into the same `ingest_c_store` core the SCP uses, so pulled instances become searchable in the local store immediately. Reply is a C-STORE-RSP per sub-op (unlike C-MOVE where the sub-ops are fire-and-forget on the SCP-to-SCU side). Verified end-to-end against `dcmqrscp`.
+  Date/Author: 2026-09-13.
+
 - Decision (M11): Worklist data lives in its own `worklist.sqlite` file rather than alongside `sop_instances` and `activity_events` in `store.sqlite`.
   Rationale: A user who clears or rebuilds the SOP index (e.g. by deleting `store.sqlite` to recover from a corrupt DB) should not lose their worklist data. Separate files = independent lifecycles.
   Date/Author: 2026-05-23 / M11 implementer.
@@ -553,7 +556,7 @@ Gaps to address before M10: none. M10 is just the worklist stub page.
 
 Follow-on observations:
 
-- C-GET SCU not implemented (see Decision Log). Documented as deferred.
+- C-GET SCU not implemented at M8 (see Decision Log). Landed post-M8 once `dicom-ul` 0.10 exposed `with_role_selection`; the deferral is retracted.
 - The file-path textarea would be much nicer as a drag-and-drop area or a native folder picker via `tauri-plugin-dialog`. Easy follow-up.
 - The Find results table is unvirtualised. At hundreds of matches that's fine; thousands of rows would want `react-virtuoso`.
 - No live progress for C-MOVE — the UI waits for the final RSP. M6's per-sub-op Pending RSPs hit the SCP-side activity stream but not this UI. A `listen("activity", …)` filter in the SCU page could show running counts.

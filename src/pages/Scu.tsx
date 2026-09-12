@@ -7,6 +7,7 @@ import {
   type ScuEchoResult,
   type ScuFindMatch,
   type ScuFindResult,
+  type ScuGetResult,
   type ScuMoveResult,
   type ScuQueryKeys,
   type ScuStoreOutcome,
@@ -17,13 +18,14 @@ import {
   listStudies,
   scuEcho,
   scuFind,
+  scuGet,
   scuMove,
   scuStore,
 } from "../lib/api";
 import { Field } from "../components/Field";
 import { Select } from "../components/Select";
 
-type Op = "echo" | "find" | "move" | "store";
+type Op = "echo" | "find" | "move" | "get" | "store";
 
 const INPUT_CLASS =
   "w-full rounded border border-slate-700 bg-slate-900 px-3 py-1.5 text-sm " +
@@ -87,6 +89,7 @@ export function ScuPage() {
   const [echoResult, setEchoResult] = useState<ScuEchoResult | null>(null);
   const [findResult, setFindResult] = useState<ScuFindResult | null>(null);
   const [moveResult, setMoveResult] = useState<ScuMoveResult | null>(null);
+  const [getResult, setGetResult] = useState<ScuGetResult | null>(null);
   const [storeResult, setStoreResult] = useState<ScuStoreOutcome[] | null>(null);
 
   const [form, setForm] = useState<QueryForm>(EMPTY_QUERY);
@@ -137,6 +140,7 @@ export function ScuPage() {
     setEchoResult(null);
     setFindResult(null);
     setMoveResult(null);
+    setGetResult(null);
     setStoreResult(null);
     setError(null);
   };
@@ -162,6 +166,10 @@ export function ScuPage() {
         }
         setMoveResult(
           await scuMove(peerId, form.root, form.level, queryKeysFromForm(form), dest),
+        );
+      } else if (op === "get") {
+        setGetResult(
+          await scuGet(peerId, form.root, form.level, queryKeysFromForm(form)),
         );
       } else if (op === "store") {
         const studyUids = Array.from(selectedStudyUids);
@@ -219,7 +227,7 @@ export function ScuPage() {
         </Field>
         <Field label="Operation">
           <div className="flex flex-wrap gap-2">
-            {(["echo", "find", "move", "store"] as Op[]).map((o) => (
+            {(["echo", "find", "move", "get", "store"] as Op[]).map((o) => (
               <button
                 key={o}
                 type="button"
@@ -285,6 +293,7 @@ export function ScuPage() {
       {echoResult && <EchoResultPanel result={echoResult} />}
       {findResult && <FindResultPanel result={findResult} />}
       {moveResult && <MoveResultPanel result={moveResult} />}
+      {getResult && <GetResultPanel result={getResult} />}
       {storeResult && <StoreResultPanel outcomes={storeResult} />}
     </section>
   );
@@ -298,6 +307,8 @@ function opLabel(op: Op): string {
       return "Run Query";
     case "move":
       return "Send Move";
+    case "get":
+      return "Send Get";
     case "store":
       return "Send Store";
   }
@@ -609,6 +620,43 @@ function MoveResultPanel({ result }: { result: ScuMoveResult }) {
       <div className="mt-1 text-xs opacity-70">
         completed {result.completed} · failed {result.failed} · {result.elapsed_ms} ms
       </div>
+    </div>
+  );
+}
+
+function GetResultPanel({ result }: { result: ScuGetResult }) {
+  const ok = result.status === 0;
+  const received = result.received_sop_instance_uids;
+  return (
+    <div
+      className={
+        "mt-4 rounded border p-3 text-sm " +
+        (ok
+          ? "border-emerald-700/50 bg-emerald-900/20 text-emerald-200"
+          : "border-amber-700/50 bg-amber-900/20 text-amber-200")
+      }
+    >
+      <div className="font-medium">
+        C-GET-RSP {result.status_label} (0x
+        {result.status.toString(16).toUpperCase().padStart(4, "0")})
+      </div>
+      <div className="mt-1 text-xs opacity-70">
+        completed {result.completed} · failed {result.failed} · {result.elapsed_ms} ms
+      </div>
+      {received.length > 0 && (
+        <details className="mt-2">
+          <summary className="cursor-pointer text-xs opacity-80">
+            {received.length} SOP Instance{received.length === 1 ? "" : "s"} received into the local store
+          </summary>
+          <ul className="mt-2 max-h-48 overflow-y-auto font-mono text-xs opacity-80">
+            {received.map((uid) => (
+              <li key={uid} className="truncate">
+                {uid}
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
     </div>
   );
 }

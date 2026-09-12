@@ -115,41 +115,6 @@ NightOwl is a desktop application built with Tauri 2, combining a Rust backend w
 - At session end: call `automatic_store_memory` with meaningful learnings (decisions, conventions, gotchas)
 - Use hierarchical memory keys (e.g., `conventions/naming`, `setup/dicom`, `decisions/mcp-integration`)
 
-<!-- automatic:groups:start -->
-## Related Projects
-The following projects are related to this one. They are provided for context — explore or reference them when relevant to the current task.
-
-### Aura
-The Aurabox application and related projects
-**aura**
-Location: `../../_active/aura`
-**bounce**
-Location: `../../_active/bounce`
-**lasso**
-Location: `../../_active/lasso`
-**uhura**
-Location: `../../_active/uhura`
-**lift**
-Location: `../../_active/lift`
-**starfleet**
-Location: `../../_active/starfleet`
-**skills**
-Location: `../../_active/skills`
-**ravana**
-Location: `../ravana`
-**tus-server**
-Location: `../../_active/tus-server`
-**cloud-lib-gcp**
-Location: `../../_active/cloud-lib-gcp`
-**gcp-pub-sub**
-Location: `../../_active/gcp-pub-sub`
-**scanfinder**
-Location: `../../_active/scanfinder`
-**meridian**
-Location: `../meridian`
-
-<!-- automatic:groups:end -->
-
 <!-- automatic:rules:start -->
 # Working with the Automatic MCP Service
 

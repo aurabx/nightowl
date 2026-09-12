@@ -93,12 +93,16 @@ Initiated from the SCU page or the MCP `scu_*` tools:
   range.
 - **C-MOVE** — asks a remote peer to forward matching SOP Instances
   to a named Move Destination AE Title.
+- **C-GET** — asks a remote peer to send matching SOP Instances back
+  over the same association. Received instances are ingested into the
+  local store and become searchable immediately. Returns completed and
+  failed sub-op counts plus the list of received SOP Instance UIDs.
 - **C-STORE** — sends one or more local DICOM Part-10 files to a
   remote peer. Per-file outcome (success / failure / extracted SOP
   Instance UID / message) is returned.
 
-C-GET as SCU is not implemented in the current iteration. C-GET as
-SCP is implemented.
+Both roles of every C-service are now implemented — SCP for C-ECHO,
+C-FIND, C-STORE, C-MOVE, C-GET, and SCU for the same set.
 
 ## UI pages
 
@@ -240,7 +244,7 @@ the SCP or SCU paths is recorded in the activity log:
   local network or behind a firewall.
 - Not a clinical product. NightOwl makes no regulatory or compliance
   claims.
-- C-GET as SCU is not implemented; C-GET as SCP is.
+- Advertised Storage SOP Classes for C-GET SCU (role selection) match the SCP acceptance list; a peer that returns a class outside that set will count as a sub-op failure.
 - Storage SOP Classes accepted are limited to the set listed above.
   Additional SOP Classes are added by amending the negotiation
   table in `core::dimse`.

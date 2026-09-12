@@ -1417,13 +1417,14 @@ fn handle_c_store(
     // Anything below this point is a peer-data failure rather than a
     // protocol failure: we want to send back a C-STORE-RSP with a
     // failure status so the SCU sees the problem, then move on.
+    let ts_uid = transfer_syntax_uid_for(association, pc_id)?;
     let status = match ingest_c_store(
-        scp,
+        &scp.index,
+        &scp.store_dir,
         &sop_class_uid,
         &sop_instance_uid,
         data,
-        pc_id,
-        association,
+        &ts_uid,
     ) {
         Ok(path) => {
             ctx.emit_lifecycle(
@@ -1470,20 +1471,22 @@ fn handle_c_store(
     Ok(true)
 }
 
-/// Inner half of `handle_c_store`: decode the data set, validate the
-/// UIDs, write a Part-10 file, refresh the SQLite index. Any error
-/// flows back to `handle_c_store` which translates it into the right
-/// DIMSE failure status.
+/// Inner half of `handle_c_store` — also reused by the SCU-side C-GET
+/// receive loop when it acts as a Storage SCP for the sub-operations.
+///
+/// Decodes the data set with the negotiated transfer syntax, validates
+/// the UIDs, writes a Part-10 file into `store_dir`, and refreshes the
+/// SQLite index. Any error flows back to the caller which translates
+/// it into the right DIMSE failure status.
 fn ingest_c_store(
-    scp: &ScpContext,
+    index: &Index,
+    store_dir: &Path,
     sop_class_uid: &str,
     sop_instance_uid: &str,
     data: &[u8],
-    pc_id: u8,
-    association: &ServerAssociation<TcpStream>,
+    ts_uid: &str,
 ) -> Result<PathBuf, AppError> {
-    let ts_uid = transfer_syntax_uid_for(association, pc_id)?;
-    let ts = lookup_ts(&ts_uid)?;
+    let ts = lookup_ts(ts_uid)?;
 
     // Parse the inbound data set with the negotiated transfer syntax.
     let dataset = InMemDicomObject::read_dataset_with_ts(data, ts)
@@ -1513,7 +1516,7 @@ fn ingest_c_store(
         )));
     }
 
-    let target_dir = scp.store_dir.join(&study_uid).join(&series_uid);
+    let target_dir = store_dir.join(&study_uid).join(&series_uid);
     std::fs::create_dir_all(&target_dir)
         .map_err(|e| AppError::Io(format!("create {}: {e}", target_dir.display())))?;
     let target = target_dir.join(format!("{sop_instance_uid}.dcm"));
@@ -1523,7 +1526,7 @@ fn ingest_c_store(
     let file_obj = dataset
         .with_meta(
             FileMetaTableBuilder::new()
-                .transfer_syntax(&ts_uid)
+                .transfer_syntax(ts_uid)
                 .media_storage_sop_class_uid(sop_class_uid)
                 .media_storage_sop_instance_uid(sop_instance_uid),
         )
@@ -1535,7 +1538,7 @@ fn ingest_c_store(
     // Refresh the SQLite index from the file we just wrote. Re-parsing
     // here is the cost of consistency: the index reflects exactly what
     // is on disk.
-    scp.index.ingest_file(&target)?;
+    index.ingest_file(&target)?;
 
     Ok(target)
 }
@@ -2420,6 +2423,23 @@ fn transfer_syntax_uid_for(
         })
 }
 
+/// Same as [`transfer_syntax_uid_for`] but for the SCU-side
+/// `ClientAssociation`. Used by [`scu_get`] to resolve the transfer
+/// syntax for each inbound C-STORE-RQ sub-operation before ingest.
+fn client_transfer_syntax_uid_for(
+    association: &ClientAssociation<TcpStream>,
+    pc_id: u8,
+) -> Result<String, AppError> {
+    association
+        .presentation_contexts()
+        .iter()
+        .find(|p| p.id == pc_id)
+        .map(|p| p.transfer_syntax.clone())
+        .ok_or_else(|| {
+            AppError::Internal(format!("no negotiated presentation context for id {pc_id}"))
+        })
+}
+
 fn lookup_ts(uid: &str) -> Result<&'static TransferSyntax, AppError> {
     TransferSyntaxRegistry
         .get(uid)
@@ -2574,6 +2594,12 @@ impl QrRoot {
             QrRoot::Study => STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_MOVE,
         }
     }
+    fn get_uid(self) -> &'static str {
+        match self {
+            QrRoot::Patient => PATIENT_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET,
+            QrRoot::Study => STUDY_ROOT_QUERY_RETRIEVE_INFORMATION_MODEL_GET,
+        }
+    }
 }
 
 /// Inputs the UI hands to the SCU side for a C-FIND / C-MOVE.
@@ -2623,6 +2649,22 @@ pub struct ScuMoveResult {
     pub failed: u16,
     pub status: u16,
     pub status_label: String,
+    pub elapsed_ms: u64,
+}
+
+/// Result of an SCU-side C-GET. Same shape as `ScuMoveResult` plus the
+/// list of SOP Instance UIDs actually received — unlike C-MOVE the
+/// requester sees each sub-operation directly and can enumerate them.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScuGetResult {
+    pub completed: u16,
+    pub failed: u16,
+    pub status: u16,
+    pub status_label: String,
+    /// SOP Instance UIDs that were successfully ingested from the
+    /// remote peer during this C-GET association. Order matches
+    /// arrival.
+    pub received_sop_instance_uids: Vec<String>,
     pub elapsed_ms: u64,
 }
 
@@ -3112,6 +3154,325 @@ pub fn scu_move(
         failed,
         status: final_status,
         status_label: label,
+        elapsed_ms: start.elapsed().as_millis() as u64,
+    })
+}
+
+/// Sends a C-GET-RQ to `peer` and receives the matched SOP Instances
+/// back over the same association as inbound C-STORE-RQ sub-operations.
+/// Each sub-operation is ingested into `store_dir` and indexed via
+/// `index`, so pulled instances become searchable in the local store —
+/// the "NightOwl is a mini PACS" mental model.
+///
+/// Per PS3.7 §9.1.3 the C-GET SCU is also the Storage SCP for the
+/// sub-operations: it must negotiate SCP-role presentation contexts for
+/// the Storage SOP Classes (via `with_role_selection`) and reply to
+/// each C-STORE-RQ with a C-STORE-RSP. Requires `dicom-ul` 0.10.
+///
+/// Activity events are routed to `emitter`.
+#[allow(clippy::too_many_arguments)]
+pub fn scu_get(
+    emitter: &dyn ActivityEmitter,
+    index: &Index,
+    store_dir: &Path,
+    local_ae: &str,
+    peer: &Peer,
+    root: QrRoot,
+    level: FindLevel,
+    keys: ScuQueryKeys,
+) -> Result<ScuGetResult, AppError> {
+    let start = Instant::now();
+    let qr_sop_class = root.get_uid();
+    let ctx = ScuCtx::new(emitter, peer);
+
+    ctx.emit_lifecycle(
+        Status::Info,
+        format!(
+            "opening SCU association to {} ({}) for C-GET",
+            ctx.peer_ae_title, ctx.peer_host
+        ),
+    );
+
+    // Negotiate the Q/R GET SOP class as SCU (default), plus every
+    // Storage SOP Class we might receive back — with role selection
+    // (scu_role=true, scp_role=true) so the peer can send C-STORE-RQs
+    // to us as SCP over this same association. dicom-ul 0.10 exposes
+    // `with_role_selection` for exactly this case.
+    let mut options = ClientAssociationOptions::new()
+        .calling_ae_title(local_ae.to_string())
+        .called_ae_title(peer.ae_title.clone())
+        .max_pdu_length(MAX_PDU_LENGTH)
+        .with_abstract_syntax(qr_sop_class);
+    for sop in STORAGE_SOP_CLASSES {
+        options = options
+            .with_abstract_syntax(*sop)
+            .with_role_selection(*sop, true, true);
+    }
+
+    let mut association = match options.establish(format!("{}:{}", peer.host, peer.port)) {
+        Ok(a) => a,
+        Err(err) => {
+            ctx.emit_lifecycle(Status::Error, format!("establish failed: {err}"));
+            return Err(AppError::Internal(format!("SCU get establish: {err}")));
+        }
+    };
+
+    let (qr_pc_id, ts_uid) = accepted_pc(&association, qr_sop_class)?;
+    let ts = lookup_ts(&ts_uid)?;
+
+    let identifier = build_scu_identifier(level, &keys);
+    let identifier_bytes = encode_identifier(&identifier, ts)?;
+
+    let message_id = next_scu_message_id();
+    let cmd = InMemDicomObject::command_from_element_iter([
+        DataElement::new(
+            tags::AFFECTED_SOP_CLASS_UID,
+            VR::UI,
+            qr_sop_class.to_string(),
+        ),
+        DataElement::new(
+            tags::COMMAND_FIELD,
+            VR::US,
+            dicom_value!(U16, [cmd::C_GET_RQ]),
+        ),
+        DataElement::new(tags::MESSAGE_ID, VR::US, dicom_value!(U16, [message_id])),
+        DataElement::new(tags::PRIORITY, VR::US, dicom_value!(U16, [0u16])),
+        DataElement::new(
+            tags::COMMAND_DATA_SET_TYPE,
+            VR::US,
+            dicom_value!(U16, [DATASET_PRESENT]),
+        ),
+    ]);
+    let cmd_bytes = encode_command_set(&cmd)?;
+
+    ctx.emit_outbound(
+        "C-GET-RQ",
+        format!("message id {message_id} sop class {qr_sop_class}"),
+    );
+
+    association
+        .send(&Pdu::PData {
+            data: vec![PDataValue {
+                presentation_context_id: qr_pc_id,
+                value_type: PDataValueType::Command,
+                is_last: true,
+                data: cmd_bytes,
+            }],
+        })
+        .map_err(|e| AppError::Internal(format!("SCU get send command: {e}")))?;
+    {
+        let mut writer = association.send_pdata(qr_pc_id);
+        writer
+            .write_all(&identifier_bytes)
+            .map_err(|e| AppError::Internal(format!("SCU get send identifier: {e}")))?;
+        writer
+            .finish()
+            .map_err(|e| AppError::Internal(format!("SCU get flush identifier: {e}")))?;
+    }
+
+    // Buffer for one sub-op in flight: peers send C-STORE-RQ as a
+    // Command PDV followed by one or more Data PDVs (terminated by
+    // `is_last`), so we hold the command set and accumulate the data
+    // bytes until the last PDV.
+    struct SubOpBuf {
+        command: InMemDicomObject,
+        data: Vec<u8>,
+        pc_id: u8,
+    }
+
+    let mut completed: u16 = 0;
+    let mut failed: u16 = 0;
+    let mut received_sop_instance_uids: Vec<String> = Vec::new();
+    let mut in_flight: Option<SubOpBuf> = None;
+    let final_status;
+
+    loop {
+        let pdu = match association.receive() {
+            Ok(p) => p,
+            Err(err) => {
+                ctx.emit_lifecycle(Status::Error, format!("receive failed: {err}"));
+                return Err(AppError::Internal(format!("SCU get receive: {err}")));
+            }
+        };
+        match pdu {
+            Pdu::PData { data } => {
+                let mut got_final_get_rsp: Option<u16> = None;
+                for pdv in data {
+                    match pdv.value_type {
+                        PDataValueType::Command => {
+                            let cmd_obj = parse_command_set(&pdv.data)?;
+                            let cmd_field = read_u16(&cmd_obj, tags::COMMAND_FIELD)?;
+                            match cmd_field {
+                                cmd::C_GET_RSP => {
+                                    let status = read_u16(&cmd_obj, tags::STATUS)?;
+                                    completed =
+                                        read_u16(&cmd_obj, tags::NUMBER_OF_COMPLETED_SUBOPERATIONS)
+                                            .unwrap_or(completed);
+                                    failed =
+                                        read_u16(&cmd_obj, tags::NUMBER_OF_FAILED_SUBOPERATIONS)
+                                            .unwrap_or(failed);
+                                    if status != STATUS_PENDING {
+                                        got_final_get_rsp = Some(status);
+                                    }
+                                }
+                                cmd::C_STORE_RQ => {
+                                    // Start a new in-flight sub-op.
+                                    in_flight = Some(SubOpBuf {
+                                        command: cmd_obj,
+                                        data: Vec::new(),
+                                        pc_id: pdv.presentation_context_id,
+                                    });
+                                }
+                                other => {
+                                    ctx.emit_lifecycle(
+                                        Status::Warning,
+                                        format!(
+                                            "unexpected command 0x{:04X} during C-GET",
+                                            other
+                                        ),
+                                    );
+                                }
+                            }
+                        }
+                        PDataValueType::Data => {
+                            let Some(sub) = in_flight.as_mut() else {
+                                // Data with no in-flight command — peer
+                                // protocol violation. Drop and let the
+                                // final C-GET-RSP counters report it.
+                                continue;
+                            };
+                            sub.data.extend_from_slice(&pdv.data);
+                            if !pdv.is_last {
+                                continue;
+                            }
+                            let sub = in_flight.take().unwrap();
+                            let sop_class_uid =
+                                read_str(&sub.command, tags::AFFECTED_SOP_CLASS_UID)?;
+                            let sop_instance_uid =
+                                read_str(&sub.command, tags::AFFECTED_SOP_INSTANCE_UID)?;
+                            let sub_message_id = read_u16(&sub.command, tags::MESSAGE_ID)?;
+                            let sub_ts_uid =
+                                client_transfer_syntax_uid_for(&association, sub.pc_id)?;
+                            let ingest_status = match ingest_c_store(
+                                index,
+                                store_dir,
+                                &sop_class_uid,
+                                &sop_instance_uid,
+                                &sub.data,
+                                &sub_ts_uid,
+                            ) {
+                                Ok(_path) => {
+                                    received_sop_instance_uids.push(sop_instance_uid.clone());
+                                    ctx.emit_inbound(
+                                        Status::Success,
+                                        "C-STORE-RQ",
+                                        format!("sop {sop_instance_uid} ingested"),
+                                    );
+                                    STATUS_SUCCESS
+                                }
+                                Err(err) => {
+                                    ctx.emit_lifecycle(
+                                        Status::Warning,
+                                        format!(
+                                            "C-STORE sub-op ingest failed for {sop_instance_uid}: {err}"
+                                        ),
+                                    );
+                                    match err {
+                                        AppError::Io(_) => STATUS_REFUSED_OUT_OF_RESOURCES,
+                                        _ => STATUS_FAILED_UNABLE_TO_PROCESS,
+                                    }
+                                }
+                            };
+                            let rsp = build_c_store_rsp(
+                                sub_message_id,
+                                &sop_class_uid,
+                                &sop_instance_uid,
+                                ingest_status,
+                            );
+                            let rsp_bytes = encode_command_set(&rsp)?;
+                            association
+                                .send(&Pdu::PData {
+                                    data: vec![PDataValue {
+                                        presentation_context_id: sub.pc_id,
+                                        value_type: PDataValueType::Command,
+                                        is_last: true,
+                                        data: rsp_bytes,
+                                    }],
+                                })
+                                .map_err(|e| {
+                                    AppError::Internal(format!(
+                                        "SCU get send C-STORE-RSP: {e}"
+                                    ))
+                                })?;
+                            ctx.emit_outbound(
+                                "C-STORE-RSP",
+                                format!(
+                                    "sop {sop_instance_uid} status 0x{:04X}",
+                                    ingest_status
+                                ),
+                            );
+                        }
+                    }
+                }
+                if let Some(status) = got_final_get_rsp {
+                    final_status = status;
+                    break;
+                }
+            }
+            Pdu::AbortRQ { source } => {
+                ctx.emit_lifecycle(
+                    Status::Error,
+                    format!("peer aborted association: {:?}", source),
+                );
+                return Err(AppError::Internal(format!(
+                    "C-GET peer aborted: {:?}",
+                    source
+                )));
+            }
+            other => {
+                ctx.emit_lifecycle(
+                    Status::Warning,
+                    format!("unexpected pdu: {}", other.short_description()),
+                );
+                return Err(AppError::Internal(format!(
+                    "unexpected pdu during C-GET: {}",
+                    other.short_description()
+                )));
+            }
+        }
+    }
+    let _ = association.release();
+
+    let label = match final_status {
+        STATUS_SUCCESS => "Success".to_string(),
+        STATUS_WARNING_SUBOPS_COMPLETE_WITH_FAILURES => {
+            "Warning (sub-op failures)".to_string()
+        }
+        STATUS_FAILED_UNABLE_TO_PROCESS => "Failed: Unable to Process".to_string(),
+        other => format!("status 0x{:04X}", other),
+    };
+
+    let rsp_status = match final_status {
+        STATUS_SUCCESS => Status::Success,
+        STATUS_WARNING_SUBOPS_COMPLETE_WITH_FAILURES => Status::Warning,
+        _ => Status::Error,
+    };
+    ctx.emit_inbound(
+        rsp_status,
+        "C-GET-RSP",
+        format!(
+            "final status 0x{:04X} ({label}) — completed {completed} failed {failed}",
+            final_status
+        ),
+    );
+    ctx.emit_lifecycle(Status::Info, "association released".to_string());
+
+    Ok(ScuGetResult {
+        completed,
+        failed,
+        status: final_status,
+        status_label: label,
+        received_sop_instance_uids,
         elapsed_ms: start.elapsed().as_millis() as u64,
     })
 }

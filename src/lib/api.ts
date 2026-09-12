@@ -313,6 +313,20 @@ export interface ScuMoveResult {
   elapsed_ms: number;
 }
 
+export interface ScuGetResult {
+  completed: number;
+  failed: number;
+  status: number;
+  status_label: string;
+  /**
+   * SOP Instance UIDs successfully ingested from the peer during this
+   * C-GET. Unlike C-MOVE (where the SCU never sees the sub-ops), the
+   * C-GET SCU receives every instance directly and can enumerate them.
+   */
+  received_sop_instance_uids: string[];
+  elapsed_ms: number;
+}
+
 export interface ScuStoreOutcome {
   file: string;
   success: boolean;
@@ -347,6 +361,15 @@ export function scuMove(
     keys,
     destinationAe,
   });
+}
+
+export function scuGet(
+  peerId: string,
+  root: QrRoot,
+  level: QrLevel,
+  keys: ScuQueryKeys,
+): Promise<ScuGetResult> {
+  return invoke<ScuGetResult>("scu_get_cmd", { peerId, root, level, keys });
 }
 
 export function scuStore(

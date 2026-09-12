@@ -21,8 +21,9 @@ use std::path::PathBuf as StdPathBuf;
 use core::activity::{ActivityFilter, ActivityLog, ActivityPage};
 use core::config::{load_or_default, save, AppConfig};
 use core::dimse::{
-    scu_echo, scu_find, scu_move, scu_store, start_listener, ListenerHandle, QrRoot, ScpContext,
-    ScuEchoResult, ScuFindResult, ScuMoveResult, ScuQueryKeys, ScuStoreOutcome, TauriEmitter,
+    scu_echo, scu_find, scu_get, scu_move, scu_store, start_listener, ListenerHandle, QrRoot,
+    ScpContext, ScuEchoResult, ScuFindResult, ScuGetResult, ScuMoveResult, ScuQueryKeys,
+    ScuStoreOutcome, TauriEmitter,
 };
 use core::error::AppError;
 use core::inspect::{read_dicom_properties, DicomFileProperties};
@@ -527,6 +528,31 @@ async fn scu_move_cmd(
 }
 
 #[tauri::command]
+async fn scu_get_cmd(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    peers: State<'_, Arc<PeerStore>>,
+    peer_id: String,
+    root: QrRoot,
+    level: FindLevel,
+    keys: ScuQueryKeys,
+) -> Result<ScuGetResult, AppError> {
+    let config = read_config(&state)?;
+    let local_ae = config.local_ae_title;
+    let store_dir = config.store_dir;
+    let peer = resolve_peer(&peers, &peer_id)?;
+    let index = state.index.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let emitter = TauriEmitter::new(app);
+        scu_get(
+            &emitter, &index, &store_dir, &local_ae, &peer, root, level, keys,
+        )
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("scu_get join: {e}")))?
+}
+
+#[tauri::command]
 async fn scu_store_cmd(
     app: AppHandle,
     state: State<'_, AppState>,
@@ -912,6 +938,7 @@ pub fn run() {
             scu_echo_cmd,
             scu_find_cmd,
             scu_move_cmd,
+            scu_get_cmd,
             scu_store_cmd,
             list_worklist,
             create_worklist_entry,
