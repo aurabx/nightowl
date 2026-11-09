@@ -41,7 +41,7 @@ that renders a React + TypeScript frontend.
 - **Desktop shell**: Tauri 2.11.
 - **Frontend**: React 19, TypeScript 6, Vite 7, Tailwind CSS v4,
   lucide-react icons.
-- **Backend**: Rust (stable, edition 2021, MSRV 1.77).
+- **Backend**: Rust (stable, edition 2021, MSRV 1.89).
 - **DICOM stack**: the `dicom-rs` family of crates (`dicom-object`,
   `dicom-core`, `dicom-ul`, `dicom-transfer-syntax-registry`,
   `dicom-dictionary-std`, `dicom-encoding`) for parsing, association
