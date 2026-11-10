@@ -4,7 +4,7 @@ version = "0.6.0"
 description = "NightOwl — Tauri desktop app for testing DICOM services"
 authors = ["Aurabox"]
 edition = "2021"
-rust-version = "1.77"
+rust-version = "1.89"
 
 # The library crate exposes `run()` for both the desktop binary (main.rs)
 # and any future mobile entrypoints. Keep main.rs thin per CLAUDE.md.
@@ -46,7 +46,7 @@ dicom-ul = "0.10"
 dicom-transfer-syntax-registry = "0.10"
 
 # SOP Instance index (M2).
-rusqlite = { version = "0.39", features = ["bundled"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
 
 # Directory walker for the rescan (M2).
 walkdir = "2.5"
@@ -73,7 +73,7 @@ chrono = { version = "0.4", features = ["serde"] }
 # `tower` provide the HTTP server the rmcp StreamableHttpService nests
 # into. `schemars` produces the JSON schemas that rmcp's `#[tool]` macro
 # exposes for each tool's input shape.
-rmcp = { version = "1.7", features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
+rmcp = { version = "3.9", features = ["server", "macros", "schemars", "transport-streamable-http-server"] }
 axum = "0.8"
 tower = "0.5"
 schemars = "1.2"

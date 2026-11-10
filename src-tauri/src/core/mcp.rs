@@ -25,7 +25,8 @@ use std::sync::Arc;
 use rmcp::{
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, Content, Implementation, ProtocolVersion, ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, Implementation, ProtocolVersion, ServerCapabilities,
+        ServerConfig,
     },
     schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
@@ -644,30 +645,28 @@ impl NightowlMcp {
 
 #[tool_handler]
 impl ServerHandler for NightowlMcp {
-    fn get_info(&self) -> ServerInfo {
-        // `ServerInfo` is `#[non_exhaustive]` upstream, so we start from
-        // `Default::default()` and overwrite only the fields we care
-        // about. Future rmcp versions may add fields without breaking
+    fn get_info(&self) -> ServerConfig {
+        // `ServerConfig` (`InitializeResult`) is `#[non_exhaustive]`
+        // upstream, so we use the builder helpers rather than a struct
+        // literal. Future rmcp versions may add fields without breaking
         // this construction.
-        let mut info = ServerInfo::default();
-        info.protocol_version = ProtocolVersion::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
-        info.server_info = Implementation::from_build_env();
-        info.instructions = Some(
-            "NightOwl MCP server. Use the read tools to inspect peers, studies, \
-             series, instances, the modality worklist and the activity log. Use \
-             create_peer / update_peer / delete_peer to manage the configured \
-             peer list — these mutate NightOwl's local peers.json only, not any \
-             remote system. Use the scu_* tools to actively send C-ECHO / C-FIND \
-             / C-MOVE / C-GET / C-STORE to a configured peer (peer_id values come \
-             from `list_peers`). C-GET pulls SOP Instances directly into the local \
-             store and returns their UIDs; C-MOVE routes them to a named third-party \
-             destination and never touches the local store. NightOwl is a developer \
-             tool — do not use it against \
-             production PACS without explicit operator approval."
-                .to_string(),
-        );
-        info
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
+            .with_protocol_version(ProtocolVersion::default())
+            .with_server_info(Implementation::from_build_env())
+            .with_instructions(
+                "NightOwl MCP server. Use the read tools to inspect peers, studies, \
+                 series, instances, the modality worklist and the activity log. Use \
+                 create_peer / update_peer / delete_peer to manage the configured \
+                 peer list — these mutate NightOwl's local peers.json only, not any \
+                 remote system. Use the scu_* tools to actively send C-ECHO / C-FIND \
+                 / C-MOVE / C-GET / C-STORE to a configured peer (peer_id values come \
+                 from `list_peers`). C-GET pulls SOP Instances directly into the local \
+                 store and returns their UIDs; C-MOVE routes them to a named third-party \
+                 destination and never touches the local store. NightOwl is a developer \
+                 tool — do not use it against \
+                 production PACS without explicit operator approval."
+                    .to_string(),
+            )
     }
 }
 
@@ -752,13 +751,13 @@ fn resolve_peer(peers: &PeerStore, id: &str) -> Result<super::peers::Peer, AppEr
 }
 
 /// Renders a serialisable value as a pretty-printed JSON string wrapped
-/// in a single `Content::text(...)` entry. Pretty-printed because the
+/// in a single `ContentBlock::text(...)` entry. Pretty-printed because the
 /// primary consumer is an LLM and the slightly larger payload is offset
 /// by improved readability inside the model's context.
 fn ok_json<T: Serialize>(value: &T) -> Result<CallToolResult, McpError> {
     let body = serde_json::to_string_pretty(value)
         .map_err(|e| McpError::internal_error(format!("serialise tool result: {e}"), None))?;
-    Ok(CallToolResult::success(vec![Content::text(body)]))
+    Ok(CallToolResult::success(vec![ContentBlock::text(body)]))
 }
 
 /// Converts our internal `AppError` to the MCP `ErrorData` the SDK
@@ -1124,8 +1123,8 @@ mod tests {
         let bind = handle.bind_addr;
 
         // JSON-RPC initialize. The protocol version is the original MCP
-        // spec version — broadly supported by rmcp 1.7. The
-        // Mcp-Protocol-Version header is required by rmcp's streamable
+        // spec version — still accepted by rmcp 3.9's version negotiation.
+        // The Mcp-Protocol-Version header is required by rmcp's streamable
         // HTTP transport for initialize requests.
         let body = serde_json::json!({
             "jsonrpc": "2.0",
