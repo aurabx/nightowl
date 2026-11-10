@@ -1,0 +1,78 @@
+{
+  "agents": [
+    "claude",
+    "codex",
+    "opencode",
+    "cursor"
+  ],
+  "contexts": [
+    "aurabox"
+  ],
+  "custom_agents": [],
+  "custom_commands": [],
+  "custom_skills": [
+    {
+      "content": "---\nname: Nightowl releases\ndescription: Describes how to do a release\n---\n\nNightowl releases are on github.\n\nThe tag format is vX.X.X.\n\nAlways ensure the cargo.lock is in the commit, as sometimes it gets missed.\n\nAlso check the build and test before release.\n\nAlways write a CHANGELOG.txt entry in Keep a Changelog format. Do not wrap lines, just let them wrap normally. \n\nKeep changelog entries readable, short and clear.\n",
+      "name": "nightowl-release"
+    }
+  ],
+  "description": "",
+  "file_rules": {
+    "_project": [
+      "automatic-process",
+      "automatic-service",
+      "automatic-code",
+      "automatic-general",
+      "automatic-prose",
+      "local-git-rules",
+      "thinking-effort",
+      "automatic-workflow",
+      "local-rules",
+      "local-long-running-work",
+      "ethics"
+    ]
+  },
+  "id": "541faf78-83be-45ce-8a5f-303c4a653558",
+  "instruction_mode": "unified",
+  "instructions_index_mode": false,
+  "manage_gitignore": true,
+  "mcp_servers": [
+    "automatic",
+    "github",
+    "aurabox-teams",
+    "spacelift",
+    "better-stack",
+    "sentry-aura",
+    "nightowl",
+    "linear-aurabox"
+  ],
+  "name": "nightowl",
+  "profiles": [
+    "General",
+    "Aurabox"
+  ],
+  "providers": [],
+  "skills": [
+    "automatic-security-review",
+    "git-commit",
+    "codex-plans",
+    "tailwindcss-development",
+    "automatic-refactoring",
+    "automatic-documentation",
+    "automatic-performance",
+    "automatic",
+    "automatic-debugging",
+    "linear-workflow",
+    "automatic-code-review",
+    "automatic-testing",
+    "rust-development",
+    "aurabox-rest-api"
+  ],
+  "tools": [
+    "dev-servers"
+  ],
+  "user_agents": [
+    "automatic-code-reviewer",
+    "automatic-debugger"
+  ]
+}
