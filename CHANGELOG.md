@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] — 2026-11-10
+
+### Security
+- Bumped `rmcp` from 1.7 to 3.9 and `rusqlite` from 0.39 to 0.41 to pick up upstream security fixes. The MCP server code in `core/mcp.rs` was adapted to the rmcp 3.x API; the MCP tool surface is unchanged.
+
+### Changed
+- The minimum supported Rust version is now 1.89 (was 1.77), as required by the updated dependencies.
+
 ## [0.6.0] — 2026-09-13
 
 ### Added
