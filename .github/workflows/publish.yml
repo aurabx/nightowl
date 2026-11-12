@@ -19,6 +19,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   # First job: check if a draft release already exists for the current
   # version. Create one if not, otherwise reuse it so the platform jobs
