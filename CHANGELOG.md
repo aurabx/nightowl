@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.2] — 2026-11-22
+
+### Security
+- Bumped `vite` from 7.3.3 to 7.3.8 to pick up the fix for GHSA-p4f5-76q4-ffq7. Vite is a build-time dependency only.
+
+### Changed
+- The `publish` workflow now declares least-privilege permissions (`contents: read` at the workflow level, with `contents: write` only on the job that creates the draft release). A `CODEOWNERS` entry now covers `.github/`.
+
 ## [0.6.1] — 2026-11-10
 
 ### Security
