@@ -974,3 +974,14 @@ Follow these rules:
 4. Add your own ignore entries outside the markers. Automatic never touches the
    rest of the file.
 <!-- automatic:rules:end -->
+
+## Working Protocols
+
+- **Operating mode:** Plan and Review for interactive sessions. Unsupervised for scheduled routine runs (a session that starts with "SCHEDULED TASK"). A scheduled run works until done without waiting for plan approval, and it does not ask questions. If it is blocked, it reports the blocker through a notification.
+- **Branches:** commit directly to main. No feature branches. Scheduled releases are committed on main.
+- **Worktrees:** no
+- **Pull requests:** no
+- **Merge target:** main
+- **Human review:** not required for scheduled release runs. Required for interactive feature work.
+- **Handoff:** after verification, report the result. A scheduled run sends a push notification only when something needs the owner, or when it released.
+- **Releases:** the scheduled release routine may bump versions, edit CHANGELOG.md, commit to main, and push a `vX.Y.Z` tag. The owner approved this in advance. Use the `v` prefix, as the publish workflow does.
